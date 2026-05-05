@@ -7,16 +7,22 @@ from einops import rearrange
 import torch
 import matplotlib.pyplot as plt
 from utils.normalization import normalize_min_max
+import cv2
+import torchvision.transforms as T
 
 
 def seq_collate_eth(batch):
-    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel) = zip(*batch)
+    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, video_frames) = zip(*batch)
     indexes = torch.stack(index, dim=0)
     pre_motion_3D = torch.stack(past_traj,dim=0)
     fut_motion_3D = torch.stack(fut_traj,dim=0)
     pre_motion_3D_orig = torch.stack(past_traj_orig, dim=0)
     fut_motion_3D_orig = torch.stack(fut_traj_orig, dim=0)
     fut_traj_vel = torch.stack(traj_vel, dim=0)
+
+    # NEW: stacking for Video-MoFlow: 
+    # Resulting shape: [Batch, 8, 3, 224, 224]
+    video_batch = torch.stack(video_frames, dim=0)
 
     batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt 
     data = {
@@ -27,13 +33,14 @@ def seq_collate_eth(batch):
         'past_traj_original_scale': pre_motion_3D_orig,
         'fut_traj_original_scale': fut_motion_3D_orig,
         'fut_traj_vel': fut_traj_vel,  
+        'video': video_batch,
     }
 
     return data 
 
 
 def seq_collate_imle_train(batch):
-    (past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, y_t, y_pred_data) = zip(*batch)
+    (past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, y_t, y_pred_data, video_frames) = zip(*batch)
 
     pre_motion_3D = torch.stack(past_traj,dim=0)
     fut_motion_3D = torch.stack(fut_traj,dim=0)
@@ -42,6 +49,10 @@ def seq_collate_imle_train(batch):
     fut_traj_vel = torch.stack(traj_vel, dim=0)
     y_t = torch.stack(y_t, dim=0)
     y_pred_data = torch.stack(y_pred_data,dim=0)
+
+    # NEW: stacking for Video-MoFlow: 
+    # Resulting shape: [Batch, 8, 3, 224, 224]
+    video_batch = torch.stack(video_frames, dim=0)
 
     batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt 
     data = {
@@ -52,7 +63,8 @@ def seq_collate_imle_train(batch):
         'fut_traj_original_scale': fut_motion_3D_orig,
         'fut_traj_vel': fut_traj_vel,
         'y_t': y_t,
-        'y_pred_data': y_pred_data
+        'y_pred_data': y_pred_data,
+        'video': video_batch,
     }
 
     return data
@@ -194,6 +206,16 @@ class ETHDataset(object):
                 imle_data_dict[key] = torch.from_numpy(np.concatenate(imle_data_dict[key], axis=0))[:len(self.past_traj)]
 
             self.imle_data_dict = imle_data_dict
+        
+        self.subset = subset
+        self.video_path = os.path.join(data_dir, 'videos', f"{subset}.avi")
+
+        # Define video preprocessing (resize to 224x224 and normalize to [6])
+        self.video_transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize((224, 224)),
+            T.ToTensor(),
+        ])
 
     def __len__(self):
         return self.all_data.shape[0]
@@ -209,6 +231,8 @@ class ETHDataset(object):
                     self.imle_data_dict['y_t'][item],
                     self.imle_data_dict['y_pred_data'][item]
                 ]
+            # Synchronization: Extract start_frame from IMLE metadata
+            start_frame = int(self.imle_data_dict['start_frame'][item])
         else:
             ### past traj, future traj, number of pedestrians (presumbly?), index
             past_traj_norm_scale = self.past_traj[item]                             # [A, P, 6]
@@ -253,7 +277,45 @@ class ETHDataset(object):
                 fut_traj_original_scale, 
                 fut_traj_vel
             ]
+
+            # Synchronization: Map item to start_frame based on dataset type
+            if self.type == 'LED':
+                start_frame = int(self.frame_ids[item])
+            else:
+                start_frame = int(self.data[item]['start_frame'])
+
+        # --- PHASE 2: Video-MoFlow Addition (Global Video Input) ---
+        # Open the .avi file from data/eth_ucy/videos/
+        cap = cv2.VideoCapture(self.video_path)
+        video_frames = []
+        
+        # Extract 8 frames corresponding to the T_obs observation window [3]
+        for i in range(8):
+            # Sampling every 10th frame to match the 2.5 FPS trajectory rate [4]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + (i * 10))
+            ret, frame = cap.read()
+            
+            if not ret:
+                # Fallback to zero-tensor if frame reading fails
+                frame = np.zeros((224, 224, 3), dtype=np.uint8)
+            else:
+                # Convert BGR to RGB for the visual token encoder
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Apply Resize(224, 224) and ToTensor() [5]
+            video_frames.append(self.video_transform(frame))
+        
+        cap.release()
+        
+        # Create visual evidence tensor V [1]
+        video_tensor = torch.stack(video_frames, dim=0)
+
+        # --- PHASE 3: Appending Video to Output ---
+        # Append video_tensor as the last element of the 'out' list
+        out.append(video_tensor)
+
         return out
+
 
 class ETHDatasetSocialGAN:
     '''
