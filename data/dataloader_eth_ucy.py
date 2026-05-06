@@ -103,22 +103,53 @@ def rotate_traj(past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, s
 
 class ETHDataset(object):
     def __init__(self, cfg, training=True, data_dir = None, subset = None, rotate_time_frame=0, imle=False, type='original'):
+        self.type = type
+        self.imle = imle
+        self.frame_ids = []
+        
         ### LED version of preprocessed data
-        if type == 'LED':
-            data_file_path = os.path.join(data_dir, type, '{:s}_data_{:s}.npy'.format(subset, 'train' if training else 'test'))
-            num_file_path = os.path.join(data_dir, type, '{:s}_num_{:s}.npy'.format(subset, 'train' if training else 'test'))
+        if self.type == 'LED':
+            data_file_path = os.path.join(data_dir, self.type, '{:s}_data_{:s}.npy'.format(subset, 'train' if training else 'test'))
+            num_file_path = os.path.join(data_dir, self.type, '{:s}_num_{:s}.npy'.format(subset, 'train' if training else 'test'))
 
             all_data = np.load(data_file_path)
             all_num = np.load(num_file_path)
+            
+            # === SET self.frame_ids FOR LED ===
+            # The 'num' file contains sequence metadata. The first column (index 0) 
+            # of the first agent (index 0) provides the absolute Frame ID.
+            self.frame_ids = all_num[:, 0, 0] 
+            
             self.all_data = torch.Tensor(all_data)
             self.all_num = torch.Tensor(all_num) 
-        elif type == 'original':
+        elif self.type == 'original':
             ### Original version of preprocessed data
-            data_file_path = os.path.join(data_dir, type, subset,'{:s}_{:s}.pkl'.format(subset, 'train' if training else 'test'))
-            all_data = pickle.load(open(data_file_path, 'rb'))
-            all_data = all_data['traj']
-            self.all_data = torch.Tensor(all_data)   #[A, T, 2]
-            self.all_data = self.all_data[:,None,:,:]  #[A, 1, T, 2]
+            data_file_path = os.path.join(data_dir, self.type, subset, f'{subset}_{"train" if training else "test"}.pkl')
+            
+            with open(data_file_path, 'rb') as f:
+                data_dict = pickle.load(f)
+            
+            # --- CRITICAL FIX: Add  to extract the scalar count (16765) ---
+            all_data = data_dict['traj']
+            num_peds = all_data.shape[0] # <--- MUST HAVE 
+            
+            # Metadata for temporal synchronization
+            frame_list = np.array(data_dict['frame_list'])
+            seq_start_end = data_dict['seq_start_end']
+            
+            # Create a 1D FLAT array (Size: 16765)
+            full_frame_ids = np.zeros(num_peds, dtype=int)
+            for i, (start, end) in enumerate(seq_start_end):
+                # Map the single scene frame ID to all agents in that scene
+                full_frame_ids[start:end] = frame_list[i]
+                
+            self.frame_ids = full_frame_ids # Now a 1D vector
+            # ----------------------------------------------------------------
+
+            # Load the trajectory coordinates as tensors
+            self.all_data = torch.Tensor(all_data)
+            self.all_data = self.all_data[:, None, :, :] # Shape: [A, 1, T, 2]
+
         else:
             raise ValueError('Invalid type')
 
@@ -126,7 +157,6 @@ class ETHDataset(object):
         self.cfg = cfg
         self.rotate_time_frame = rotate_time_frame
         self.imle = imle
-
         
         ### set the agent_num in the cfg
         cfg.agents = self.all_data.shape[1]
@@ -169,7 +199,7 @@ class ETHDataset(object):
             os.makedirs(os.path.join(data_dir, f'imle/{subset}'), exist_ok=True)
             pkl_ls = sorted(glob.glob(os.path.join(data_dir, f'imle/{subset}/*train*.pkl')))
 
-            keys_ls = ['past_traj', 'fut_traj', 'past_traj_original_scale', 'fut_traj_original_scale', 'fut_traj_vel', 'y_t', 'y_pred_data']
+            keys_ls = ['past_traj', 'fut_traj', 'past_traj_original_scale', 'fut_traj_original_scale', 'fut_traj_vel', 'y_t', 'y_pred_data', 'start_frame']
             imle_data_dict = {}
             total_scenes_loaded_ = 0
             for i_pkl, cur_pkl in enumerate(pkl_ls):
@@ -278,15 +308,32 @@ class ETHDataset(object):
                 fut_traj_vel
             ]
 
-            # Synchronization: Map item to start_frame based on dataset type
-            if self.type == 'LED':
-                start_frame = int(self.frame_ids[item])
-            else:
-                start_frame = int(self.data[item]['start_frame'])
+            ## Synchronization: Map item to start_frame based on dataset type
+            # if self.type == 'LED':
+            #     start_frame = int(self.frame_ids[item])# 
+            # else:
+            #     start_frame = int(self.data[item]['start_frame'])
 
+        # --- PHASE 2: Video-MoFlow Synchronization (OPENCV DOUBLE FIX) ---
+        raw_val = self.frame_ids[item]
+        
+        # .item() extracts the value as a standard Python scalar, 
+        # which OpenCV can successfully treat as a 'double'.
+        try:
+            # np.ravel ensures we have a flat view,  grabs the first element,
+            # and .item() converts it to a standard Python int/float.
+            start_frame = np.ravel(raw_val).item()
+        except Exception:
+            # Fallback for unexpected data types
+            start_frame = float(raw_val)
+            
         # --- PHASE 2: Video-MoFlow Addition (Global Video Input) ---
         # Open the .avi file from data/eth_ucy/videos/
         cap = cv2.VideoCapture(self.video_path)
+        
+        # Seek to the perfectly aligned starting frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
         video_frames = []
         
         # Extract 8 frames corresponding to the T_obs observation window [3]
@@ -402,4 +449,3 @@ class ETHDatasetSocialGAN:
                 line = [float(i) for i in line]
                 data.append(line)
         return np.asarray(data)
-
