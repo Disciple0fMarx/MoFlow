@@ -3,19 +3,42 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import os
 import numpy as np
+import cv2
 
 # Import the modified classes and collation function
 from data.dataloader_eth_ucy import ETHDataset, seq_collate_eth
 
 def test_pipeline():
-    # 1. Minimal Config Mock
-    # The dataset class expects a cfg object for normalization parameters
+    # 1. Comprehensive Config Mock to satisfy all internal checks
+    class ContextEncoder:
+        def __init__(self):
+            self.AGENTS = 0  
+            self.D_MODEL = 128 
+
+    class ModelConfig:
+        def __init__(self):
+            self.CONTEXT_ENCODER = ContextEncoder()
+
     class DummyCfg:
         def __init__(self):
+            # Dataset parameters
+            self.agents = 2 
+            self.past_frames = 8
+            self.future_frames = 12
+            
+            # Normalization parameters
+            self.data_norm = 'min_max' # Fixes the current AttributeError
             self.past_traj_min = -10.0
             self.past_traj_max = 10.0
             self.fut_traj_min = -10.0
             self.fut_traj_max = 10.0
+            
+            # Flags for augmentation/rotation
+            self.rotate = False       
+            self.rotate_aug = False   
+            
+            # Nested model config required by dataloader init
+            self.MODEL = ModelConfig()
 
     cfg = DummyCfg()
     data_dir = 'data/eth_ucy'
@@ -23,16 +46,15 @@ def test_pipeline():
     
     print(f"--- Starting Data Pipeline Test for: {subset} ---")
 
-    # 2. Initialize the Modified Dataset (Teacher branch)
-    # Ensure you have your .avi files in data/eth_ucy/videos/
     try:
+        # 2. Initialize the Modified Dataset (Teacher branch)
         dataset = ETHDataset(
             cfg, 
             training=True, 
             data_dir=data_dir, 
             subset=subset, 
             imle=False, 
-            type='original' # or 'LED' depending on your setup
+            type='original' 
         )
 
         # 3. Setup DataLoader with our new collation logic
@@ -48,40 +70,70 @@ def test_pipeline():
 
         # 5. Validate Shapes
         print("\n[Batch Verification]")
-        print(f"Batch Keys: {list(batch.keys())}")
         print(f"Trajectory Shape (Past): {batch['past_traj'].shape}")
         
         if 'video' in batch:
             video_shape = batch['video'].shape
             print(f"Video Tensor Shape: {video_shape}")
             
-            # Expected: [Batch, T_obs (8), Channels (3), H (224), W (224)]
+            # Expected shape: [Batch, T_obs (8), Channels (3), H (224), W (224)]
             if video_shape == (4, 8, 3, 224, 224):
                 print("✅ SUCCESS: Video tensor shape is correct.")
             else:
                 print(f"❌ ERROR: Video shape mismatch. Got {video_shape}")
 
-            # 6. Visual Synchronization Check
-            # We will save the 1st and 8th frame of the first item in the batch
-            sample_video = batch['video'] # Get first sample in batch
-            
-            fig, ax = plt.subplots(1, 2, figsize=(12, 6))
-            
-            # Frame 0 (Start of T_obs) - Convert back from Tensor to Image
-            img_start = sample_video.permute(1, 2, 0).cpu().numpy()
-            ax.imshow(img_start)
-            ax.set_title(f"Sample 0: Frame 1 of {subset}")
-            
-            # Frame 7 (End of T_obs)
-            img_end = sample_video[1].permute(1, 2, 0).cpu().numpy()
-            ax[2].imshow(img_end)
-            ax[2].set_title(f"Sample 0: Frame 8 of {subset}")
-            
+            # 6. Visual Check (Overlay ALL pedestrians per scene)
+            sample_video = batch['video'][0]      # [8, 3, 224, 224] — first sample's video
+            sample_indexes = batch['indexes']     # [4] — dataset indices for each sample in batch
+
+            # Group all samples that share the same start_frame (i.e. same scene)
+            frame_ids_in_batch = [int(dataset.frame_ids[int(idx)]) for idx in sample_indexes]
+            target_frame = frame_ids_in_batch[0]
+            scene_mask = [i for i, fid in enumerate(frame_ids_in_batch) if fid == target_frame]
+
+            print(f"\n[Scene Info] Frame ID: {target_frame} | Pedestrians found: {len(scene_mask)}")
+
+            # Collect trajectory points for every pedestrian in this scene
+            # past_traj shape per sample: [1, 8, 6] -> agent 0 -> [8, 6] -> [:, :2] = abs (x,y)
+            all_traj_px = []
+            for i in scene_mask:
+                traj_pts = batch['past_traj'][i, 0, :, :2].cpu().numpy()  # [8, 2]
+                traj_px = (traj_pts + 1) / 2 * 224                         # denorm to [0, 224]
+                all_traj_px.append(traj_px)
+
+            # Color palette — one color per pedestrian
+            colors = plt.cm.get_cmap('tab10', len(all_traj_px))
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            fig.suptitle(f"Scene @ Frame {target_frame} — {len(all_traj_px)} pedestrian(s)", fontsize=13)
+
+            for ax, (frame_idx, title) in zip(axes, [(0, "Frame 1 (Start)"), (7, "Frame 8 (End)")]):
+                img = sample_video[frame_idx].permute(1, 2, 0).cpu().numpy()
+                ax.imshow(img)
+                ax.set_title(title)
+
+                for p_idx, traj_px in enumerate(all_traj_px):
+                    color = colors(p_idx)
+                    # Draw the full 8-step trajectory path
+                    ax.plot(traj_px[:, 0], traj_px[:, 1],
+                            color=color, linewidth=2, alpha=0.8)
+                    # Draw all positions as small dots
+                    ax.scatter(traj_px[:, 0], traj_px[:, 1],
+                               color=color, s=20)
+                    # Highlight start (circle) and end (star)
+                    ax.scatter(*traj_px[0],  color=color, s=80,  marker='o',
+                               edgecolors='white', linewidths=1, label=f'Ped {p_idx}')
+                    ax.scatter(*traj_px[-1], color=color, s=120, marker='*',
+                               edgecolors='white', linewidths=1)
+
+                ax.legend(loc='upper right', fontsize=7, framealpha=0.6)
+
+            plt.tight_layout()
             output_path = 'debug_pipeline_frames.png'
-            plt.savefig(output_path)
-            print(f"\n✅ Visual Check Saved: Look at '{output_path}' to confirm alignment.")
+            plt.savefig(output_path, dpi=150)
+            print(f"✅ Visual Check Saved: '{output_path}'")
         else:
-            print("❌ ERROR: 'video' key is missing from the batch dictionary.")
+            print("❌ ERROR: 'video' key is missing from batch dictionary.")
 
     except Exception as e:
         print(f"❌ TEST FAILED: {str(e)}")
