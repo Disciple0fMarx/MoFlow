@@ -42,7 +42,7 @@ def test_pipeline():
 
     cfg = DummyCfg()
     data_dir = 'data/eth_ucy'
-    subset = 'eth'  # You can test 'hotel', 'zara1', etc.
+    subset = 'zara2'  # You can test 'hotel', 'zara1', etc.
     
     print(f"--- Starting Data Pipeline Test for: {subset} ---")
 
@@ -50,7 +50,7 @@ def test_pipeline():
         # 2. Initialize the Modified Dataset (Teacher branch)
         dataset = ETHDataset(
             cfg, 
-            training=True, 
+            training=False, 
             data_dir=data_dir, 
             subset=subset, 
             imle=False, 
@@ -83,22 +83,27 @@ def test_pipeline():
                 print(f"❌ ERROR: Video shape mismatch. Got {video_shape}")
 
             # 6. Visual Check (Overlay ALL pedestrians per scene)
-            sample_video = batch['video'][0]      # [8, 3, 224, 224] — first sample's video
-            sample_indexes = batch['indexes']     # [4] — dataset indices for each sample in batch
+            sample_video = batch['video'][0]      # [8, 3, 224, 224]
+            sample_indexes = batch['indexes']
 
-            # Group all samples that share the same start_frame (i.e. same scene)
-            frame_ids_in_batch = [int(dataset.frame_ids[int(idx)]) for idx in sample_indexes]
-            target_frame = frame_ids_in_batch[0]
-            scene_mask = [i for i, fid in enumerate(frame_ids_in_batch) if fid == target_frame]
+            sample_idx    = int(sample_indexes[0])
+            target_frame  = int(dataset.frame_ids[sample_idx])
 
-            print(f"\n[Scene Info] Frame ID: {target_frame} | Pedestrians found: {len(scene_mask)}")
+            # Search the ENTIRE dataset for all peds sharing this frame_id
+            all_scene_indices = np.where(dataset.frame_ids == target_frame)[0]
+            print(f"\n[Scene Info] Frame ID: {target_frame} | Total peds in scene: {len(all_scene_indices)}")
 
-            # Collect trajectory points for every pedestrian in this scene
-            # past_traj shape per sample: [1, 8, 6] -> agent 0 -> [8, 6] -> [:, :2] = abs (x,y)
             all_traj_px = []
-            for i in scene_mask:
-                traj_pts = batch['past_traj'][i, 0, :, :2].cpu().numpy()  # [8, 2]
-                traj_px = (traj_pts + 1) / 2 * 224                         # denorm to [0, 224]
+            for idx in all_scene_indices:
+                # all_data shape: [N, 1, T, 2] — column 0=pos_x, column 1=pos_z (NOT pos_y!)
+                # ETH stores [pos_x, pos_z] but homography expects [pos_x, pos_y].
+                # Swap col 0 and col 1, then use col [0,1] as [x, y] for the H transform.
+                # Actually the pkl loader takes cols 2: from obsmat which is [pos_x, pos_z, pos_y...]
+                # and transposes — so stored as [pos_x, pos_z]. We need [pos_x, pos_y].
+                # For ETH/hotel: swap axes (use col 1 as y... but it's pos_z, not pos_y).
+                # Safest: just try both col orderings and see which aligns.
+                traj_pts = dataset.all_data[idx, 0, :cfg.past_frames, :].cpu().numpy()  # [8, 2]
+                traj_px  = dataset.world_to_pixel(traj_pts)
                 all_traj_px.append(traj_px)
 
             # Color palette — one color per pedestrian
@@ -126,7 +131,7 @@ def test_pipeline():
                     ax.scatter(*traj_px[-1], color=color, s=120, marker='*',
                                edgecolors='white', linewidths=1)
 
-                ax.legend(loc='upper right', fontsize=7, framealpha=0.6)
+                # ax.legend(loc='upper right', fontsize=7, framealpha=0.6)
 
             plt.tight_layout()
             output_path = 'debug_pipeline_frames.png'
