@@ -247,6 +247,45 @@ class ETHDataset(object):
             T.ToTensor(),
         ])
 
+        self.SCENE_RESOLUTIONS = {
+            'eth':   (640, 480),
+            'hotel': (720, 576),
+            'univ':  (720, 576),
+            'zara1': (720, 576),
+            'zara2': (720, 576),
+        }
+        
+        self.SCENE_WORLD_BOUNDS = {
+            # (x_min, x_max, y_min, y_max, flip_y) — from test pkl stats
+            'eth':   (-7.69, 13.89,  -1.81, 12.67),              # use H_inv — confirmed working
+            'hotel': (-10.31, 4.31, -2.77,  4.04),
+            'univ':  (-0.46, 15.47,  -0.32, 13.89),
+            'zara1': (-0.14, 15.48,  -0.37, 12.39),
+            'zara2': (-0.36, 15.56,  -0.19, 13.48),
+        }
+        
+        self.SCENE_FLIP = {
+            #           flip_x  flip_y
+            'eth':   (False, False),  # H_inv handles orientation
+            'hotel': (False, False),  # H_inv handles orientation  
+            'univ':  (True,  False),  # x is mirrored
+            'zara1': (False, False),  # working correctly already
+            'zara2': (False, False),  # working correctly already
+        }
+        
+        self.SCENE_SWAP_XY = {'hotel': True}
+        self.SCENE_FLIP_X = {'hotel': True}
+
+        # Load scene-specific homography matrix
+        h_path = os.path.join(data_dir, 'homography', f'{subset}_H.txt')
+        if os.path.exists(h_path):
+            # Homography matrices in ETH-UCY are typically 3x3
+            self.H = np.loadtxt(h_path)
+        else:
+            print(f"Warning: Homography for {subset} not found at {h_path}. Using identity.")
+            self.H = np.eye(3) # Fallback to identity matrix
+        self.H_inv = np.linalg.inv(self.H)
+        self.orig_res = self.SCENE_RESOLUTIONS.get(subset, (720, 576))
     def __len__(self):
         return self.all_data.shape[0]
 
@@ -316,42 +355,22 @@ class ETHDataset(object):
 
         # --- PHASE 2: Video-MoFlow Synchronization (OPENCV DOUBLE FIX) ---
         raw_val = self.frame_ids[item]
-        
-        # .item() extracts the value as a standard Python scalar, 
-        # which OpenCV can successfully treat as a 'double'.
-        try:
-            # np.ravel ensures we have a flat view,  grabs the first element,
-            # and .item() converts it to a standard Python int/float.
-            start_frame = np.ravel(raw_val).item()
-        except Exception:
-            # Fallback for unexpected data types
-            start_frame = float(raw_val)
-            
-        # --- PHASE 2: Video-MoFlow Addition (Global Video Input) ---
-        # Open the .avi file from data/eth_ucy/videos/
+        start_frame = int(np.ravel(raw_val).item())
+
         cap = cv2.VideoCapture(self.video_path)
-        
-        # Seek to the perfectly aligned starting frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
         video_frames = []
-        
-        # Extract 8 frames corresponding to the T_obs observation window [3]
         for i in range(8):
-            # Sampling every 10th frame to match the 2.5 FPS trajectory rate [4]
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + (i * 10))
+            frame_idx = min(start_frame + (i * 10), total_frames - 1)  # clamp to valid range
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
-            
             if not ret:
-                # Fallback to zero-tensor if frame reading fails
                 frame = np.zeros((224, 224, 3), dtype=np.uint8)
             else:
-                # Convert BGR to RGB for the visual token encoder
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Apply Resize(224, 224) and ToTensor() [5]
             video_frames.append(self.video_transform(frame))
-        
+
         cap.release()
         
         # Create visual evidence tensor V [1]
@@ -363,6 +382,49 @@ class ETHDataset(object):
 
         return out
 
+    def world_to_pixel_backup(self, traj_pts, target_res=(224, 224)):
+        traj_w  = np.array(traj_pts, dtype=np.float64)
+        orig_w, orig_h = self.orig_res
+        bounds = self.SCENE_WORLD_BOUNDS.get(self.subset)
+
+        # Scenes with valid homography
+        if bounds is None:
+            h = np.hstack((traj_w, np.ones((len(traj_w), 1)))).T
+            c = self.H_inv @ h
+            img_pts = (c / c[2]).T[:, :2].copy()
+        else:
+            x_min, x_max, y_min, y_max = bounds
+            pad = 10
+            img_pts = np.zeros_like(traj_w)
+            img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min) * (orig_w - 2*pad) + pad
+            img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min) * (orig_h - 2*pad) + pad
+
+        # Flip y — world y-axis points opposite to image y-axis in all ETH-UCY scenes
+        img_pts[:, 1] = orig_h - img_pts[:, 1]
+
+        img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
+        img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
+        return img_pts
+        
+    def world_to_pixel(self, traj_pts, target_res=(224, 224)):
+        traj_w  = np.array(traj_pts, dtype=np.float64)
+        orig_w, orig_h = self.orig_res
+
+        x_min, x_max, y_min, y_max = self.SCENE_WORLD_BOUNDS[self.subset]
+        pad = 10
+        img_pts = np.zeros_like(traj_w)
+        img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min) * (orig_w - 2*pad) + pad
+        img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min) * (orig_h - 2*pad) + pad
+        
+        # if self.SCENE_FLIP_X.get(self.subset, False):
+        #    img_pts[:, 0] = orig_w - img_pts[:, 0]
+
+        # Y-axis is inverted relative to image coordinates in all ETH-UCY scenes
+        img_pts[:, 1] = orig_h - img_pts[:, 1]
+
+        img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
+        img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
+        return img_pts
 
 class ETHDatasetSocialGAN:
     '''
