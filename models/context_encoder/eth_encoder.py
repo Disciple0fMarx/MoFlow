@@ -8,6 +8,9 @@ from models.context_encoder.mtr_encoder import SinusoidalPosEmb
 from einops import rearrange
 import math
 
+from .video_encoder import GlobalVideoEncoder
+from .fusion_module import CrossModalFusion
+
 
 class SocialTransformer(nn.Module):
     def __init__(self, in_dim=48, hidden_dim=256, out_dim=128):
@@ -38,67 +41,36 @@ class SocialTransformer(nn.Module):
     
 
 class ETHEncoder(nn.Module):
-    def __init__(self, config, use_pre_norm):
+    def __init__(self, config, use_pre_norm): # MAINTAIN original signature
         super().__init__()
         self.model_cfg = config
-        dim = self.model_cfg.D_MODEL
+        self.d_model = config.D_MODEL # Use 128 from your cor_fm.yml [6, 7]
         
-        ### build social encoder
-        self.agent_social_encoder = SocialTransformer(in_dim=48, hidden_dim=256, out_dim=dim)
-        
-        # Positional encoding
-        self.pos_encoding = nn.Sequential(
-                SinusoidalPosEmb(dim, theta = 10000),
-                nn.Linear(dim, dim),
-                nn.ReLU(),
-                nn.Linear(dim, dim)
-            )
-        self.agent_query_embedding = nn.Embedding(self.model_cfg.AGENTS, dim)
-        self.mlp_pe = nn.Sequential(
-            nn.Linear(2*dim, dim),
-            nn.ReLU(),
-            nn.Linear(dim, dim)
+        # 1. KINEMATIC BRANCH: Original MoFlow Social Transformer [1]
+        # Initializing based on original MoFlow parameters
+        self.traj_encoder = SocialTransformer(
+            in_dim=48, 
+            hidden_dim=256, 
+            out_dim=self.d_model
         )
-        # build transformer encoder layers
-        self.layer = nn.TransformerEncoderLayer(d_model=dim, 
-                                                dropout=self.model_cfg.get('DROPOUT_OF_ATTN', 0.1),
-                                                nhead=self.model_cfg.NUM_ATTN_HEAD, 
-                                                dim_feedforward=dim * 4, 
-                                                norm_first=use_pre_norm,
-                                                batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=self.model_cfg.NUM_ATTN_LAYERS)
-        self.num_out_channels = dim
-        
-    ### polyline encoder MLP PointNet [B, A, D]
-    def build_polyline_encoder(self, in_channels, hidden_dim, num_layers, num_pre_layers=1, out_channels=None):
-        ret_polyline_encoder = polyline_encoder.PointNetPolylineEncoder(
-            in_channels=in_channels,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_pre_layers=num_pre_layers,
-            out_channels=out_channels
-        )
-        return ret_polyline_encoder
-    
 
-    def forward(self, past_traj):
+        # 2. VISUAL BRANCH (PHASE 2.2) [8]
+        self.video_encoder = GlobalVideoEncoder(d_model=self.d_model)
+        
+        # 3. CROSS-MODAL FUSION (PHASE 2.2 - Variante B) [3]
+        self.fusion_module = CrossModalFusion(d_model=self.d_model)
+
+    def forward(self, past_traj, video_tensor=None):
         """
-        Args: [Batch size, Number of agents, Number of time frames, 6]
+        past_traj:    [B, A, P, D]
+        video_tensor: [B, T_obs, 3, 224, 224] or None
         """
-        
-        B, A, P, D = past_traj.shape
-        agent_feature = self.agent_social_encoder(past_traj, mask=None)  # [B, A, D]
+        z_traj = self.traj_encoder(past_traj, mask=None)  # [B, A, D]
 
-        ### use positional encoding
-        pos_encoding = self.pos_encoding(torch.arange(agent_feature.shape[1]).to(past_traj.device))         # [A, D]
+        if video_tensor is not None:
+            z_video = self.video_encoder(video_tensor)     # [B, T_obs, D]
+            z_ctx = self.fusion_module(z_traj, z_video)
+        else:
+            z_ctx = z_traj
 
-        ### enforce positional encoding earlier here
-        agent_query = self.agent_query_embedding(torch.arange(self.model_cfg.AGENTS).to(past_traj.device))  # [A, D]
-
-        pos_encoding = self.mlp_pe(torch.cat([agent_query, pos_encoding], dim=-1)) # [A, D]
-
-        agent_feature += pos_encoding.unsqueeze(0)                              # [B, A, D]
-        encoder_out = self.transformer_encoder(agent_feature)
-        
-        return encoder_out 
-    
+        return z_ctx
