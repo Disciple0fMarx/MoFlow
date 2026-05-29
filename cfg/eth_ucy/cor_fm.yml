@@ -40,6 +40,14 @@ MODEL:
         NUM_ATTN_LAYERS: 4
         NUM_ATTN_HEAD: 8 
         DROPOUT_OF_ATTN: 0.1 
+
+        # --- variant A (per-timestep concat) ---
+        USE_VIDEO: True            # set False to fall back to upstream behaviour
+        VIDEO_DIM_RAW: 512         # ResNet18 pooled feature dim — must match cached .npy
+        VIDEO_DIM: 32              # projected dim concatenated to traj_channels (6)
+        PAST_FRAMES: 8             # MUST match cfg.past_frames at top level
+        TRAJ_CHANNELS: 6           # abs_xy + rel_xy + vel_xy
+        VIDEO_FEATURES_ROOT: "features/resnet18"
  
     MOTION_DECODER:
         NAME: MTRDecoder

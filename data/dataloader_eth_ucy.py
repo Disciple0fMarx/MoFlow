@@ -9,34 +9,35 @@ import matplotlib.pyplot as plt
 from utils.normalization import normalize_min_max
 import cv2
 import torchvision.transforms as T
+import os, sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from video_encoder.moflow_adapter import FrameFeatureLookup
 
 
 def seq_collate_eth(batch):
-    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, video_frames) = zip(*batch)
-    indexes = torch.stack(index, dim=0)
-    pre_motion_3D = torch.stack(past_traj,dim=0)
-    fut_motion_3D = torch.stack(fut_traj,dim=0)
+    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, z_video) = zip(*batch)
+    pre_motion_3D = torch.stack(past_traj, dim=0)
+    fut_motion_3D = torch.stack(fut_traj, dim=0)
     pre_motion_3D_orig = torch.stack(past_traj_orig, dim=0)
     fut_motion_3D_orig = torch.stack(fut_traj_orig, dim=0)
-    fut_traj_vel = torch.stack(traj_vel, dim=0)
-
-    # NEW: stacking for Video-MoFlow: 
-    # Resulting shape: [Batch, 8, 3, 224, 224]
-    video_batch = torch.stack(video_frames, dim=0)
-
-    batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt 
-    data = {
-        'indexes': indexes,
-        'batch_size': batch_size,
+    fut_traj_vel_stack = torch.stack(traj_vel, dim=0)
+    # z_video may be a degenerate `torch.zeros(1)` when USE_VIDEO=False — detect.
+    if z_video[0].dim() == 3:
+        z_video_stack = torch.stack(z_video, dim=0)        # [B, T_obs, D_raw]
+    else:
+        z_video_stack = None
+    data_dict = {
+        'index': torch.cat(index, dim=0),
         'past_traj': pre_motion_3D,
         'fut_traj': fut_motion_3D,
         'past_traj_original_scale': pre_motion_3D_orig,
         'fut_traj_original_scale': fut_motion_3D_orig,
-        'fut_traj_vel': fut_traj_vel,  
-        'video': video_batch,
+        'fut_traj_vel': fut_traj_vel_stack,
     }
-
-    return data 
+    if z_video_stack is not None:
+        data_dict['z_video_global'] = z_video_stack
+    return data_dict
 
 
 def seq_collate_imle_train(batch):
@@ -184,6 +185,43 @@ class ETHDataset(object):
         ### record the original to avoid numerical errors
         self.past_traj_original_scale = past_traj
         self.fut_traj_original_scale = fut_traj
+
+        self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
+        self.z_video_global = None
+        if self.use_video:
+            split = 'train' if training else 'test'
+            # Sidecar produced by `video_encoder/scripts/build_frame_index.py`.
+            frame_idx_path = os.path.join(
+                data_dir, 'original', subset,
+                f'{subset}_{split}_frame_index.pkl'
+            )
+            if not os.path.exists(frame_idx_path):
+                raise FileNotFoundError(
+                    f"USE_VIDEO=True but {frame_idx_path} is missing. "
+                    f"Run: python -m video_encoder.scripts.build_frame_index "
+                    f"--data-root <raw_root> --pkl-dir {os.path.join(data_dir, 'original')} "
+                    f"--scene {subset} --split {split}"
+                )
+            with open(frame_idx_path, 'rb') as f:
+                frame_index = pickle.load(f)
+            # `frame_index['start_frame_id']` aligned with axis-0 of self.all_data.
+            start_fids = np.asarray(frame_index['start_frame_id'], dtype=np.int64)
+            stride = int(frame_index.get('stride', 10))
+            assert start_fids.shape[0] == self.all_data.shape[0], (
+                f"frame_index has {start_fids.shape[0]} entries but pickle has "
+                f"{self.all_data.shape[0]} samples. Rebuild the index."
+            )
+            features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT',
+                                    'features/resnet18')
+            scene_name = frame_index.get('scene', subset)
+            lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
+            T_obs = int(cfg.past_frames)
+            D = lookup.features.shape[1]
+            z = np.zeros((self.all_data.shape[0], T_obs, D), dtype=np.float32)
+            for i, fid in enumerate(start_fids):
+                z[i] = lookup.window(int(fid), n_frames=T_obs, stride=stride,
+                                     policy='nearest')
+            self.z_video_global = torch.from_numpy(z)
    
         ### min-max linear normalization
         if cfg.data_norm == 'min_max':
@@ -338,13 +376,17 @@ class ETHDataset(object):
                 fut_traj_original_scale = fut_traj_o_rot
                 fut_traj_vel = fut_traj_vel_o
 
+            z_video = (self.z_video_global[item]
+                   if self.z_video_global is not None
+                   else torch.zeros(1))
             out = [
                 torch.Tensor([item]).to(torch.int32),
                 past_traj_norm_scale,
                 fut_traj_norm_scale,
                 past_traj_original_scale,
-                fut_traj_original_scale, 
-                fut_traj_vel
+                fut_traj_original_scale,
+                fut_traj_vel,
+                z_video,
             ]
 
             ## Synchronization: Map item to start_frame based on dataset type
