@@ -97,6 +97,7 @@ class ETHMotionTransformer(nn.Module):
         encoder_out = self.context_encoder(
             x_data['past_traj_original_scale'],
             z_video=x_data.get('z_video_global', None),
+            agent_crops=x_data.get('agent_crops', None),
         )                                                                       # [B, A, D]
         encoder_out_batch = repeat(encoder_out, 'b a d -> b k a d', k=K, a=A) 	# [B, K, A, D]
 
