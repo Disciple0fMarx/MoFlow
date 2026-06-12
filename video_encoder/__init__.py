@@ -20,6 +20,9 @@ def __getattr__(name):
     if name in ("GlobalVideoEncoder", "BaseFrameEncoder"):
         from . import encoder as _e
         return getattr(_e, name)
+    if name == "AgentVideoEncoder":
+        from . import agent_encoder as _ae
+        return getattr(_ae, name)
     if name == "GlobalFrameDataset":
         from . import datasets as _d
         return _d.GlobalFrameDataset
