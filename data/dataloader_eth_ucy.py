@@ -14,19 +14,25 @@ from video_encoder.moflow_adapter import FrameFeatureLookup
 
 
 def seq_collate_eth(batch):
-    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, z_video) = zip(*batch)
+    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, z_video, agent_crops) = zip(*batch)
     pre_motion_3D = torch.stack(past_traj, dim=0)
     fut_motion_3D = torch.stack(fut_traj, dim=0)
     pre_motion_3D_orig = torch.stack(past_traj_orig, dim=0)
     fut_motion_3D_orig = torch.stack(fut_traj_orig, dim=0)
     fut_traj_vel_stack = torch.stack(traj_vel, dim=0)
-    
+
     # z_video may be a degenerate `torch.zeros(1)` when USE_VIDEO=False — detect.
     if z_video[0].dim() == 3:
         z_video_stack = torch.stack(z_video, dim=0)        # [B, T_obs, D_raw]
     else:
         z_video_stack = None
-        
+
+    # agent_crops may be a degenerate `torch.zeros(1)` when USE_AGENT_VIDEO=False — detect.
+    if agent_crops[0].dim() == 4:  # [A, P, 3, h, w] -> 4 dimensions
+        agent_crops_stack = torch.stack(agent_crops, dim=0)  # [B, A, P, 3, h, w]
+    else:
+        agent_crops_stack = None
+
     data_dict = {
         'batch_size': torch.tensor(pre_motion_3D.shape[0]),
         'index': torch.cat(index, dim=0),
@@ -38,12 +44,14 @@ def seq_collate_eth(batch):
     }
     if z_video_stack is not None:
         data_dict['z_video_global'] = z_video_stack
+    if agent_crops_stack is not None:
+        data_dict['agent_crops'] = agent_crops_stack
     return data_dict
 
 
 def seq_collate_imle_train(batch):
     # Removed video_frames unpacking to reflect the optimized lightweight pipeline
-    (past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, y_t, y_pred_data) = zip(*batch)
+    (past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, y_t, y_pred_data, agent_crops) = zip(*batch)
 
     pre_motion_3D = torch.stack(past_traj,dim=0)
     fut_motion_3D = torch.stack(fut_traj,dim=0)
@@ -53,7 +61,13 @@ def seq_collate_imle_train(batch):
     y_t = torch.stack(y_t, dim=0)
     y_pred_data = torch.stack(y_pred_data,dim=0)
 
-    batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt 
+    # agent_crops may be a degenerate `torch.zeros(1)` when USE_AGENT_VIDEO=False — detect.
+    if agent_crops[0].dim() == 4:  # [A, P, 3, h, w] -> 4 dimensions
+        agent_crops_stack = torch.stack(agent_crops, dim=0)  # [B, A, P, 3, h, w]
+    else:
+        agent_crops_stack = None
+
+    batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt
     data = {
         'batch_size': batch_size,
         'past_traj': pre_motion_3D,
@@ -64,6 +78,8 @@ def seq_collate_imle_train(batch):
         'y_t': y_t,
         'y_pred_data': y_pred_data,
     }
+    if agent_crops_stack is not None:
+        data['agent_crops'] = agent_crops_stack
 
     return data
 
@@ -175,6 +191,8 @@ class ETHDataset(object):
         self.fut_traj_original_scale = fut_traj
 
         self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
+        self.use_agent_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_AGENT_VIDEO', False))
+        self.agent_crop_size = getattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENT_CROP_SIZE', [64, 64])
         self.z_video_global = None
         if self.use_video:
             split = 'train' if training else 'test'
@@ -341,6 +359,16 @@ class ETHDataset(object):
                 fut_traj_original_scale = fut_traj_o_rot
                 fut_traj_vel = fut_traj_vel_o
 
+            # Extract agent-centric video crops if enabled
+            agent_crops = None
+            if self.use_agent_video:
+                agent_crops = self._extract_agent_crops(past_traj_original_scale)
+
+            # Extract agent-centric video crops if enabled
+            agent_crops = None
+            if self.use_agent_video:
+                agent_crops = self._extract_agent_crops(past_traj_original_scale)
+
             z_video = (self.z_video_global[item]
                    if self.z_video_global is not None
                    else torch.zeros(1))
@@ -352,6 +380,7 @@ class ETHDataset(object):
                 fut_traj_original_scale,
                 fut_traj_vel,
                 z_video,
+                agent_crops if agent_crops is not None else torch.zeros(1),
             ]
 
         return out
@@ -396,6 +425,76 @@ class ETHDataset(object):
         img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
         img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
         return img_pts
+
+    def _extract_agent_crops(self, past_traj_original_scale):
+        """
+        Extract agent-centric video crops for each agent in each observed frame.
+
+        Args:
+            past_traj_original_scale: [A, P, 6] tensor containing [abs_xy, rel_xy, vel_xy]
+                                    where abs_xy are world coordinates
+
+        Returns:
+            Tensor of shape [A, P, 3, h, w] containing RGB crops for each agent/frame,
+            or None if video is not enabled
+        """
+        if not self.use_agent_video:
+            return None
+
+        A, P, _ = past_traj_original_scale.shape
+        h, w = self.agent_crop_size
+
+        # Initialize crops tensor
+        crops = torch.zeros(A, P, 3, h, w, dtype=torch.float32)
+
+        # Get original image dimensions for the scene
+        orig_w, orig_h = self.orig_res
+
+        # Process each agent and frame
+        for a in range(A):
+            for p in range(P):
+                # Extract world coordinates (x, y) - first two channels
+                world_xy = past_traj_original_scale[a, p, :2].numpy()  # [x, y]
+
+                # Convert to pixel coordinates using existing homography method
+                # world_to_pixel expects [N, 2] array
+                pixel_xy = self.world_to_pixel(world_xy.reshape(1, 2))[0]  # [x, y] in pixel space
+                pixel_x, pixel_y = int(round(pixel_xy[0])), int(round(pixel_xy[1]))
+
+                # Calculate crop boundaries
+                x1 = pixel_x - w // 2
+                y1 = pixel_y - h // 2
+                x2 = x1 + w
+                y2 = y1 + h
+
+                # Handle padding if crop goes outside image boundaries
+                x1_pad = max(0, -x1)
+                y1_pad = max(0, -y1)
+                x2_pad = max(0, x2 - orig_w)
+                y2_pad = max(0, y2 - orig_h)
+
+                # Adjust crop boundaries to be within image
+                x1_clip = max(0, x1)
+                y1_clip = max(0, y1)
+                x2_clip = min(orig_w, x2)
+                y2_clip = min(orig_h, y2)
+
+                # Extract the actual image region
+                if x2_clip > x1_clip and y2_clip > y1_clip:
+                    # TODO: Actually load the image frame and extract the crop
+                    # For now, we'll return zeros as placeholder
+                    # In a real implementation, we would:
+                    # 1. Determine which frame this is (need frame ID)
+                    # 2. Load the corresponding image
+                    # 3. Extract the crop [y1_clip:y2_clip, x1_clip:x2_clip]
+                    # 4. Apply padding if needed
+                    pass
+
+                # For now, return zeros tensor with correct shape
+                # This will be replaced with actual image loading logic
+                crops[a, p] = torch.zeros(3, h, w, dtype=torch.float32)
+
+        return crops
 
 class ETHDatasetSocialGAN:
     '''
