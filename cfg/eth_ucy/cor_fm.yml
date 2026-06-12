@@ -48,6 +48,13 @@ MODEL:
         PAST_FRAMES: 8             # MUST match cfg.past_frames at top level
         TRAJ_CHANNELS: 6           # abs_xy + rel_xy + vel_xy
         VIDEO_FEATURES_ROOT: "features/resnet18"
+
+        # --- agent-centric video and tri-modal fusion ---
+        USE_AGENT_VIDEO: False     # set True to enable agent-centric video encoder
+        USE_TRI_MODAL_FUSION: False # set True to enable tri-modal cascaded cross-attention fusion
+        AGENT_CROP_SIZE: [64, 64]  # [height, width] for agent-centric crops
+        RESNET_FREEZE_BLOCKS: 2    # number of initial ResNet blocks to freeze
+        SPATIAL_DROPOUT_RATE: 0.5  # dropout rate after backbone features
  
     MOTION_DECODER:
         NAME: MTRDecoder
