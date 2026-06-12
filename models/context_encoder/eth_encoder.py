@@ -7,6 +7,7 @@ from models.utils import polyline_encoder
 from models.context_encoder.mtr_encoder import SinusoidalPosEmb
 from einops import rearrange
 import math
+from video_encoder.agent_encoder import AgentVideoEncoder
 
 
 # ---------------------------------------------------------------------------
