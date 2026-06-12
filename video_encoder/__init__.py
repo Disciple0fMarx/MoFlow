@@ -4,7 +4,6 @@ Heavy submodules (encoder, datasets) are imported lazily to keep `import video_e
 usable without torch installed (e.g. for splits-only usage and unit tests).
 """
 from .scenes import CANONICAL_SCENES, scene_to_folder, scene_to_raw_txt
-from .splits import build_loso_splits, temporal_split
 
 __version__ = "0.1.0"
 __all__ = [
@@ -26,4 +25,10 @@ def __getattr__(name):
     if name == "GlobalFrameDataset":
         from . import datasets as _d
         return _d.GlobalFrameDataset
+    if name == "build_loso_splits":
+        from . import splits as _splits
+        return _splits.build_loso_splits
+    if name == "temporal_split":
+        from . import splits as _splits
+        return _splits.temporal_split
     raise AttributeError(name)
