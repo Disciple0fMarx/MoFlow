@@ -7,8 +7,6 @@ from einops import rearrange
 import torch
 import matplotlib.pyplot as plt
 from utils.normalization import normalize_min_max
-import cv2
-import torchvision.transforms as T
 import os, sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -22,12 +20,15 @@ def seq_collate_eth(batch):
     pre_motion_3D_orig = torch.stack(past_traj_orig, dim=0)
     fut_motion_3D_orig = torch.stack(fut_traj_orig, dim=0)
     fut_traj_vel_stack = torch.stack(traj_vel, dim=0)
+    
     # z_video may be a degenerate `torch.zeros(1)` when USE_VIDEO=False — detect.
     if z_video[0].dim() == 3:
         z_video_stack = torch.stack(z_video, dim=0)        # [B, T_obs, D_raw]
     else:
         z_video_stack = None
+        
     data_dict = {
+        'batch_size': torch.tensor(pre_motion_3D.shape[0]),
         'index': torch.cat(index, dim=0),
         'past_traj': pre_motion_3D,
         'fut_traj': fut_motion_3D,
@@ -41,7 +42,8 @@ def seq_collate_eth(batch):
 
 
 def seq_collate_imle_train(batch):
-    (past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, y_t, y_pred_data, video_frames) = zip(*batch)
+    # Removed video_frames unpacking to reflect the optimized lightweight pipeline
+    (past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, y_t, y_pred_data) = zip(*batch)
 
     pre_motion_3D = torch.stack(past_traj,dim=0)
     fut_motion_3D = torch.stack(fut_traj,dim=0)
@@ -50,10 +52,6 @@ def seq_collate_imle_train(batch):
     fut_traj_vel = torch.stack(traj_vel, dim=0)
     y_t = torch.stack(y_t, dim=0)
     y_pred_data = torch.stack(y_pred_data,dim=0)
-
-    # NEW: stacking for Video-MoFlow: 
-    # Resulting shape: [Batch, 8, 3, 224, 224]
-    video_batch = torch.stack(video_frames, dim=0)
 
     batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt 
     data = {
@@ -65,7 +63,6 @@ def seq_collate_imle_train(batch):
         'fut_traj_vel': fut_traj_vel,
         'y_t': y_t,
         'y_pred_data': y_pred_data,
-        'video': video_batch,
     }
 
     return data
@@ -76,7 +73,7 @@ def rotate_traj(past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, s
     past_abs = rearrange(past_abs, 'b a p d -> (b a) p d')
     future_rel = rearrange(future_rel, 'b a f d -> (b a) f d')
     past_diff = past_rel[:, rotate_time_frame]
-    # past_diff = past[:, rotate_time_frame] - past[:, rotate_time_frame-1]
+    
     past_theta = torch.atan(torch.div(past_diff[:, 1], past_diff[:, 0]+1e-5))
     past_theta = torch.where((past_diff[:, 0]<0), past_theta+math.pi, past_theta)
     
@@ -85,10 +82,6 @@ def rotate_traj(past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, s
     rotate_matrix[:, 0, 1] = torch.sin(past_theta)
     rotate_matrix[:, 1, 0] = - torch.sin(past_theta)
     rotate_matrix[:, 1, 1] = torch.cos(past_theta)
-    ### store the inverse of this rotate_matrix
-    # inverse_rotate_matrix = rotate_matrix.transpose(1, 2)
-    # np.save(f'inverse_rotate_matrix_{subset}.npy', inverse_rotate_matrix.detach().cpu().numpy())
-    # exit()
 
     past_after = torch.matmul(rotate_matrix, past_rel.transpose(1, 2)).transpose(1, 2)
     future_after = torch.matmul(rotate_matrix, future_rel.transpose(1, 2)).transpose(1, 2)
@@ -96,8 +89,6 @@ def rotate_traj(past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, s
     past_after = rearrange(past_after, '(b a) p d -> b a p d', a=agents)
     future_after = rearrange(future_after, '(b a) f d -> b a f d', a=agents)
     past_abs_after = rearrange(past_abs_after, '(b a) p d -> b a p d', a=agents)
-
-    
 
     return past_after, future_after, past_abs_after
 
@@ -117,8 +108,6 @@ class ETHDataset(object):
             all_num = np.load(num_file_path)
             
             # === SET self.frame_ids FOR LED ===
-            # The 'num' file contains sequence metadata. The first column (index 0) 
-            # of the first agent (index 0) provides the absolute Frame ID.
             self.frame_ids = all_num[:, 0, 0] 
             
             self.all_data = torch.Tensor(all_data)
@@ -130,21 +119,20 @@ class ETHDataset(object):
             with open(data_file_path, 'rb') as f:
                 data_dict = pickle.load(f)
             
-            # --- CRITICAL FIX: Add  to extract the scalar count (16765) ---
+            # --- CRITICAL FIX: Extract scalar count ---
             all_data = data_dict['traj']
-            num_peds = all_data.shape[0] # <--- MUST HAVE 
+            num_peds = all_data.shape[0] 
             
             # Metadata for temporal synchronization
             frame_list = np.array(data_dict['frame_list'])
             seq_start_end = data_dict['seq_start_end']
             
-            # Create a 1D FLAT array (Size: 16765)
+            # Create a 1D FLAT array
             full_frame_ids = np.zeros(num_peds, dtype=int)
             for i, (start, end) in enumerate(seq_start_end):
-                # Map the single scene frame ID to all agents in that scene
                 full_frame_ids[start:end] = frame_list[i]
                 
-            self.frame_ids = full_frame_ids # Now a 1D vector
+            self.frame_ids = full_frame_ids 
             # ----------------------------------------------------------------
 
             # Load the trajectory coordinates as tensors
@@ -174,7 +162,7 @@ class ETHDataset(object):
         past_traj = torch.cat((past_traj_abs, past_traj_rel, past_traj_vel), dim=-1)
         self.fut_traj_vel = torch.cat((fut_traj[:, :, 1:] - fut_traj[:,:, :-1], torch.zeros_like(fut_traj[:, :, -1:])), dim=2)
 
-        self.rotate_aug = cfg.rotate_aug and training
+        self.rotate_aug = cfg.rotate and training
 
         if training:
             cfg.fut_traj_max = fut_traj.max()
@@ -190,7 +178,6 @@ class ETHDataset(object):
         self.z_video_global = None
         if self.use_video:
             split = 'train' if training else 'test'
-            # Sidecar produced by `video_encoder/scripts/build_frame_index.py`.
             frame_idx_path = os.path.join(
                 data_dir, 'original', subset,
                 f'{subset}_{split}_frame_index.pkl'
@@ -204,7 +191,7 @@ class ETHDataset(object):
                 )
             with open(frame_idx_path, 'rb') as f:
                 frame_index = pickle.load(f)
-            # `frame_index['start_frame_id']` aligned with axis-0 of self.all_data.
+            
             start_fids = np.asarray(frame_index['start_frame_id'], dtype=np.int64)
             stride = int(frame_index.get('stride', 10))
             assert start_fids.shape[0] == self.all_data.shape[0], (
@@ -259,16 +246,6 @@ class ETHDataset(object):
                 if total_scenes_loaded_ >= len(self.past_traj):
                     break
 
-                if i_pkl == 0:
-                    # y_t_original_scale_ = unnormalize_min_max(torch.from_numpy(data['y_t'][:, -1]), cfg.fut_traj_min, cfg.fut_traj_max, -1, 1)
-                    # y_pred_data_original_scale_ = torch.from_numpy(data['y_pred_data'])
-                    # assert torch.sum(torch.abs(y_t_original_scale_ - y_pred_data_original_scale_)) < 1e-5, 'IMLE data is not consistent'
-                            
-                    # past_tarj_original_scale_ = torch.from_numpy(data['past_traj_original_scale'])
-                    # assert torch.sum(torch.abs(past_tarj_original_scale_[:10] - self.past_traj_original_scale[:10])) < 1e-5, 'IMLE data is not consistent'
-
-                    pass
-
             # concat the data
             for key in keys_ls:
                 imle_data_dict[key] = torch.from_numpy(np.concatenate(imle_data_dict[key], axis=0))[:len(self.past_traj)]
@@ -276,14 +253,6 @@ class ETHDataset(object):
             self.imle_data_dict = imle_data_dict
         
         self.subset = subset
-        self.video_path = os.path.join(data_dir, 'videos', f"{subset}.avi")
-
-        # Define video preprocessing (resize to 224x224 and normalize to [6])
-        self.video_transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize((224, 224)),
-            T.ToTensor(),
-        ])
 
         self.SCENE_RESOLUTIONS = {
             'eth':   (640, 480),
@@ -294,8 +263,7 @@ class ETHDataset(object):
         }
         
         self.SCENE_WORLD_BOUNDS = {
-            # (x_min, x_max, y_min, y_max, flip_y) — from test pkl stats
-            'eth':   (-7.69, 13.89,  -1.81, 12.67),              # use H_inv — confirmed working
+            'eth':   (-7.69, 13.89,  -1.81, 12.67),             
             'hotel': (-10.31, 4.31, -2.77,  4.04),
             'univ':  (-0.46, 15.47,  -0.32, 13.89),
             'zara1': (-0.14, 15.48,  -0.37, 12.39),
@@ -303,12 +271,11 @@ class ETHDataset(object):
         }
         
         self.SCENE_FLIP = {
-            #           flip_x  flip_y
-            'eth':   (False, False),  # H_inv handles orientation
-            'hotel': (False, False),  # H_inv handles orientation  
-            'univ':  (True,  False),  # x is mirrored
-            'zara1': (False, False),  # working correctly already
-            'zara2': (False, False),  # working correctly already
+            'eth':   (False, False),  
+            'hotel': (False, False),    
+            'univ':  (True,  False),  
+            'zara1': (False, False),  
+            'zara2': (False, False),  
         }
         
         self.SCENE_SWAP_XY = {'hotel': True}
@@ -317,13 +284,13 @@ class ETHDataset(object):
         # Load scene-specific homography matrix
         h_path = os.path.join(data_dir, 'homography', f'{subset}_H.txt')
         if os.path.exists(h_path):
-            # Homography matrices in ETH-UCY are typically 3x3
             self.H = np.loadtxt(h_path)
         else:
             print(f"Warning: Homography for {subset} not found at {h_path}. Using identity.")
-            self.H = np.eye(3) # Fallback to identity matrix
+            self.H = np.eye(3) 
         self.H_inv = np.linalg.inv(self.H)
         self.orig_res = self.SCENE_RESOLUTIONS.get(subset, (720, 576))
+        
     def __len__(self):
         return self.all_data.shape[0]
 
@@ -338,10 +305,8 @@ class ETHDataset(object):
                     self.imle_data_dict['y_t'][item],
                     self.imle_data_dict['y_pred_data'][item]
                 ]
-            # Synchronization: Extract start_frame from IMLE metadata
             start_frame = int(self.imle_data_dict['start_frame'][item])
         else:
-            ### past traj, future traj, number of pedestrians (presumbly?), index
             past_traj_norm_scale = self.past_traj[item]                             # [A, P, 6]
             fut_traj_norm_scale = self.fut_traj[item]                               # [A, F, 2] 
             past_traj_original_scale = self.past_traj_original_scale[item]          # [A, P, 6]
@@ -389,39 +354,6 @@ class ETHDataset(object):
                 z_video,
             ]
 
-            ## Synchronization: Map item to start_frame based on dataset type
-            # if self.type == 'LED':
-            #     start_frame = int(self.frame_ids[item])# 
-            # else:
-            #     start_frame = int(self.data[item]['start_frame'])
-
-        # --- PHASE 2: Video-MoFlow Synchronization (OPENCV DOUBLE FIX) ---
-        raw_val = self.frame_ids[item]
-        start_frame = int(np.ravel(raw_val).item())
-
-        cap = cv2.VideoCapture(self.video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        video_frames = []
-        for i in range(8):
-            frame_idx = min(start_frame + (i * 10), total_frames - 1)  # clamp to valid range
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                frame = np.zeros((224, 224, 3), dtype=np.uint8)
-            else:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            video_frames.append(self.video_transform(frame))
-
-        cap.release()
-        
-        # Create visual evidence tensor V [1]
-        video_tensor = torch.stack(video_frames, dim=0)
-
-        # --- PHASE 3: Appending Video to Output ---
-        # Append video_tensor as the last element of the 'out' list
-        out.append(video_tensor)
-
         return out
 
     def world_to_pixel_backup(self, traj_pts, target_res=(224, 224)):
@@ -458,9 +390,6 @@ class ETHDataset(object):
         img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min) * (orig_w - 2*pad) + pad
         img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min) * (orig_h - 2*pad) + pad
         
-        # if self.SCENE_FLIP_X.get(self.subset, False):
-        #    img_pts[:, 0] = orig_w - img_pts[:, 0]
-
         # Y-axis is inverted relative to image coordinates in all ETH-UCY scenes
         img_pts[:, 1] = orig_h - img_pts[:, 1]
 
