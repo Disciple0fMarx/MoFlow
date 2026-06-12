@@ -46,7 +46,7 @@ class FrameFeatureLookup:
         feats = np.load(npy)
         man = pd.read_parquet(manifest)
         # Manifest columns: scene, frame_id, path, idx
-        fmap = dict(zip(man["frame_id"].astype(int), man["idx"].astype(int)))
+        fmap = dict(zip(man["frame_id"].astype(int), man["row_idx"].astype(int)))
         sorted_ids = np.sort(np.fromiter(fmap.keys(), dtype=np.int64))
         return cls(scene=scene, features=feats, frame_to_row=fmap, sorted_frame_ids=sorted_ids)
 
