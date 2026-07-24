@@ -29,7 +29,7 @@ def parse_config():
     # Data configuration
     parser.add_argument('--epochs', default=None, type=int, help='Override the number of epochs in the config file.')
     parser.add_argument('--batch_size', default=None, type=int, help='Override the batch size in the config file.')
-    parser.add_argument('--data_dir', type=str, default='./data/sdd', help='Directory where the data is stored.')
+    parser.add_argument('--data_dir', type=str, default='/home/efrei_stage/Desktop/Datasets/SDD', help='Directory where the data is stored.')
     parser.add_argument('--subset', type=str, default=None, help='Scene subset for Leave-One-Out (use None or all for full dataset)')
     parser.add_argument('--n_train', type=int, default=None, help='Override the number training scenes used.')
     parser.add_argument('--n_test', type=int, default=None, help='Override the number testing scenes used.')
