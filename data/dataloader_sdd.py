@@ -123,13 +123,16 @@ def seq_collate_imle_train(batch):
 
 
 class SDDDataset(Dataset):
-    def __init__(self, cfg, data_dir, 
-                 training=True, overfit=False, rotate_time_frame=0, imle=False):
+    def __init__(self, cfg, data_dir,
+                 training=True, overfit=False, rotate_time_frame=0, imle=False, subset=None):
         super(SDDDataset, self).__init__()
 
         """init"""
         self.cfg = cfg
-        dataset_file = os.path.join(data_dir, 'original/sdd_train.pkl') if training else os.path.join(data_dir, 'original/sdd_test.pkl')
+        if subset is None or subset == 'all':
+            dataset_file = os.path.join(data_dir, 'original/sdd_train.pkl') if training else os.path.join(data_dir, 'original/sdd_test.pkl')
+        else:
+            dataset_file = os.path.join(data_dir, 'original', subset, ('sdd_train.pkl' if training else 'sdd_test.pkl'))
         if overfit:
             dataset_file = os.path.join(data_dir, 'original/sdd_train.pkl')
 
@@ -141,7 +144,7 @@ class SDDDataset(Dataset):
 
         self.training = training
         self.overfit = overfit
-        self.scene = 'sdd'  # treat entire dataset as single scene for video features
+        self.scene = subset if (subset is not None and subset != 'all') else 'sdd'  # treat entire dataset as single scene for video features
 
         self.rotate_time_frame = rotate_time_frame
         self.imle = imle

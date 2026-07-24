@@ -30,6 +30,7 @@ def parse_config():
     parser.add_argument('--epochs', default=None, type=int, help='Override the number of epochs in the config file.')
     parser.add_argument('--batch_size', default=None, type=int, help='Override the batch size in the config file.')
     parser.add_argument('--data_dir', type=str, default='./data/sdd', help='Directory where the data is stored.')
+    parser.add_argument('--subset', type=str, default=None, help='Scene subset for Leave-One-Out (use None or all for full dataset)')
     parser.add_argument('--n_train', type=int, default=None, help='Override the number training scenes used.')
     parser.add_argument('--n_test', type=int, default=None, help='Override the number testing scenes used.')
     parser.add_argument('--checkpt_freq', default=5, type=int, help='Override the checkpt_freq in the config file.')
@@ -289,7 +290,8 @@ def build_data_loader(cfg, args):
         cfg=cfg,
         training=True,
         data_dir=args.data_dir,
-        rotate_time_frame=args.rotate_time_frame)
+        rotate_time_frame=args.rotate_time_frame,
+        subset=args.subset)
 
     train_loader = DataLoader(
         train_dset,
@@ -304,7 +306,8 @@ def build_data_loader(cfg, args):
         cfg=cfg,
         training=False,
         data_dir=args.data_dir,
-        rotate_time_frame=args.rotate_time_frame)
+        rotate_time_frame=args.rotate_time_frame,
+        subset=args.subset)
         
     test_loader = DataLoader(
         test_dset,
