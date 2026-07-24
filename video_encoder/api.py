@@ -12,6 +12,7 @@ GET  /api/scenes/{scene}/info             -> counts, frame range, stride, world 
 GET  /api/scenes/{scene}/trajectories     -> all rows {frame_id, ped_id, x, y}
 GET  /api/scenes/{scene}/frames           -> sorted list of available frame indices
 GET  /api/scenes/{scene}/frame/{fid}.jpg  -> JPEG bytes (snapped to nearest dumped frame)
+GET  /api/scenes/{scene}/frame/{fid}/agent_crops -> agent crops for that frame (JSON with base64)
 GET  /api/scenes/{scene}/stats            -> density-over-time, speed-distribution, per-ped counts
 GET  /api/loso/{held_out}                 -> train/val row counts per training scene, cutoffs
 POST /api/features                        -> body: {npy_path}; returns 2-D PCA + indices
@@ -25,10 +26,11 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
+from PIL import Image
 
 from .scenes import CANONICAL_SCENES, scene_to_folder, others
 from .trajectories import load_raw_trajectories
@@ -46,16 +48,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ---------- caches ----------
 _traj_cache: dict[str, pd.DataFrame] = {}
-
 
 def _traj(scene: str) -> pd.DataFrame:
     if scene not in _traj_cache:
         _traj_cache[scene] = load_raw_trajectories(DATA_ROOT, scene)
     return _traj_cache[scene]
-
 
 def _scene_exists(scene: str) -> bool:
     try:
@@ -64,6 +63,60 @@ def _scene_exists(scene: str) -> bool:
         return False
     return True
 
+# Scene-specific constants (copied from dataloader_eth_ucy.py)
+SCENE_RESOLUTIONS = {
+    'eth':   (640, 480),
+    'hotel': (720, 576),
+    'univ':  (720, 576),
+    'zara1': (720, 576),
+    'zara2': (720, 576),
+    # SDD scenes - SDD videos are typically 1280x720 (720p)
+    'bookstore': (1280, 720),
+    'coupa': (1280, 720),
+    'deathCircle': (1280, 720),
+    'gates': (1280, 720),
+    'hyang': (1280, 720),
+    'little': (1280, 720),
+    'nexus': (1280, 720),
+    'quad': (1280, 720),
+}
+
+SCENE_WORLD_BOUNDS = {
+    'eth':   (-7.69, 13.89,  -1.81, 12.67),
+    'hotel': (-10.31, 4.31, -2.77,  4.04),
+    'univ':  (-0.46, 15.47,  -0.32, 13.89),
+    'zara1': (-0.14, 15.48,  -0.37, 12.39),
+    'zara2': (-0.36, 15.56,  -0.19, 13.48),
+    # SDD scenes - set to make world_to_pixel approximately identity for visualization
+    # Derived from: xmin=pad, xmax=width-pad, ymin=height-pad, ymax=pad (with pad=10)
+    # This ensures that when trajectory data is in pixel coordinates matching the video,
+    # the world_to_pixel function returns approximately the same coordinates for visualization
+    'bookstore': (10, 1270, 710, 10),
+    'coupa': (10, 1270, 710, 10),
+    'deathCircle': (10, 1270, 710, 10),
+    'gates': (10, 1270, 710, 10),
+    'hyang': (10, 1270, 710, 10),
+    'little': (10, 1270, 710, 10),
+    'nexus': (10, 1270, 710, 10),
+    'quad': (10, 1270, 710, 10),
+}
+
+def world_to_pixel(traj_pts, scene: str, target_res=(64, 64)):
+    """Convert world coordinates to pixel coordinates using scene bounds.
+    Mirrors ETHDataset.world_to_pixel (with 10-pixel padding).
+    """
+    traj_w = np.array(traj_pts, dtype=np.float64)
+    orig_w, orig_h = SCENE_RESOLUTIONS[scene]
+    x_min, x_max, y_min, y_max = SCENE_WORLD_BOUNDS[scene]
+    pad = 10
+    img_pts = np.zeros_like(traj_w)
+    img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min) * (orig_w - 2*pad) + pad
+    img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min) * (orig_h - 2*pad) + pad
+    # Y-axis is inverted relative to image coordinates in all ETH-UCY scenes
+    img_pts[:, 1] = orig_h - img_pts[:, 1]
+    img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
+    img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
+    return img_pts
 
 # ---------- routes ----------
 @app.get("/api/health")
@@ -173,6 +226,87 @@ def frame(scene: str, fid: int):
         return FileResponse(str(p), media_type="image/jpeg")
     except FileNotFoundError:
         raise HTTPException(404, f"frame {fid} not available")
+
+
+@app.get("/api/scenes/{scene}/frame/{fid}/agent_crops")
+def agent_crops(
+    scene: str,
+    fid: int,
+    size: int = Query(64, gt=0, le=256),
+):
+    """Return agent crops for the given scene and frame ID as base64 JPEGs."""
+    if scene not in CANONICAL_SCENES:
+        raise HTTPException(404, "unknown scene")
+    # Snap frame ID to nearest available frame
+    try:
+        available_frames = list_available_frames(str(DATA_ROOT), scene)
+    except FileNotFoundError:
+        raise HTTPException(404, f"No frames found for scene {scene}")
+    snapped = snap_frame_id(fid, available_frames, policy="nearest")
+    if snapped is None:
+        raise HTTPException(404, f"Frame {fid} not available for scene {scene}")
+    # Load trajectories
+    df = _traj(scene)
+    # Filter rows for the snapped frame
+    rows = df[df["frame_id"] == snapped]
+    if rows.empty:
+        # No agents at this frame
+        return JSONResponse({"frame_id": snapped, "crops": []})
+    # Load the full frame image
+    img_path = frame_path(DATA_ROOT, scene, snapped)
+    try:
+        img = Image.open(img_path).convert("RGB")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load frame image: {e}")
+    width, height = img.size
+    crops_b64 = []
+    for _, row in rows.iterrows():
+        world_xy = np.array([[float(row["x"]), float(row["y"])]])
+        pixel_xy = world_to_pixel(world_xy, scene, target_res=(size, size))[0]
+        px, py = int(round(pixel_xy[0])), int(round(pixel_xy[1]))
+        # Calculate crop boundaries
+        x1 = px - size // 2
+        y1 = py - size // 2
+        x2 = x1 + size
+        y2 = y1 + size
+        # Compute padding needed
+        pad_left = max(0, -x1)
+        pad_top = max(0, -y1)
+        pad_right = max(0, x2 - width)
+        pad_bottom = max(0, y2 - height)
+        # Adjust crop coordinates to image bounds
+        x1_clip = max(0, x1)
+        y1_clip = max(0, y1)
+        x2_clip = min(width, x2)
+        y2_clip = min(height, y2)
+        # Extract region
+        if x2_clip > x1_clip and y2_clip > y1_clip:
+            crop_img = img.crop((x1_clip, y1_clip, x2_clip, y2_clip))
+        else:
+            # No overlap -> black image
+            crop_img = Image.new("RGB", (size, size), (0, 0, 0))
+        # Apply padding if needed
+        if pad_left or pad_top or pad_right or pad_bottom:
+            padded = Image.new("RGB", (size, size), (0, 0, 0))
+            padded.paste(crop_img, (pad_left, pad_top))
+            crop_img = padded
+        # Encode to JPEG base64
+        buffer = io.BytesIO()
+        crop_img.save(buffer, format="JPEG")
+        jpeg_bytes = buffer.getvalue()
+        import base64
+        b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+        crops_b64.append({
+            "ped_id": int(row["ped_id"]),
+            "crop_base64": b64,
+        })
+    return JSONResponse({
+        "scene": scene,
+        "frame_id": snapped,
+        "requested_frame_id": fid,
+        "size": size,
+        "crops": crops_b64,
+    })
 
 
 @app.get("/api/scenes/{scene}/stats")

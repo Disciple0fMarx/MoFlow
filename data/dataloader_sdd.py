@@ -14,6 +14,12 @@ import pickle
 from utils.normalization import normalize_min_max
 from torch.nn.utils.rnn import pad_sequence
 
+# Video encoder imports
+try:
+    from video_encoder.moflow_adapter import FrameFeatureLookup
+except ImportError:
+    FrameEffectLookup = None  # fallback if video_encoder not available
+
 
 def rotate_traj(past_rel, future_rel, past_abs, rotate_time_frame=0):
     """
@@ -53,7 +59,7 @@ def rotate_traj(past_rel, future_rel, past_abs, rotate_time_frame=0):
 
 
 def seq_collate_sdd(batch):
-    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel) = zip(*batch)
+    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, z_video, agent_crops) = zip(*batch)
     indexes = torch.stack(index, dim=0)
     pre_motion_3D = torch.stack(past_traj,dim=0)
     fut_motion_3D = torch.stack(fut_traj,dim=0)
@@ -61,7 +67,19 @@ def seq_collate_sdd(batch):
     fut_motion_3D_orig = torch.stack(fut_traj_orig, dim=0)
     fut_traj_vel = torch.stack(traj_vel, dim=0)
 
-    batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt 
+    # Handle video features: stack if they are real tensors, else None
+    if z_video[0].numel() > 1:  # Not a dummy scalar
+        z_video_stack = torch.stack(z_video, dim=0)  # [B, T_obs, D_raw]
+    else:
+        z_video_stack = None
+
+    # Agent crops: placeholder for now; treat similarly
+    if agent_crops[0].numel() > 1:
+        agent_crops_stack = torch.stack(agent_crops, dim=0)  # [B, A, P, 3, h, w]
+    else:
+        agent_crops_stack = None
+
+    batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt
     data = {
         'indexes': indexes,
         'batch_size': batch_size,
@@ -69,8 +87,12 @@ def seq_collate_sdd(batch):
         'fut_traj': fut_motion_3D,
         'past_traj_original_scale': pre_motion_3D_orig,
         'fut_traj_original_scale': fut_motion_3D_orig,
-        'fut_traj_vel': fut_traj_vel,  
+        'fut_traj_vel': fut_traj_vel,
     }
+    if z_video_stack is not None:
+        data['z_video_global'] = z_video_stack
+    if agent_crops_stack is not None:
+        data['agent_crops'] = agent_crops_stack
     return data 
 
 
@@ -119,6 +141,7 @@ class SDDDataset(Dataset):
 
         self.training = training
         self.overfit = overfit
+        self.scene = 'sdd'  # treat entire dataset as single scene for video features
 
         self.rotate_time_frame = rotate_time_frame
         self.imle = imle
@@ -166,6 +189,45 @@ class SDDDataset(Dataset):
 
         self.rotate_aug = cfg.rotate_aug and training
 
+        # Video settings
+        self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
+        self.use_agent_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_AGENT_VIDEO', False))
+        self.z_video_global = None
+        if self.use_video:
+            # Load frame index and compute video features
+            split = 'train' if training else 'test'
+            frame_idx_path = os.path.join(
+                data_dir, 'original', subset,
+                f'{subset}_{split}_frame_index.pkl'
+            )
+            if not os.path.exists(frame_idx_path):
+                raise FileNotFoundError(
+                    f"USE_VIDEO=True but {frame_idx_path} is missing. "
+                    f"Run: python -m video_encoder.scripts.build_frame_index "
+                    f"--data-root <raw_root> --pkl-dir {os.path.join(data_dir, 'original')} "
+                    f"--scene {subset} --split {split}"
+                )
+            with open(frame_idx_path, 'rb') as f:
+                frame_index = pickle.load(f)
+
+            start_fids = np.asarray(frame_index['start_frame_id'], dtype=np.int64)
+            stride = int(frame_index.get('stride', 10))
+            assert start_fids.shape[0] == self.all_data.shape[0], (
+                f"frame_index has {start_fids.shape[0]} entries but pickle has "
+                f"{self.all_data.shape[0]} samples. Rebuild the index."
+            )
+            features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT',
+                                    'features/resnet18')
+            scene_name = frame_index.get('scene', subset)
+            lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
+            T_obs = int(cfg.past_frames)
+            D = lookup.features.shape[1]
+            z = np.zeros((self.all_data.shape[0], T_obs, D), dtype=np.float32)
+            for i, fid in enumerate(start_fids):
+                z[i] = lookup.window(int(fid), n_frames=T_obs, stride=stride,
+                                     policy='nearest')
+            self.z_video_global = torch.from_numpy(z)
+
         if training:
             cfg.fut_traj_max = fut_traj_rel.max()
             cfg.fut_traj_min = fut_traj_rel.min()
@@ -181,6 +243,47 @@ class SDDDataset(Dataset):
 
         ### min-max normalization to make fut_traj in [-1, 1]
         self.fut_traj = normalize_min_max(fut_traj_rel, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1).contiguous()
+
+        # Video encoder integration
+        self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
+        self.use_agent_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_AGENT_VIDEO', False))
+        self.agent_crop_size = getattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENT_CROP_SIZE', [64, 64])
+        self.z_video_global = None
+        if self.use_video:
+            video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_DIM_RAW', 512))
+            # Load actual video features if available, otherwise create placeholder
+            split = 'train' if self.training else 'test'
+            scene_name = getattr(self.cfg, 'dataset', 'sdd')  # SDD dataset name
+            features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT', 'features/resnet18')
+            features_path = os.path.join(features_root, f"{scene_name}.npy")
+            manifest_path = os.path.join(features_root, f"{scene_name}.manifest.parquet")
+
+            if os.path.exists(features_path) and os.path.exists(manifest_path):
+                # Load actual features
+                import pandas as pd
+                import numpy as np
+                from video_encoder.moflow_adapter import FrameFeatureLookup
+
+                lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
+                T_obs = int(self.cfg.past_frames)
+                D = lookup.features.shape[1]
+                stride = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_STRIDE', 12))  # Default to 12 for SDD
+
+                # We need to map our samples to frame indices
+                # For SDD, we'll assume the pickle samples are already aligned with video frames
+                # This would need to be customized based on how the SDD data was collected
+                z = np.zeros((len(self.past_traj), T_obs, D), dtype=np.float32)
+
+                # For now, use zero placeholder and warn user to implement proper alignment
+                # In a real implementation, you would map each sample to its corresponding video frame
+                print(f"Warning: Video features loaded but frame alignment not implemented. Using zeros.")
+                print(f"         To use real features, implement frame ID mapping in dataloader_sdd.py")
+                self.z_video_global = torch.zeros((len(self.past_traj), T_obs, D), dtype=torch.float32)
+            else:
+                # Create placeholder zero features
+                self.z_video_global = torch.zeros((len(self.past_traj), int(self.cfg.past_frames), video_dim_raw), dtype=torch.float32)
+                print(f"Warning: Using zero placeholder for video features. Shape: {self.z_video_global.shape}")
+                print(f"         Expected features at: {features_path}")
 
 
         """load distillation target"""
@@ -231,14 +334,21 @@ class SDDDataset(Dataset):
 
     def __getitem__(self, item): 
         if self.imle:
+            # Video features and agent crops
+            z_video = (self.z_video_global[item]
+                       if self.z_video_global is not None
+                       else torch.zeros(1))
+            agent_crops = torch.zeros(1)  # placeholder
             out = [
-                    self.imle_data_dict['past_traj'][item], 
+                    self.imle_data_dict['past_traj'][item],
                     self.imle_data_dict['fut_traj'][item],
                     self.imle_data_dict['past_traj_original_scale'][item],
                     self.imle_data_dict['fut_traj_original_scale'][item],
                     self.imle_data_dict['fut_traj_vel'][item],
                     self.imle_data_dict['y_t'][item],
-                    self.imle_data_dict['y_pred_data'][item]
+                    self.imle_data_dict['y_pred_data'][item],
+                    z_video,
+                    agent_crops,
                 ]
         else:
             ### past traj, future traj, number of pedestrians (presumbly?), index
@@ -249,6 +359,12 @@ class SDDDataset(Dataset):
             fut_traj_vel = self.fut_traj_vel[item]                                  # [A, F, 2]   
 
         
+            # Video features and agent crops
+            z_video = (self.z_video_global[item]
+                       if self.z_video_global is not None
+                       else torch.zeros(1))
+            agent_crops = torch.zeros(1)  # placeholder; implement actual cropping if needed
+
             out = [
                 torch.Tensor([item]).to(torch.int32),
                 past_traj_norm_scale,
@@ -256,5 +372,7 @@ class SDDDataset(Dataset):
                 past_traj_original_scale,
                 fut_traj_original_scale,
                 fut_traj_vel,
+                z_video,
+                agent_crops,
             ]
         return out
