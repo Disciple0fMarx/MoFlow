@@ -121,16 +121,15 @@ def seq_collate_imle_train(batch):
 
 
 class SDDDataset(Dataset):
-    """Dataset for Stanford Drone Dataset (SDD)"""
-    
     def __init__(self, cfg, data_dir, 
                  training=True, overfit=False, rotate_time_frame=0, imle=False, subset=None):
         super(SDDDataset, self).__init__()
 
+        """init"""
         self.cfg = cfg
         self.training = training
         self.overfit = overfit
-        self.scene = 'sdd'
+        self.scene = 'sdd'  # treat entire dataset as single scene for video features
         self.rotate_time_frame = rotate_time_frame
         self.imle = imle
         self.subset = subset
@@ -141,95 +140,23 @@ class SDDDataset(Dataset):
         self.max_agents_per_scene = 0
         assert self.seq_len == 20 and self.past_frames == 8, "Sanity check on frame length failed!"
 
-        # Load trajectories from raw SDD annotations
+        """Load trajectories from raw SDD annotations"""
         all_data = self._load_sdd_trajectories(data_dir, training, subset)
         
         print("Mode: {:s}, {:d} sequences".format('train' if training else 'test', len(all_data)))
 
-        # Set agent count
-        cfg.MODEL.CONTEXT_ENCODER.AGENTS = cfg.agents
-        
-        # Compute past and future trajectories
-        past_traj_abs = torch.from_numpy(np.stack([scene[0] for scene in all_data], axis=0)).unsqueeze(1)    # [N, 1, T, 2]
-        initial_pos = past_traj_abs[:, :, -1:, :]                                                            # [N, 1, 1, 2]
-        past_traj_rel = (past_traj_abs - initial_pos).contiguous()                                           # [N, 1, T, 2]
-
-        fut_traj_abs = torch.from_numpy(np.stack([scene[1] for scene in all_data], axis=0)).unsqueeze(1)     # [N, 1, T, 2]
-        fut_traj_rel = (fut_traj_abs - initial_pos).contiguous()                                             # [N, 1, T, 2]
-
-        if getattr(cfg, 'rotate', False):
-            past_traj_rel, fut_traj_rel, past_traj_abs = rotate_traj(past_traj_rel, fut_traj_rel, past_traj_abs, rotate_time_frame)
-
-        past_traj_vel = torch.cat((past_traj_rel[:, :, 1:] - past_traj_rel[:, :, :-1], torch.zeros_like(past_traj_rel[:,:, -1:])), dim=2)
-        past_traj = torch.cat((past_traj_abs, past_traj_rel, past_traj_vel), dim=-1)
-        self.fut_traj_vel = torch.cat((fut_traj_rel[:, :, 1:] - fut_traj_rel[:,:, :-1], torch.zeros_like(fut_traj_rel[:, :, -1:])), dim=2)
-
-        self.rotate_aug = getattr(cfg, 'rotate_aug', False) and training
-
-        # Video settings
-        self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
-        self.use_agent_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_AGENT_VIDEO', False))
-        self.agent_crop_size = getattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENT_CROP_SIZE', [64, 64])
-        self.z_video_global = None
-
-        if self.use_video:
-            # Load frame index and compute video features
-            split = 'train' if training else 'test'
-            frame_idx_path = os.path.join(data_dir, f'sdd_{split}_frame_index.pkl')
-            
-            if not os.path.exists(frame_idx_path):
-                print(f"Warning: USE_VIDEO=True but {frame_idx_path} is missing.")
-                print(f"         Using zero placeholder for video features.")
-                video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_DIM_RAW', 512))
-                self.z_video_global = torch.zeros((len(all_data), int(cfg.past_frames), video_dim_raw), dtype=torch.float32)
-            else:
-                try:
-                    with open(frame_idx_path, 'rb') as f:
-                        frame_index = pickle.load(f)
-                    
-                    start_fids = np.asarray(frame_index['start_frame_id'], dtype=np.int64)
-                    stride = int(frame_index.get('stride', 10))
-                    
-                    assert start_fids.shape[0] == len(all_data), (
-                        f"frame_index has {start_fids.shape[0]} entries but we have "
-                        f"{len(all_data)} samples. Mismatch!"
-                    )
-                    
-                    features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT', 'features/resnet18')
-                    scene_name = frame_index.get('scene', 'sdd')
-                    
-                    lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
-                    T_obs = int(cfg.past_frames)
-                    D = lookup.features.shape[1]
-                    z = np.zeros((len(all_data), T_obs, D), dtype=np.float32)
-                    for i, fid in enumerate(start_fids):
-                        z[i] = lookup.window(int(fid), n_frames=T_obs, stride=stride, policy='nearest')
-                    self.z_video_global = torch.from_numpy(z)
-                except Exception as e:
-                    print(f"Warning: Failed to load video features ({e}). Using zero placeholders.")
-                    video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_DIM_RAW', 512))
-                    self.z_video_global = torch.zeros((len(all_data), int(cfg.past_frames), video_dim_raw), dtype=torch.float32)
-
-        if training:
-            cfg.fut_traj_max = fut_traj_rel.max()
-            cfg.fut_traj_min = fut_traj_rel.min()
-            cfg.past_traj_max = past_traj.max()
-            cfg.past_traj_min = past_traj.min()
-
-        # Record original scale
-        self.past_traj_original_scale = past_traj
-        self.fut_traj_original_scale = fut_traj_rel
-
-        # Min-max normalization
-        self.past_traj = normalize_min_max(past_traj, cfg.past_traj_min, cfg.past_traj_max, -1, 1).contiguous()
-        self.fut_traj = normalize_min_max(fut_traj_rel, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1).contiguous()
-
-        # Load distillation target for IMLE if needed
-        if imle:
-            self._load_imle_data(data_dir)
-
     def _load_sdd_trajectories(self, data_root, training, subset=None):
-        """Load trajectories from raw SDD annotation files."""
+        """
+        Load trajectories from raw SDD annotation files.
+        
+        Args:
+            data_root: Path to /home/efrei_stage/Desktop/Datasets/SDD
+            training: If True, mix all scenes; if False, use test split
+            subset: If specified, only load this scene (e.g., 'bookstore')
+        
+        Returns:
+            List of [past_traj, fut_traj] pairs where each is numpy array [T, 2]
+        """
         SDD_SCENES = ['bookstore', 'coupa', 'deathCircle', 'gates', 'hyang', 'little', 'nexus', 'quad']
         
         if subset is not None:
@@ -241,6 +168,7 @@ class SDDDataset(Dataset):
         
         for scene in scenes_to_use:
             scene_annotations_dir = os.path.join(data_root, 'annotations', scene)
+            scene_videos_dir = os.path.join(data_root, 'videos', scene)
             
             if not os.path.isdir(scene_annotations_dir):
                 print(f"Warning: Scene directory not found: {scene_annotations_dir}")
@@ -254,6 +182,7 @@ class SDDDataset(Dataset):
                 ann_file = os.path.join(scene_annotations_dir, video_id, 'annotations.txt')
                 
                 if not os.path.exists(ann_file):
+                    print(f"Warning: Annotation file not found: {ann_file}")
                     continue
                 
                 # Load annotations
@@ -280,18 +209,22 @@ class SDDDataset(Dataset):
                     track_data = track_data[np.argsort(track_data[:, 5].astype(int))]
                     
                     # Extract center coordinates from bounding box
-                    # Columns: xmin(1), ymin(2), xmax(3), ymax(4)
+                    # Columns: xmin, ymin, xmax, ymax = 1, 2, 3, 4
                     x_center = (track_data[:, 1] + track_data[:, 3]) / 2.0
                     y_center = (track_data[:, 2] + track_data[:, 4]) / 2.0
+                    frame_ids = track_data[:, 5].astype(int)
                     
                     # Create trajectory array
-                    trajectory = np.column_stack([x_center, y_center]).astype(np.float32)
+                    trajectory = np.column_stack([x_center, y_center])
                     
-                    # Create sliding windows
+                    # Create sliding windows of length seq_len
                     for start_idx in range(len(trajectory) - self.seq_len + 1):
                         window = trajectory[start_idx:start_idx + self.seq_len]
+                        
+                        # Split into past and future
                         past_traj = window[:self.past_frames]  # [8, 2]
                         fut_traj = window[self.past_frames:]    # [12, 2]
+                        
                         all_trajectories.append([past_traj, fut_traj])
         
         if len(all_trajectories) == 0:
@@ -300,72 +233,164 @@ class SDDDataset(Dataset):
         print(f"Loaded {len(all_trajectories)} trajectory windows from {data_root}")
         return all_trajectories
 
-    def _load_imle_data(self, data_dir):
-        """Load IMLE distillation targets."""
-        os.makedirs(os.path.join(data_dir, 'imle'), exist_ok=True)
-        pkl_ls = sorted(glob(os.path.join(data_dir, f'imle/*train*.pkl')))
-
-        keys_ls = ['past_traj', 'fut_traj', 'past_traj_original_scale', 'fut_traj_original_scale', 'fut_traj_vel', 'y_t', 'y_pred_data']
-        imle_data_dict = {}
-        total_scenes_loaded_ = 0   
+    def _continue_init(self, cfg, all_data, data_dir, training, rotate_time_frame, imle):
+        """Continue initialization after loading trajectories."""
+        """process the data"""
+        ### set the agent_num in the cfg
+        cfg.MODEL.CONTEXT_ENCODER.AGENTS = cfg.agents
         
-        for i_pkl, cur_pkl in enumerate(pkl_ls):
-            data = pickle.load(open(cur_pkl, 'rb'))
+        ### compute past and future trajectories
+        past_traj_abs = torch.from_numpy(np.stack([scene[0] for scene in all_data], axis=0)).unsqueeze(1)    # [N, 1, T, 2]
+        initial_pos = past_traj_abs[:, :, -1:, :]                                                            # [N, 1, 1, 2]
+        past_traj_rel = (past_traj_abs - initial_pos).contiguous()                                           # [N, 1, T, 2]
 
-            if i_pkl == 0:
-                self.imle_meta_data = data['meta_data']
-            
+        fut_traj_abs = torch.from_numpy(np.stack([scene[1] for scene in all_data], axis=0)).unsqueeze(1)     # [N, 1, T, 2]
+        fut_traj_rel = (fut_traj_abs - initial_pos).contiguous()                                             # [N, 1, T, 2]
+
+        if getattr(cfg, 'rotate', False):
+            past_traj_rel, fut_traj_rel, past_traj_abs = rotate_traj(past_traj_rel, fut_traj_rel, past_traj_abs, rotate_time_frame)
+
+        past_traj_vel = torch.cat((past_traj_rel[:, :, 1:] - past_traj_rel[:, :, :-1], torch.zeros_like(past_traj_rel[:,:, -1:])), dim=2)
+        past_traj = torch.cat((past_traj_abs, past_traj_rel, past_traj_vel), dim=-1)
+        self.fut_traj_vel = torch.cat((fut_traj_rel[:, :, 1:] - fut_traj_rel[:,:, :-1], torch.zeros_like(fut_traj_rel[:, :, -1:])), dim=2)
+
+        self.rotate_aug = getattr(cfg, 'rotate_aug', False) and training
+
+        # Video settings
+        self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
+        self.use_agent_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_AGENT_VIDEO', False))
+        self.agent_crop_size = getattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENT_CROP_SIZE', [64, 64])
+        self.z_video_global = None
+        if self.use_video:
+            # Load frame index and compute video features
+            split = 'train' if training else 'test'
+            frame_idx_path = os.path.join(
+                data_dir, 'original',
+                f'sdd_{split}_frame_index.pkl'
+            )
+            if not os.path.exists(frame_idx_path):
+                print(f"Warning: USE_VIDEO=True but {frame_idx_path} is missing.")
+                print(f"         Using zero placeholder for video features.")
+                video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_DIM_RAW', 512))
+                self.z_video_global = torch.zeros((len(all_data), int(cfg.past_frames), video_dim_raw), dtype=torch.float32)
+            else:
+                with open(frame_idx_path, 'rb') as f:
+                    frame_index = pickle.load(f)
+
+                start_fids = np.asarray(frame_index['start_frame_id'], dtype=np.int64)
+                stride = int(frame_index.get('stride', 10))
+                assert start_fids.shape[0] == len(all_data), (
+                    f"frame_index has {start_fids.shape[0]} entries but pickle has "
+                    f"{len(all_data)} samples. Rebuild the index."
+                )
+                features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT',
+                                        'features/resnet18')
+                scene_name = frame_index.get('scene', 'sdd')
+                
+                try:
+                    lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
+                    T_obs = int(cfg.past_frames)
+                    D = lookup.features.shape[1]
+                    z = np.zeros((len(all_data), T_obs, D), dtype=np.float32)
+                    for i, fid in enumerate(start_fids):
+                        z[i] = lookup.window(int(fid), n_frames=T_obs, stride=stride,
+                                             policy='nearest')
+                    self.z_video_global = torch.from_numpy(z)
+                except Exception as e:
+                    print(f"Warning: Failed to load video features ({e}). Using zero placeholders.")
+                    video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_DIM_RAW', 512))
+                    self.z_video_global = torch.zeros((len(all_data), int(cfg.past_frames), video_dim_raw), dtype=torch.float32)
+
+        if training:
+            cfg.fut_traj_max = fut_traj_rel.max()
+            cfg.fut_traj_min = fut_traj_rel.min()
+            cfg.past_traj_max = past_traj.max()
+            cfg.past_traj_min = past_traj.min()
+
+        ### record the original to avoid numerical errors
+        self.past_traj_original_scale = past_traj
+        self.fut_traj_original_scale = fut_traj_rel
+
+        ### min-max normalization to make past_traj in [-1, 1]
+        self.past_traj = normalize_min_max(past_traj, cfg.past_traj_min, cfg.past_traj_max, -1, 1).contiguous()
+
+        ### min-max normalization to make fut_traj in [-1, 1]
+        self.fut_traj = normalize_min_max(fut_traj_rel, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1).contiguous()
+
+        """load distillation target"""
+        if imle:
+            os.makedirs(os.path.join(data_dir, 'imle'), exist_ok=True)
+            pkl_ls = sorted(glob(os.path.join(data_dir, f'imle/*train*.pkl')))
+
+            keys_ls = ['past_traj', 'fut_traj', 'past_traj_original_scale', 'fut_traj_original_scale', 'fut_traj_vel', 'y_t', 'y_pred_data']
+            imle_data_dict = {}
+            total_scenes_loaded_ = 0   
+            for i_pkl, cur_pkl in enumerate(pkl_ls):
+                data = pickle.load(open(cur_pkl, 'rb'))
+
+                if i_pkl == 0:
+                    self.imle_meta_data = data['meta_data']
+                
+                for key in keys_ls:
+                    if key not in imle_data_dict:
+                        imle_data_dict[key] = []
+                    if key == 'y_t':
+                        imle_data_dict[key].append(data[key][:, -1])
+                    else:
+                        imle_data_dict[key].append(data[key])
+
+                total_scenes_loaded_ += data['past_traj'].shape[0]
+
+                if total_scenes_loaded_ >= len(self.past_traj):
+                    break
+
+                if i_pkl == 0:
+                    past_tarj_original_scale_ = torch.from_numpy(data['past_traj_original_scale'])
+                    assert torch.sum(torch.abs(past_tarj_original_scale_[:10] - self.past_traj_original_scale[:10])) < 1e-5, 'IMLE data is not consistent'
+                    pass
+
+            # concat the data
             for key in keys_ls:
-                if key not in imle_data_dict:
-                    imle_data_dict[key] = []
-                if key == 'y_t':
-                    imle_data_dict[key].append(data[key][:, -1])
-                else:
-                    imle_data_dict[key].append(data[key])
+                imle_data_dict[key] = torch.from_numpy(np.concatenate(imle_data_dict[key], axis=0))[:len(self.past_traj)]
 
-            total_scenes_loaded_ += data['past_traj'].shape[0]
+            self.imle_data_dict = imle_data_dict
 
-            if total_scenes_loaded_ >= len(self.past_traj):
-                break
-
-            if i_pkl == 0:
-                past_traj_original_scale_ = torch.from_numpy(data['past_traj_original_scale'])
-                assert torch.sum(torch.abs(past_traj_original_scale_[:10] - self.past_traj_original_scale[:10])) < 1e-5, 'IMLE data is not consistent'
-
-        # Concat the data
-        for key in keys_ls:
-            imle_data_dict[key] = torch.from_numpy(np.concatenate(imle_data_dict[key], axis=0))[:len(self.past_traj)]
-
-        self.imle_data_dict = imle_data_dict
-
+    
     def __len__(self):
         return len(self.past_traj)
 
-    def __getitem__(self, item):
+    def __getitem__(self, item): 
         if self.imle:
-            z_video = (self.z_video_global[item] if self.z_video_global is not None else torch.zeros(1))
-            agent_crops = torch.zeros(1)
+            # Video features and agent crops
+            z_video = (self.z_video_global[item]
+                       if self.z_video_global is not None
+                       else torch.zeros(1))
+            agent_crops = torch.zeros(1)  # placeholder
             out = [
-                self.imle_data_dict['past_traj'][item],
-                self.imle_data_dict['fut_traj'][item],
-                self.imle_data_dict['past_traj_original_scale'][item],
-                self.imle_data_dict['fut_traj_original_scale'][item],
-                self.imle_data_dict['fut_traj_vel'][item],
-                self.imle_data_dict['y_t'][item],
-                self.imle_data_dict['y_pred_data'][item],
-                z_video,
-                agent_crops,
-            ]
+                    self.imle_data_dict['past_traj'][item],
+                    self.imle_data_dict['fut_traj'][item],
+                    self.imle_data_dict['past_traj_original_scale'][item],
+                    self.imle_data_dict['fut_traj_original_scale'][item],
+                    self.imle_data_dict['fut_traj_vel'][item],
+                    self.imle_data_dict['y_t'][item],
+                    self.imle_data_dict['y_pred_data'][item],
+                    z_video,
+                    agent_crops,
+                ]
         else:
+            ### past traj, future traj, number of pedestrians (presumbly?), index
             past_traj_norm_scale = self.past_traj[item]                             # [A, P, 6]
             fut_traj_norm_scale = self.fut_traj[item]                               # [A, F, 2] 
             past_traj_original_scale = self.past_traj_original_scale[item]          # [A, P, 6]
             fut_traj_original_scale = self.fut_traj_original_scale[item]            # [A, F, 2]
             fut_traj_vel = self.fut_traj_vel[item]                                  # [A, F, 2]   
 
-            # Video features
-            z_video = (self.z_video_global[item] if self.z_video_global is not None else torch.zeros(1))
-            agent_crops = torch.zeros(1)  # Placeholder
+        
+            # Video features and agent crops
+            z_video = (self.z_video_global[item]
+                       if self.z_video_global is not None
+                       else torch.zeros(1))
+            agent_crops = torch.zeros(1)  # placeholder; implement actual cropping if needed
 
             out = [
                 torch.Tensor([item]).to(torch.int32),
@@ -377,7 +402,6 @@ class SDDDataset(Dataset):
                 z_video,
                 agent_crops,
             ]
-        
         return out
 
 
