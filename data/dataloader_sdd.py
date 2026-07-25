@@ -256,9 +256,9 @@ class SDDDataset(Dataset):
                 if not os.path.exists(ann_file):
                     continue
                 
-                # Load annotations
+                # Load annotations (only columns we need: track_id, xmin, ymin, xmax, ymax, frame)
                 try:
-                    annotations = np.loadtxt(ann_file)
+                    annotations = np.loadtxt(ann_file, usecols=(0, 1, 2, 3, 4, 5))
                 except Exception as e:
                     print(f"Error loading {ann_file}: {e}")
                     continue
