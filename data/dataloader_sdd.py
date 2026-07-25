@@ -2,7 +2,6 @@ import os
 from glob import glob
 import pickle
 import math
-import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import numpy as np
 import torch
@@ -122,17 +121,22 @@ def seq_collate_imle_train(batch):
 
 
 class SDDDataset(Dataset):
-    def __init__(self, cfg, data_dir,
+    def __init__(self, cfg, data_dir, 
                  training=True, overfit=False, rotate_time_frame=0, imle=False, subset=None):
         super(SDDDataset, self).__init__()
 
         """init"""
         self.cfg = cfg
+        dataset_file = os.path.join(data_dir, 'original/sdd_train.pkl') if training else os.path.join(data_dir, 'original/sdd_test.pkl')
+        if overfit:
+            dataset_file = os.path.join(data_dir, 'original/sdd_train.pkl')
+
         self.training = training
         self.overfit = overfit
+        self.scene = 'sdd'  # treat entire dataset as single scene for video features
+
         self.rotate_time_frame = rotate_time_frame
         self.imle = imle
-        self.held_out_scene = subset  # None means use all scenes; if a scene name, it's the held-out test scene
 
         self.past_frames = cfg.past_frames
         self.future_frames = cfg.future_frames
@@ -140,348 +144,179 @@ class SDDDataset(Dataset):
         self.max_agents_per_scene = 0
         assert self.seq_len == 20 and self.past_frames == 8, "Sanity check on frame length failed!"
 
-        # Define all possible scenes
-        self.all_scenes = ['bookstore', 'coupa', 'deathCircle', 'gates', 'hyang', 'little', 'nexus', 'quad']
+        """load the data in the original scale"""
+        all_data = pickle.load(open(dataset_file, 'rb'))
 
-        # Determine which scenes to use based on held_out_scene and overfit
-        if self.overfit:
-            # When overfitting, use all scenes for both train and test
-            self.scenes_to_use = self.all_scenes
-        else:
-            if self.held_out_scene is None or self.held_out_scene == 'all':
-                # Use all scenes
-                self.scenes_to_use = self.all_scenes
-            else:
-                # held_out_scene is the scene to hold out for testing
-                if self.training:
-                    # Training set: all scenes except the held-out one
-                    self.scenes_to_use = [s for s in self.all_scenes if s != self.held_out_scene]
-                else:
-                    # Test set: only the held-out scene
-                    self.scenes_to_use = [self.held_out_scene]
+        print("Mode: {:s}, {:d} sequences".format('train' if training else 'test', len(all_data)))
 
-        # Print info
-        print(f"SDDDataset: Training={training}, Overfit={overfit}")
-        print(f"  Held-out scene: {self.held_out_scene}")
-        print(f"  Using scenes: {self.scenes_to_use}")
+        """process the data"""
+        ### set the agent_num in the cfg
+        cfg.MODEL.CONTEXT_ENCODER.AGENTS = cfg.agents
+        
+        ### compute past and future trajectories
+        past_traj_abs = torch.from_numpy(np.stack([scene[0] for scene in all_data], axis=0)).unsqueeze(1)    # [N, 1, T, 2]
+        initial_pos = past_traj_abs[:, :, -1:, :]                                                            # [N, 1, 1, 2]
+        past_traj_rel = (past_traj_abs - initial_pos).contiguous()                                           # [N, 1, T, 2]
 
-        # Load annotations and build dataset
-        self._build_dataset(data_dir)
+        fut_traj_abs = torch.from_numpy(np.stack([scene[1] for scene in all_data], axis=0)).unsqueeze(1)     # [N, 1, T, 2]
+        fut_traj_rel = (fut_traj_abs - initial_pos).contiguous()                                             # [N, 1, T, 2]
 
-        # After building dataset, set up the data in the format expected by the rest of the code
-        self._prepare_tensors()
+        if getattr(cfg, 'rotate', False):
+            past_traj_rel, fut_traj_rel, past_traj_abs = rotate_traj(past_traj_rel, fut_traj_rel, past_traj_abs, rotate_time_frame)
 
-        # Video settings (similar to original code)
+        past_traj_vel = torch.cat((past_traj_rel[:, :, 1:] - past_traj_rel[:, :, :-1], torch.zeros_like(past_traj_rel[:,:, -1:])), dim=2)
+        past_traj = torch.cat((past_traj_abs, past_traj_rel, past_traj_vel), dim=-1)
+        self.fut_traj_vel = torch.cat((fut_traj_rel[:, :, 1:] - fut_traj_rel[:,:, :-1], torch.zeros_like(fut_traj_rel[:, :, -1:])), dim=2)
+
+        self.rotate_aug = getattr(cfg, 'rotate_aug', False) and training
+
+        # Video settings
         self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
         self.use_agent_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_AGENT_VIDEO', False))
         self.agent_crop_size = getattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENT_CROP_SIZE', [64, 64])
         self.z_video_global = None
         if self.use_video:
-            video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_DIM_RAW', 512))
-            # Load actual video features if available, otherwise create placeholder
-            features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT',
-                                    'features/resnet18')
-            # For SDD, we treat the entire dataset as one "scene" for video features
-            scene_name = 'sdd'
-            features_path = os.path.join(features_root, f"{scene_name}.npy")
-            manifest_path = os.path.join(features_root, f"{scene_name}.manifest.parquet")
+            # Load frame index and compute video features
+            split = 'train' if training else 'test'
+            frame_idx_path = os.path.join(
+                data_dir, 'original',
+                f'sdd_{split}_frame_index.pkl'
+            )
+            if not os.path.exists(frame_idx_path):
+                print(f"Warning: USE_VIDEO=True but {frame_idx_path} is missing.")
+                print(f"         Using zero placeholder for video features.")
+                video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_DIM_RAW', 512))
+                self.z_video_global = torch.zeros((len(all_data), int(cfg.past_frames), video_dim_raw), dtype=torch.float32)
+            else:
+                with open(frame_idx_path, 'rb') as f:
+                    frame_index = pickle.load(f)
 
-            if os.path.exists(features_path) and os.path.exists(manifest_path):
-                # Load actual features
+                start_fids = np.asarray(frame_index['start_frame_id'], dtype=np.int64)
+                stride = int(frame_index.get('stride', 10))
+                assert start_fids.shape[0] == len(all_data), (
+                    f"frame_index has {start_fids.shape[0]} entries but pickle has "
+                    f"{len(all_data)} samples. Rebuild the index."
+                )
+                features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT',
+                                        'features/resnet18')
+                scene_name = frame_index.get('scene', 'sdd')
+                
                 try:
-                    import pandas as pd
-                    import numpy as np
-                    from video_encoder.moflow_adapter import FrameFeatureLookup
-
                     lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
-                    T_obs = int(self.cfg.past_frames)
+                    T_obs = int(cfg.past_frames)
                     D = lookup.features.shape[1]
-                    stride = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_STRIDE', 12))  # Default to 12 for SDD
-
-                    # We need to map each sample to a start frame ID
-                    # We stored the start frame in each sample during _build_dataset
-                    start_fids = np.array([s[3] for s in self.samples_with_frames], dtype=np.int64)
-                    z = np.zeros((len(self.samples_with_frames), T_obs, D), dtype=np.float32)
+                    z = np.zeros((len(all_data), T_obs, D), dtype=np.float32)
                     for i, fid in enumerate(start_fids):
                         z[i] = lookup.window(int(fid), n_frames=T_obs, stride=stride,
                                              policy='nearest')
                     self.z_video_global = torch.from_numpy(z)
                 except Exception as e:
                     print(f"Warning: Failed to load video features ({e}). Using zero placeholders.")
-                    self.z_video_global = torch.zeros((len(self.samples_with_frames), int(self.cfg.past_frames), video_dim_raw), dtype=torch.float32)
-                    print(f"Warning: Using zero placeholder for video features. Shape: {self.z_video_global.shape}")
-                    print(f"         Expected features at: {features_path}")
-            else:
-                # Create placeholder zero features
-                self.z_video_global = torch.zeros((len(self.samples_with_frames), int(self.cfg.past_frames), video_dim_raw), dtype=torch.float32)
-                print(f"Warning: Using zero placeholder for video features. Shape: {self.z_video_global.shape}")
-                print(f"         Expected features at: {features_path}")
+                    video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_DIM_RAW', 512))
+                    self.z_video_global = torch.zeros((len(all_data), int(cfg.past_frames), video_dim_raw), dtype=torch.float32)
 
-    def _get_scenes_to_use(self, all_scenes, held_out_scene, overfit, training):
-        """Determine which scenes to use based on split and overfit flag."""
-        if overfit:
-            return all_scenes
-        if held_out_scene is None or held_out_scene == 'all':
-            return all_scenes
-        else:
-            if training:
-                return [s for s in all_scenes if s != held_out_scene]
-            else:
-                return [held_out_scene]
+        if training:
+            cfg.fut_traj_max = fut_traj_rel.max()
+            cfg.fut_traj_min = fut_traj_rel.min()
+            cfg.past_traj_max = past_traj.max()
+            cfg.past_traj_min = past_traj.min()
 
-    def _build_dataset(self, data_dir):
-        """Build the dataset from annotation files."""
-        print(f"Loading annotations from {data_dir} for scenes: {self.scenes_to_use}")
+        ### record the original to avoid numerical errors
+        self.past_traj_original_scale = past_traj
+        self.fut_traj_original_scale = fut_traj_rel
 
-        # We'll collect:
-        #   all_windows: list of windows, each window is a list of 20 points (x, y, lost, occluded, generated, frame)
-        #   but we will filter by lost/occluded later
-        all_windows = []  # each element will be a dict: {'points': list of 20 (x,y), 'start_frame': int, 'valid': bool}
-        # Actually, we'll first collect raw windows that are consecutive in frame, then filter by lost/occluded
+        ### min-max normalization to make past_traj in [-1, 1]
+        self.past_traj = normalize_min_max(past_traj, cfg.past_traj_min, cfg.past_traj_max, -1, 1).contiguous()
 
-        # Step 1: Build tracks per scene/video/track_id
-        tracks_dict = defaultdict(list)  # key: (scene, video_dir, track_id) -> list of (frame, x, y, lost, occluded, generated)
+        ### min-max normalization to make fut_traj in [-1, 1]
+        self.fut_traj = normalize_min_max(fut_traj_rel, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1).contiguous()
 
-        for scene in self.scenes_to_use:
-            scene_anno_dir = os.path.join(data_dir, 'annotations', scene)
-            if not os.path.isdir(scene_anno_dir):
-                print(f"Warning: Annotation directory not found: {scene_anno_dir}")
-                continue
-            video_dirs = [d for d in os.listdir(scene_anno_dir)
-                         if os.path.isdir(os.path.join(scene_anno_dir, d)) and d.startswith('video')]
-            for video_dir in video_dirs:
-                anno_file = os.path.join(scene_anno_dir, video_dir, 'annotations.txt')
-                if not os.path.isfile(anno_file):
-                    print(f"Warning: Annotation file not found: {anno_file}")
-                    continue
-                try:
-                    with open(anno_file, 'r') as f:
-                        for line_num, line in enumerate(f, 1):
-                            parts = line.strip().split()
-                            if len(parts) < 10:
-                                continue
-                            try:
-                                track_id = int(parts[0])
-                                xmin = float(parts[1])
-                                ymin = float(parts[2])
-                                xmax = float(parts[3])
-                                ymax = float(parts[4])
-                                frame = int(parts[5])
-                                lost = int(parts[6])
-                                occluded = int(parts[7])
-                                generated = int(parts[8])
-                                label = parts[9]
-                                # Remove quotes if present
-                                if label.startswith('"') and label.endswith('"'):
-                                    label = label[1:-1]
-                            except (ValueError, IndexError):
-                                continue
+        """load distillation target"""
+        if imle:
+            os.makedirs(os.path.join(data_dir, 'imle'), exist_ok=True)
+            pkl_ls = sorted(glob(os.path.join(data_dir, f'imle/*train*.pkl')))
 
-                            # We only want pedestrians
-                            if label != 'Pedestrian':
-                                continue
+            keys_ls = ['past_traj', 'fut_traj', 'past_traj_original_scale', 'fut_traj_original_scale', 'fut_traj_vel', 'y_t', 'y_pred_data']
+            imle_data_dict = {}
+            total_scenes_loaded_ = 0   
+            for i_pkl, cur_pkl in enumerate(pkl_ls):
+                data = pickle.load(open(cur_pkl, 'rb'))
 
-                            # Compute center of bounding box
-                            x = (xmin + xmax) / 2.0
-                            y = (ymin + ymax) / 2.0
-                            # Store: (frame, x, y, lost, occluded, generated)
-                            tracks_dict[(scene, video_dir, track_id)].append((frame, x, y, lost, occluded, generated))
-                except Exception as e:
-                    print(f"Error reading {anno_file}: {e}")
+                if i_pkl == 0:
+                    self.imle_meta_data = data['meta_data']
+                
+                for key in keys_ls:
+                    if key not in imle_data_dict:
+                        imle_data_dict[key] = []
+                    if key == 'y_t':
+                        imle_data_dict[key].append(data[key][:, -1])
+                    else:
+                        imle_data_dict[key].append(data[key])
 
-        print(f"Found {len(tracks_dict)} tracks across all scenes/videos.")
+                total_scenes_loaded_ += data['past_traj'].shape[0]
 
-        # Step 2: For each track, sort by frame and slide windows
-        all_raw_windows = []  # each element: (list of 20 (x,y), start_frame)
-        for key, points in tracks_dict.items():
-            # Sort by frame
-            points.sort(key=lambda p: p[0])  # sort by frame
+                if total_scenes_loaded_ >= len(self.past_traj):
+                    break
 
-            # Slide window of 20 consecutive frames
-            for i in range(len(points) - 19):
-                window = points[i:i+20]
-                # Check if frames are consecutive
-                frames = [p[0] for p in window]
-                if all(frames[j] + 1 == frames[j+1] for j in range(19)):
-                    # Check that none of the points in the window is lost or occluded
-                    if all(p[4] == 0 and p[5] == 0 for p in window):  # lost index 4, occluded index 5
-                        # Extract the (x,y) for the 20 points
-                        xy_points = [(p[1], p[2]) for p in window]
-                        start_frame = frames[0]
-                        all_raw_windows.append((xy_points, start_frame))
+                if i_pkl == 0:
+                    past_tarj_original_scale_ = torch.from_numpy(data['past_traj_original_scale'])
+                    assert torch.sum(torch.abs(past_tarj_original_scale_[:10] - self.past_traj_original_scale[:10])) < 1e-5, 'IMLE data is not consistent'
+                    pass
 
-        print(f"Found {len(all_raw_windows)} raw windows (consecutive frames, no lost/occluded).")
+            # concat the data
+            for key in keys_ls:
+                imle_data_dict[key] = torch.from_numpy(np.concatenate(imle_data_dict[key], axis=0))[:len(self.past_traj)]
 
-        if len(all_raw_windows) == 0:
-            print("Warning: No valid windows found. Dataset will be empty.")
-            self.samples_with_frames = []  # (past_norm, future_norm, third, start_frame)
-            return
+            self.imle_data_dict = imle_data_dict
 
-        # Step 3: Collect all points to compute global min and max for normalization
-        all_points = []
-        for window_points, _ in all_raw_windows:
-            all_points.extend(window_points)
-
-        if len(all_points) == 0:
-            print("Warning: No points in windows. Dataset will be empty.")
-            self.samples_with_frames = []
-            return
-
-        all_points_np = np.array(all_points, dtype=np.float32)
-        x_min, y_min = np.min(all_points_np[:, 0]), np.min(all_points_np[:, 1])
-        x_max, y_max = np.max(all_points_np[:, 0]), np.max(all_points_np[:, 1])
-
-        # Avoid division by zero
-        if x_max - x_min < 1e-6:
-            x_max = x_min + 1.0
-        if y_max - y_min < 1e-6:
-            y_max = y_min + 1.0
-
-        print(f"Global X range: [{x_min:.2f}, {x_max:.2f}]")
-        print(f"Global Y range: [{y_min:.2f}, {y_max:.2f}]")
-
-        # Step 4: Normalize windows and create samples
-        self.samples_with_frames = []  # each element: (past_norm_np, future_norm_np, third_np, start_frame)
-        for window_points, start_frame in all_raw_windows:
-            # Normalize each point
-            normalized_points = []
-            for (x, y) in window_points:
-                x_norm = 2.0 * (x - x_min) / (x_max - x_min) - 1.0
-                y_norm = 2.0 * (y - y_min) / (y_max - y_min) - 1.0
-                normalized_points.append((x_norm, y_norm))
-
-            # Split into past (first 8) and future (last 12)
-            past_points = normalized_points[:8]
-            future_points = normalized_points[8:20]
-
-            # Convert to numpy arrays
-            past_np = np.array(past_points, dtype=np.float32)  # shape (8,2)
-            future_np = np.array(future_points, dtype=np.float32) # shape (12,2)
-
-            # Create dummy third element (matching original shape)
-            third_np = np.empty((20, 0, 2), dtype=np.float32)  # shape (20,0,2)
-
-            self.samples_with_frames.append((past_np, future_np, third_np, start_frame))
-
-        print(f"Created {len(self.samples_with_frames)} samples.")
-
-        # Store min/max for potential use in normalization (though we already normalized)
-        self.x_min, self.y_min = x_min, y_min
-        self.x_max, self.y_max = x_max, y_max
-
-    def _prepare_tensors(self):
-        """Convert the list of samples into tensors in the format expected by the rest of the code."""
-        if len(self.samples_with_frames) == 0:
-            # Create empty tensors with expected shapes
-            self.past_traj = torch.empty((0, 1, self.past_frames, 2))
-            self.future_traj = torch.empty((0, 1, self.future_frames, 2))
-            self.past_traj_original_scale = self.past_traj.clone()
-            self.future_traj_original_scale = self.future_traj.clone()
-            return
-
-        # Extract components from samples_with_frames
-        past_list = [s[0] for s in self.samples_with_frames]   # list of (8,2) arrays
-        future_list = [s[1] for s in self.samples_with_frames] # list of (12,2) arrays
-        # We don't use the third element in the rest of the code, but we'll keep it as dummy
-        # third_list = [s[2] for s in self.samples_with_frames]  # list of (20,0,2) arrays
-
-        # Stack into numpy arrays
-        past_np = np.array(past_list)   # [N, 8, 2]
-        future_np = np.array(future_list) # [N, 12, 2]
-
-        # Add the agent dimension (dimension 1) to match the expected format [N, 1, T, 2]
-        past_np = np.expand_dims(past_np, axis=1)   # [N, 1, 8, 2]
-        future_np = np.expand_dims(future_np, axis=1) # [N, 1, 12, 2]
-
-        # Convert to tensors
-        self.past_traj = torch.from_numpy(past_np)
-        self.future_traj = torch.from_numpy(future_np)
-
-        # For consistency with original code, set the original scale tensors to the same as normalized
-        # (since we already normalized to [-1,1])
-        self.past_traj_original_scale = self.past_traj.clone()
-        self.future_traj_original_scale = self.future_traj.clone()
-
-        # Also set the min/max in config to -1,1 so that the normalization step is a no-op
-        self.cfg.past_traj_min = -1.0
-        self.cfg.past_traj_max = 1.0
-        self.cfg.fut_traj_min = -1.0
-        self.cfg.fut_traj_max = 1.0
-
+    
     def __len__(self):
         return len(self.past_traj)
 
-    def __getitem__(self, item):
+    def __getitem__(self, item): 
         if self.imle:
-            # We don't have IMLE data in this implementation, so return dummy values
-            # This is a placeholder - implement if needed
-            past_traj = torch.zeros(1)
-            fut_traj = torch.zeros(1)
-            past_traj_original_scale = torch.zeros(1)
-            fut_traj_original_scale = torch.zeros(1)
-            fut_traj_vel = torch.zeros(1)
-            y_t = torch.zeros(1)
-            y_pred_data = torch.zeros(1)
-            z_video = torch.zeros(1) if self.z_video_global is not None else torch.zeros(1)
-            agent_crops = torch.zeros(1)
-            return [
-                past_traj,
-                fut_traj,
-                past_traj_original_scale,
-                fut_traj_original_scale,
-                fut_traj_vel,
-                y_t,
-                y_pred_data,
-                z_video,
-                agent_crops,
-            ]
+            # Video features and agent crops
+            z_video = (self.z_video_global[item]
+                       if self.z_video_global is not None
+                       else torch.zeros(1))
+            agent_crops = torch.zeros(1)  # placeholder
+            out = [
+                    self.imle_data_dict['past_traj'][item],
+                    self.imle_data_dict['fut_traj'][item],
+                    self.imle_data_dict['past_traj_original_scale'][item],
+                    self.imle_data_dict['fut_traj_original_scale'][item],
+                    self.imle_data_dict['fut_traj_vel'][item],
+                    self.imle_data_dict['y_t'][item],
+                    self.imle_data_dict['y_pred_data'][item],
+                    z_video,
+                    agent_crops,
+                ]
         else:
-            # Return the sample in the format expected by the original code
-            # The original code returned a tuple of 8 elements:
-            # [index, past_traj_norm_scale, fut_traj_norm_scale, past_traj_original_scale,
-            #  fut_traj_original_scale, fut_traj_vel, z_video, agent_crops]
-            # We don't have vel or agent_crops yet, so we'll set them to zeros.
-            # We also don't have an index in the original sense, but we'll use the item as index.
+            ### past traj, future traj, number of pedestrians (presumbly?), index
+            past_traj_norm_scale = self.past_traj[item]                             # [A, P, 6]
+            fut_traj_norm_scale = self.fut_traj[item]                               # [A, F, 2] 
+            past_traj_original_scale = self.past_traj_original_scale[item]          # [A, P, 6]
+            fut_traj_original_scale = self.fut_traj_original_scale[item]            # [A, F, 2]
+            fut_traj_vel = self.fut_traj_vel[item]                                  # [A, F, 2]   
 
-            past_traj = self.past_traj[item]          # [1, 8, 2]
-            fut_traj = self.future_traj[item]       # [1, 12, 2]
-            past_traj_original_scale = self.past_traj_original_scale[item]
-            fut_traj_original_scale = self.future_traj_original_scale[item]
+        
+            # Video features and agent crops
+            z_video = (self.z_video_global[item]
+                       if self.z_video_global is not None
+                       else torch.zeros(1))
+            agent_crops = torch.zeros(1)  # placeholder; implement actual cropping if needed
 
-            # Compute velocity from past_traj_relative (as in original code)
-            # We need to compute past_traj_relative first
-            initial_pos = past_traj[:, -1:, :]  # [1, 1, 2] - last position of past trajectory
-            past_traj_rel = past_traj - initial_pos  # [1, 8, 2]
-            # Velocity: difference between consecutive positions
-            past_traj_vel = torch.cat([past_traj_rel[:, 1:] - past_traj_rel[:, :-1],
-                                       torch.zeros_like(past_traj_rel[:, :1])], dim=1)  # [1, 8, 2]
-
-            # For future_traj_vel, we don't have future ground truth in the same way?
-            # In the original code, they computed future_traj_vel from future_traj_rel
-            # but we don't have future_traj_relative?
-            # We'll set it to zero for now.
-            fut_traj_vel = torch.zeros_like(fut_traj)  # [1, 12, 2]
-
-            # Video features
-            if self.z_video_global is not None:
-                z_video = self.z_video_global[item]  # [T_obs, D]
-            else:
-                z_video = torch.zeros((self.cfg.past_frames, 512))  # default D=512
-
-            # Agent crops - dummy
-            agent_crops = torch.zeros(1)
-
-            # Return in the order expected by seq_collate_sdd
-            return [
-                torch.tensor([item], dtype=torch.int32),  # index
-                past_traj,  # [1, 8, 2]
-                fut_traj,   # [1, 12, 2]
+            out = [
+                torch.Tensor([item]).to(torch.int32),
+                past_traj_norm_scale,
+                fut_traj_norm_scale,
                 past_traj_original_scale,
                 fut_traj_original_scale,
                 fut_traj_vel,
                 z_video,
                 agent_crops,
             ]
+        return out
 
 
 if __name__ == "__main__":
@@ -490,10 +325,10 @@ if __name__ == "__main__":
     sys.path.insert(0, '/home/dhya/Repos/Studies/MoFlow')
     from utils.config import Config
     cfg = Config('cfg/sdd/cor_fm.yml', 'test')
-    dataset = SDDDataset(cfg, './data/sdd', training=True, overfit=False, held_out_scene='bookstore')
+    dataset = SDDDataset(cfg, './data/sdd', training=True, overfit=False)
     print(f"Dataset size: {len(dataset)}")
     if len(dataset) > 0:
         sample = dataset[0]
         print(f"Sample types: {[type(s) for s in sample]}")
-        print(f"Past train shape: {sample[1].shape}")
-        print(f"Future train shape: {sample[2].shape}")
+        print(f"Past traj shape: {sample[1].shape}")
+        print(f"Future traj shape: {sample[2].shape}")
