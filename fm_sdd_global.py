@@ -9,8 +9,8 @@ Usage on the remote lab machine:
     python fm_sdd_global.py \\
         --cfg cfg/eth_ucy/cor_fm.yml \\
         --held_out_scene coupa \\
-        --sdd_root ~/Datasets/SDD \\
-        --video_features_root ~/Datasets/SDD/features/resnet18
+        --sdd_root ~/Desktop/Datasets/SDD \\
+        --video_features_root ~/Desktop/Datasets/SDD/features/resnet18
 
     # Evaluation
     python fm_sdd_global.py --cfg cfg/eth_ucy/cor_fm.yml --held_out_scene coupa --eval
@@ -48,9 +48,9 @@ def parse_args() -> argparse.Namespace:
     # ---- SDD-specific -------------------------------------------------------
     p.add_argument(
         "--sdd_root",
-        default="~/Datasets/SDD",
+        default="~/Desktop/Datasets/SDD",
         type=str,
-        help="Remote SDD path. Default: ~/Datasets/SDD (hardcoded).",
+        help="Remote SDD path. Default: ~/Desktop/Datasets/SDD (hardcoded).",
     )
     p.add_argument(
         "--held_out_scene",

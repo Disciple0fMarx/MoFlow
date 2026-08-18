@@ -1,6 +1,6 @@
 """Visual alignment verification for the SDD dataloader (remote-machine only).
 
-Run on the lab machine where ``~/Datasets/SDD`` is mounted. The script:
+Run on the lab machine where ``~/Desktop/Datasets/SDD`` is mounted. The script:
 
 1. Picks a single (scene, video_id) from the SDD annotations.
 2. Renders three sample frames to PNG with bounding boxes + track IDs drawn.

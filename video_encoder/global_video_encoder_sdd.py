@@ -21,7 +21,7 @@ this cache (see ``SDDFrameFeatureLookup.window`` in :mod:`sdd_adapter`).
 Two public entry points:
 
 * :class:`SDDGlobalVideoEncoder` — encodes a list of (scene, frame_id) rows.
-* :func:`build_sdd_frame_index` — parses ``~/Datasets/SDD/annotations/**`` and
+* :func:`build_sdd_frame_index` — parses ``~/Desktop/Datasets/SDD/annotations/**`` and
   returns the canonical (scene, video_id, track_id, frame_id, ...) DataFrame.
 """
 from __future__ import annotations
@@ -61,7 +61,7 @@ def build_sdd_frame_index(
     sdd_root: str | Path | None = None,
     scenes: Sequence[str] | None = None,
 ) -> pd.DataFrame:
-    """Parse every ``annotations.txt`` under ``~/Datasets/SDD`` and return a
+    """Parse every ``annotations.txt`` under ``~/Desktop/Datasets/SDD`` and return a
     flat DataFrame with one row per (scene, video_id, track_id, frame_id).
 
     Columns: ``scene, video_id, track_id, frame_id, xmin, ymin, xmax, ymax``.

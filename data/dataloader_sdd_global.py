@@ -24,7 +24,7 @@ Coordinate handling:
   ``SDD_READY_FOR_TRAINING.md`` notes — flagged with a ``WARNING`` at init
   so the user is aware that predicted coords will be in pixel space.
 
-Hardcoded path: ``~/Datasets/SDD`` via :data:`video_encoder.sdd_adapter.DEFAULT_SDD_ROOT`.
+Hardcoded path: ``~/Desktop/Datasets/SDD`` via :data:`video_encoder.sdd_adapter.DEFAULT_SDD_ROOT`.
 Override per-run with ``--sdd_root`` / ``cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT``.
 """
 from __future__ import annotations
@@ -208,7 +208,7 @@ def build_window_index(
     if not rows_list:
         raise RuntimeError(
             f"No SDD trajectory windows found under {root} for scenes={scenes}. "
-            f"Verify the dataset layout matches ~/Datasets/SDD/{{annotations,videos}}/<scene>/..."
+            f"Verify the dataset layout matches ~/Desktop/Datasets/SDD/{{annotations,videos}}/<scene>/..."
         )
 
     dt = np.dtype(

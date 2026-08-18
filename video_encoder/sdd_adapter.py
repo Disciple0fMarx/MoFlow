@@ -1,9 +1,9 @@
 """SDD-specific adapter for the global video encoder (note §5.2).
 
-Stanford Drone Dataset lives on the **remote lab machine** at ``~/Datasets/SDD``
+Stanford Drone Dataset lives on the **remote lab machine** at ``~/Desktop/Datasets/SDD``
 and uses a layout completely different from ETH/UCY:
 
-    ~/Datasets/SDD/
+    ~/Desktop/Datasets/SDD/
         annotations/<scene>/<videoX>/annotations.txt   # TrackID,xmin,ymin,xmax,ymax,frame,lost,occ,gen,label
         videos/<scene>/<videoX>/video.mov
 
@@ -35,13 +35,13 @@ SDD_SCENES: tuple[str, ...] = (
 
 # Default remote path. Override via the ``--sdd_root`` CLI flag or the
 # ``cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT`` YAML key.
-DEFAULT_SDD_ROOT = Path("~/Datasets/SDD").expanduser()
+DEFAULT_SDD_ROOT = Path("~/Desktop/Datasets/SDD").expanduser()
 
 SnapPolicy = Literal["nearest", "floor", "drop"]
 
 
 def expand_sdd_root(maybe_root: str | Path | None) -> Path:
-    """Resolve the SDD root directory, defaulting to ``~/Datasets/SDD``.
+    """Resolve the SDD root directory, defaulting to ``~/Desktop/Datasets/SDD``.
 
     The constant is intentionally *hardcoded* — local repositories must NOT
     ship a copy of SDD. Anything that bypasses this helper is a bug.
