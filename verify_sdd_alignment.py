@@ -70,27 +70,28 @@ def _extract_frame_from_mov(
     video_subfolder: str = "videos",
     video_ext: str = "mov",
 ) -> Image.Image:
-    """Decode a single frame from
-    ``<sdd_root>/<video_subfolder>/<scene>/<video_id>/video.<video_ext>``.
-
-    Defaults match the lab server layout (``videos/.../video.mov``). On
-    Kaggle the subfolder may be named differently and/or the files may use
-    a different extension (e.g. ``mp4``); both can be overridden via the
-    matching CLI flags without touching this function's call sites.
-
-    Falls back to torchvision's ``read_video`` which loads the entire video
-    into RAM — fine for verification (one short clip at a time).
-    """
-    from torchvision.io import read_video
+    """Decode a single frame lazily using OpenCV to prevent OOM errors."""
+    import cv2
 
     mov = sdd_root / video_subfolder / scene / video_id / f"video.{video_ext}"
     if not mov.exists():
         raise FileNotFoundError(f"missing {mov}")
-    video, _audio, info = read_video(str(mov), pts_unit="sec")
-    video_np = video.numpy()  # [T, H, W, C] uint8
-    if frame_id >= video_np.shape[0]:
-        frame_id = video_np.shape[0] - 1
-    return Image.fromarray(video_np[frame_id])
+    
+    cap = cv2.VideoCapture(str(mov))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video at {mov}")
+
+    # Seek directly to the target frame index
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        raise RuntimeError(f"Could not read frame {frame_id} from {mov}")
+
+    # OpenCV reads in BGR format; convert to RGB for standard PIL processing
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(frame_rgb)
 
 
 def _draw_boxes(img: Image.Image, rows: list[tuple[int, float, float, float, float]]) -> Image.Image:
