@@ -68,20 +68,22 @@ def _extract_frame_from_mov(
     video_id: str,
     frame_id: int,
     video_subfolder: str = "videos",
+    video_ext: str = "mov",
 ) -> Image.Image:
-    """Decode a single frame from ``<sdd_root>/<video_subfolder>/<scene>/<video_id>/video.mov``.
+    """Decode a single frame from
+    ``<sdd_root>/<video_subfolder>/<scene>/<video_id>/video.<video_ext>``.
 
-    The ``video_subfolder`` parameter defaults to ``"videos"`` (lab server layout)
-    but can be set to e.g. ``"video"`` on Kaggle where the folder is named
-    differently. The rest of the path (``<scene>/<video_id>/video.mov``) is
-    unchanged.
+    Defaults match the lab server layout (``videos/.../video.mov``). On
+    Kaggle the subfolder may be named differently and/or the files may use
+    a different extension (e.g. ``mp4``); both can be overridden via the
+    matching CLI flags without touching this function's call sites.
 
     Falls back to torchvision's ``read_video`` which loads the entire video
     into RAM — fine for verification (one short clip at a time).
     """
     from torchvision.io import read_video
 
-    mov = sdd_root / video_subfolder / scene / video_id / "video.mov"
+    mov = sdd_root / video_subfolder / scene / video_id / f"video.{video_ext}"
     if not mov.exists():
         raise FileNotFoundError(f"missing {mov}")
     video, _audio, info = read_video(str(mov), pts_unit="sec")
@@ -137,10 +139,16 @@ def render_one(
     bboxes_at_frame: list[tuple[int, float, float, float, float]],
     trajectory_xy: np.ndarray | None = None,
     video_subfolder: str = "videos",
+    video_ext: str = "mov",
 ) -> None:
     """Render a single annotated frame + optional trajectory overlay."""
     img = _extract_frame_from_mov(
-        sdd_root, scene, video_id, frame_id, video_subfolder=video_subfolder
+        sdd_root,
+        scene,
+        video_id,
+        frame_id,
+        video_subfolder=video_subfolder,
+        video_ext=video_ext,
     )
     img = _draw_boxes(img, bboxes_at_frame)
     if trajectory_xy is not None:
@@ -185,6 +193,16 @@ def main() -> None:
             "Subdirectory under SDD root that contains the .mov files. "
             "Lab server layout uses 'videos'; Kaggle may use 'video'. "
             "Default: 'videos'."
+        ),
+    )
+    p.add_argument(
+        "--video_ext",
+        default="mov",
+        type=str,
+        help=(
+            "Filename extension of the raw video files (without leading dot). "
+            "Lab server uses 'mov'; Kaggle mirrors may use 'mp4'. "
+            "Default: 'mov'."
         ),
     )
     p.add_argument("--out_dir", default="./verify_sdd_out")
@@ -234,6 +252,7 @@ def main() -> None:
             frame_id=fid,
             bboxes_at_frame=rows_at_fid,
             video_subfolder=args.video_subfolder,
+            video_ext=args.video_ext,
         )
 
     # ---- Cross-check: render a trajectory window from the new dataloader --
@@ -277,6 +296,7 @@ def main() -> None:
             bboxes_at_frame=rows_at_fid,
             trajectory_xy=full_xy,
             video_subfolder=args.video_subfolder,
+            video_ext=args.video_ext,
         )
 
     print(f"[verify] done. Outputs in {out_dir.resolve()}")
