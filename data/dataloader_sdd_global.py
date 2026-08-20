@@ -200,8 +200,8 @@ def build_window_index(
                             video_idx,
                             int(tid),
                             anchor,
-                            scene.encode("ascii", "ignore")[:16].ljust(16).encode(),
-                            video_id.encode("ascii", "ignore")[:16].ljust(16).encode(),
+                            scene.encode("ascii", "ignore")[:16].ljust(16),
+                            video_id.encode("ascii", "ignore")[:16].ljust(16),
                         )
                     )
 
