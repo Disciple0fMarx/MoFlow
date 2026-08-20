@@ -62,15 +62,26 @@ def _load_annotations_for_video(sdd_root: Path, scene: str, video_id: str):
     return out
 
 
-def _extract_frame_from_mov(sdd_root: Path, scene: str, video_id: str, frame_id: int) -> Image.Image:
-    """Decode a single frame from ``<sdd_root>/videos/<scene>/<video_id>/video.mov``.
+def _extract_frame_from_mov(
+    sdd_root: Path,
+    scene: str,
+    video_id: str,
+    frame_id: int,
+    video_subfolder: str = "videos",
+) -> Image.Image:
+    """Decode a single frame from ``<sdd_root>/<video_subfolder>/<scene>/<video_id>/video.mov``.
+
+    The ``video_subfolder`` parameter defaults to ``"videos"`` (lab server layout)
+    but can be set to e.g. ``"video"`` on Kaggle where the folder is named
+    differently. The rest of the path (``<scene>/<video_id>/video.mov``) is
+    unchanged.
 
     Falls back to torchvision's ``read_video`` which loads the entire video
     into RAM — fine for verification (one short clip at a time).
     """
     from torchvision.io import read_video
 
-    mov = sdd_root / "videos" / scene / video_id / "video.mov"
+    mov = sdd_root / video_subfolder / scene / video_id / "video.mov"
     if not mov.exists():
         raise FileNotFoundError(f"missing {mov}")
     video, _audio, info = read_video(str(mov), pts_unit="sec")
@@ -125,9 +136,12 @@ def render_one(
     frame_id: int,
     bboxes_at_frame: list[tuple[int, float, float, float, float]],
     trajectory_xy: np.ndarray | None = None,
+    video_subfolder: str = "videos",
 ) -> None:
     """Render a single annotated frame + optional trajectory overlay."""
-    img = _extract_frame_from_mov(sdd_root, scene, video_id, frame_id)
+    img = _extract_frame_from_mov(
+        sdd_root, scene, video_id, frame_id, video_subfolder=video_subfolder
+    )
     img = _draw_boxes(img, bboxes_at_frame)
     if trajectory_xy is not None:
         img = _draw_trajectory(img, trajectory_xy)
@@ -163,6 +177,16 @@ def main() -> None:
     p.add_argument("--scene", default="bookstore", choices=SDD_SCENES)
     p.add_argument("--video_id", default=None,
                    help="If omitted, picks the first video under <scene>.")
+    p.add_argument(
+        "--video_subfolder",
+        default="videos",
+        type=str,
+        help=(
+            "Subdirectory under SDD root that contains the .mov files. "
+            "Lab server layout uses 'videos'; Kaggle may use 'video'. "
+            "Default: 'videos'."
+        ),
+    )
     p.add_argument("--out_dir", default="./verify_sdd_out")
     p.add_argument("--num_samples", default=3, type=int)
     p.add_argument("--sanity_only", action="store_true",
@@ -209,6 +233,7 @@ def main() -> None:
             video_id=video_id,
             frame_id=fid,
             bboxes_at_frame=rows_at_fid,
+            video_subfolder=args.video_subfolder,
         )
 
     # ---- Cross-check: render a trajectory window from the new dataloader --
@@ -251,6 +276,7 @@ def main() -> None:
             frame_id=anchor,
             bboxes_at_frame=rows_at_fid,
             trajectory_xy=full_xy,
+            video_subfolder=args.video_subfolder,
         )
 
     print(f"[verify] done. Outputs in {out_dir.resolve()}")
