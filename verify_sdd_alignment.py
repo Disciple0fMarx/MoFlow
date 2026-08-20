@@ -267,6 +267,8 @@ def main() -> None:
             use_video=False,
         )
     except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
         print(f"[verify] WARNING: could not construct SDDGlobalDataset: {exc}")
         ds = None
 
@@ -314,10 +316,10 @@ def _minimal_cfg():
                 VIDEO_DIM_RAW = 512
                 HELD_OUT_SCENE = None
                 VIDEO_FEATURES_ROOT = None
-        past_traj_min = None
-        past_traj_max = None
-        fut_traj_min = None
-        fut_traj_max = None
+        past_traj_min = 0.0
+        past_traj_max = 1.0
+        fut_traj_min = 0.0
+        fut_traj_max = 1.0
     return _C()
 
 
