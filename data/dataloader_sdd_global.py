@@ -24,8 +24,10 @@ Coordinate handling:
   ``SDD_READY_FOR_TRAINING.md`` notes — flagged with a ``WARNING`` at init
   so the user is aware that predicted coords will be in pixel space.
 
-Hardcoded path: ``~/Desktop/Datasets/SDD`` via :data:`video_encoder.sdd_adapter.DEFAULT_SDD_ROOT`.
-Override per-run with ``--sdd_root`` / ``cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT``.
+Hardcoded paths: resolved via :func:`video_encoder.sdd_adapter.expand_sdd_root`
+(Lab default ``/home/efrei_stage/Desktop/Datasets/SDD``; Kaggle mount
+auto-detected when ``/kaggle`` exists). Override per-run with ``--sdd_root``
+/ ``cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT``.
 """
 from __future__ import annotations
 
@@ -441,6 +443,9 @@ class SDDGlobalDataset(Dataset):
         }
 
         # ---- Lazy global video features ------------------------------------
+        # Scene-level conditioning: window [P, D_raw] → temporal mean → [D_raw].
+        # Batched contract (collate): z_video_global ∈ [B, 512]; the uncached
+        # fallback stays the scalar sentinel tensor([0.]).
         if self.use_video and self.video_features_root is not None:
             scene = item["scene"]
             anchor = item["anchor_frame"]
@@ -452,8 +457,11 @@ class SDDGlobalDataset(Dataset):
                     n_frames=SDD_PAST_FRAMES,
                     stride=self.video_stride,
                     policy="nearest",
-                )  # [P, D]
-                item["z_video_global"] = torch.from_numpy(z)
+                )  # [P, D_raw]
+                z_vec = z.mean(axis=0, dtype=np.float32)  # [D_raw]
+                item["z_video_global"] = torch.from_numpy(
+                    np.ascontiguousarray(z_vec, dtype=np.float32)
+                )
             except FileNotFoundError:
                 # Missing cache → return a dummy scalar (the collate will skip it).
                 item["z_video_global"] = torch.zeros(1)
@@ -476,8 +484,9 @@ class SDDGlobalDataset(Dataset):
 def collate_sdd_global(batch: list[dict]) -> dict:
     """Collate with strict shape checks.
 
-    Detects the "no video" sentinel via ``.dim() == 0`` so we never stack
-    a scalar with a 3-D tensor.
+    Detects the "no video" sentinel via ``numel() == 1`` (scalar ``tensor([0.])``)
+    so we never stack it with a real scene-level feature vector. Real features
+    are stacked to the batched contract ``[B, D_raw=512]``.
     """
     keys_simple = [
         "past_traj",
@@ -494,8 +503,8 @@ def collate_sdd_global(batch: list[dict]) -> dict:
 
     # ---- Video features ---------------------------------------------------
     videos = [b["z_video_global"] for b in batch]
-    if videos[0].dim() == 3:                                # [P, D] per sample
-        out["z_video_global"] = torch.stack(videos, dim=0)  # [B, P, D]
+    if videos[0].dim() == 1 and videos[0].numel() > 1:      # [D_raw] per sample
+        out["z_video_global"] = torch.stack(videos, dim=0)  # [B, D_raw]
     else:
         out["z_video_global"] = None
 
