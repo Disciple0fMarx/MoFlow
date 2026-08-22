@@ -1,64 +1,80 @@
 import torch
 from models.backbone_eth_ucy import ETHMotionTransformer
 
+
+class _Log:
+    """Minimal logger stub for the backbone's parameter report."""
+
+    def info(self, msg):
+        print(msg)
+
+
 def test_backbone_multimodal_forward():
     print("--- Starting Backbone Multimodal Verification ---")
-    
+
     # 1. ROBUST CONFIG MOCK: Supports both .ATTR and .get() access
     class MockSubConfig:
         def __init__(self, **kwargs):
             for k, v in kwargs.items():
                 setattr(self, k, v)
+
         def get(self, key, default=None):
             return getattr(self, key, default)
 
     class DummyCfg:
         def __init__(self):
-            # Matches literal class names as per your previous tweak
+            self.NUM_PROPOSED_QUERY = 20
+            self.MODEL_OUT_DIM = 24  # A * F * 2
+            self.REGRESSION_MLPS = [128, 256, 24]
+            self.CLASSIFICATION_MLPS = [128, 128, 1]
             self.CONTEXT_ENCODER = MockSubConfig(
-                NAME='ETHEncoder', 
-                D_MODEL=128
+                NAME="ETHEncoder",
+                D_MODEL=128,
+                AGENTS=2,
+                NUM_ATTN_HEAD=8,
+                NUM_ATTN_LAYERS=4,
+                DROPOUT_OF_ATTN=0.1,
+                USE_VIDEO=True,
+                VIDEO_DIM_RAW=512,
+                VIDEO_DIM=32,
             )
             self.MOTION_DECODER = MockSubConfig(
-                NAME='MTRDecoder',
-                NUM_DECODER_BLOCKS=2, # Satisfies line 29 of mtr_decoder.py
+                NAME="MTRDecoder",
+                NUM_DECODER_BLOCKS=2,
                 D_MODEL=128,
                 NUM_ATTN_HEAD=8,
+                DROPOUT_OF_ATTN=0.1,
             )
 
-    model_config = DummyCfg()
-    
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
     # 2. Initialize Teacher Backbone
-    # Passing None for logger/config as they aren't used in this basic forward check
-    model = ETHMotionTransformer(model_config, logger=None, config=None)
+    model = ETHMotionTransformer(DummyCfg(), logger=_Log(), config=None)
     model.eval()
 
-    # 3. Create a Mock Multimodal Batch
-    # FIX: Reshape to 4D [Batch, Agents, Time, Dim] to satisfy eth_encoder.py line 28
-    batch = {
-        # 48 features total (e.g., 8 frames * 6 features per frame)
-        'pre_motion_3D': torch.randn(4, 2, 8, 6),     
-        'video_frames': torch.randn(4, 8, 3, 224, 224) 
-    }
+    batch_size, n_agents = 4, 2
+    pre_motion_3D = torch.randn(batch_size, n_agents, 8, 6)  # [B, A, P, 6]
 
-    try:
-        print("Executing full backbone forward pass...")
-        with torch.no_grad():
-            # This tests the extraction logic in ETHMotionTransformer.forward()
-            # and the flow into the ETHEncoder and MTRDecoder
-            z_ctx = model.context_encoder(batch['pre_motion_3D'], video_tensor=batch['video_frames'])
-            
-        print(f"✅ Context produced: {z_ctx.shape}")
-        
-        if z_ctx.shape == (4, 2, 128):
-            print("\n🚀 SUCCESS: Backbone is correctly orchestrating the multimodal flow.")
-        else:
-            print(f"\n❌ ERROR: Unexpected shape {z_ctx.shape}")
+    # 3. Multimodal forward via the production call-site signature
+    #    (models/backbone_eth_ucy.py: context_encoder(x, z_video=..., agent_crops=...))
 
-    except Exception as e:
-        print(f"\n❌ BACKBONE CRASHED: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    # 3a. Scene-level contract [B, 512] (SDD global pipeline)
+    z_scene = torch.randn(batch_size, 512)
+    with torch.no_grad():
+        z_ctx = model.context_encoder(pre_motion_3D, z_video=z_scene)
+    assert z_ctx.shape == (batch_size, n_agents, 128), f"scene-level: {z_ctx.shape}"
+    print(f"PASS z_video_global [B, 512]: {tuple(z_ctx.shape)}")
+
+    # 3b. Per-timestep contract [B, P, 512] (ETH/UCY pipeline)
+    z_legacy = torch.randn(batch_size, 8, 512)
+    with torch.no_grad():
+        z_ctx = model.context_encoder(pre_motion_3D, z_video=z_legacy)
+    assert z_ctx.shape == (batch_size, n_agents, 128), f"legacy: {z_ctx.shape}"
+    print(f"PASS z_video [B, P, 512]:     {tuple(z_ctx.shape)}")
+
+    print("\nSUCCESS: Backbone is correctly orchestrating the multimodal flow.")
+
 
 if __name__ == "__main__":
     test_backbone_multimodal_forward()
