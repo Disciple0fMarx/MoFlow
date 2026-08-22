@@ -467,9 +467,16 @@ class ETHEncoder(nn.Module):
         else:
             # Fall back to existing variant A behavior
             if self.use_video and z_video is not None:
-                # Project to small d_v and broadcast across agents.
-                z = self.video_proj(z_video)                           # [B, P, d_v]
-                z = z.unsqueeze(1).expand(B, A, P, self.video_dim)     # [B, A, P, d_v]
+                # Two supported conditioning contracts:
+                #   [B, P, D_raw]  — per-timestep features (ETH/UCY pipeline)
+                #   [B, D_raw]     — scene-level pooled vector (SDD global;
+                #                    broadcast uniformly across agents/time)
+                if z_video.dim() == 3:
+                    z = self.video_proj(z_video)                       # [B, P, d_v]
+                    z = z.unsqueeze(1).expand(B, A, P, self.video_dim)  # [B, A, P, d_v]
+                else:
+                    z = self.video_proj(z_video)                       # [B, d_v]
+                    z = z[:, None, None, :].expand(B, A, P, self.video_dim)
                 past_traj = torch.cat([past_traj, z], dim=-1)          # [B, A, P, 6+d_v]
             elif self.use_video and z_video is None:
                 # Inference-time safety: pad with zeros so shapes still match.
