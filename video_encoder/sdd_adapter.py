@@ -1,17 +1,26 @@
 """SDD-specific adapter for the global video encoder (note §5.2).
 
-Stanford Drone Dataset lives on the **remote lab machine** at ``~/Desktop/Datasets/SDD``
-and uses a layout completely different from ETH/UCY:
+Dual-infrastructure environment matrix (see OPENCODE_CONTEXT.md):
 
-    ~/Desktop/Datasets/SDD/
-        annotations/<scene>/<videoX>/annotations.txt   # TrackID,xmin,ymin,xmax,ymax,frame,lost,occ,gen,label
-        videos/<scene>/<videoX>/video.mov
+A. **Remote Lab Machine** (default / production — full multi-epoch training)::
 
-This module exposes the same ``FrameFeatureLookup``-style API that the
-MoFlow data layer expects, but resolves frame paths against this layout.
+    /home/efrei_stage/Desktop/Datasets/SDD/
+        annotations/<scene>/<videoX>/annotations.txt  # TrackID,xmin,...,frame,...
+        videos/<scene>/<videoX>/video.mov             # subdir ``videos/``, ext .mov
+
+B. **Kaggle** (compute proxy — VRAM profiling with dummy caches)::
+
+    /kaggle/input/datasets/aryashah2k/stanford-drone-dataset/
+        annotations/<scene>/<videoX>/annotations.txt
+        video/<scene>/<videoX>/video.mp4              # subdir ``video/``, ext .mp4
+
+Resolution order: explicit argument > Kaggle auto-detection > Lab default.
+All CLI parsers and function signatures default to the **Lab machine values**;
+Kaggle is handled via :func:`is_kaggle` auto-detection or explicit overrides.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -33,23 +42,55 @@ SDD_SCENES: tuple[str, ...] = (
     "quad",
 )
 
-# Default remote path. Override via the ``--sdd_root`` CLI flag or the
-# ``cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT`` YAML key.
-DEFAULT_SDD_ROOT = Path("~/Desktop/Datasets/SDD").expanduser()
+# ---------------------------------------------------------------------------
+# Environment matrix (defaults are the Remote Lab Machine values)
+# ---------------------------------------------------------------------------
+LAB_SDD_ROOT = Path("/home/efrei_stage/Desktop/Datasets/SDD")
+KAGGLE_SDD_ROOT = Path(
+    "/kaggle/input/datasets/aryashah2k/stanford-drone-dataset"
+)
 
-SnapPolicy = Literal["nearest", "floor", "drop"]
+#: Signature-level default: the Remote Lab Machine root.
+DEFAULT_SDD_ROOT = LAB_SDD_ROOT
+
+
+def is_kaggle() -> bool:
+    """True when executing inside a Kaggle notebook container."""
+    return os.path.exists("/kaggle")
+
+
+def detect_sdd_root() -> Path:
+    """Auto-detect the dataset root for the current environment.
+
+    Returns the Kaggle mount when ``/kaggle`` exists, otherwise the Remote
+    Lab Machine root (production default).
+    """
+    return KAGGLE_SDD_ROOT if is_kaggle() else LAB_SDD_ROOT
+
+
+def _is_kaggle_root(root: Path) -> bool:
+    """Classify a resolved root so the video layout follows its environment."""
+    return str(root).startswith("/kaggle")
 
 
 def expand_sdd_root(maybe_root: str | Path | None) -> Path:
-    """Resolve the SDD root directory, defaulting to ``~/Desktop/Datasets/SDD``.
+    """Resolve the SDD root directory.
 
+    Resolution order: explicit argument > Kaggle auto-detection > Lab default.
     The constant is intentionally *hardcoded* — local repositories must NOT
     ship a copy of SDD. Anything that bypasses this helper is a bug.
     """
     if maybe_root is None:
-        return DEFAULT_SDD_ROOT
-    p = Path(maybe_root).expanduser()
-    return p
+        return detect_sdd_root()
+    return Path(maybe_root).expanduser()
+
+
+#: Video subdirectory name per environment (Lab: ``videos/``, Kaggle: ``video/``).
+VIDEO_DIR_LAB = "videos"
+VIDEO_DIR_KAGGLE = "video"
+#: Video file extension per environment (Lab: ``.mov``, Kaggle: ``.mp4``).
+VIDEO_EXT_LAB = ".mov"
+VIDEO_EXT_KAGGLE = ".mp4"
 
 
 def scene_annotations_dir(sdd_root: Path, scene: str) -> Path:
@@ -57,12 +98,18 @@ def scene_annotations_dir(sdd_root: Path, scene: str) -> Path:
 
 
 def scene_videos_dir(sdd_root: Path, scene: str) -> Path:
-    return sdd_root / "videos" / scene
+    subdir = VIDEO_DIR_KAGGLE if _is_kaggle_root(Path(sdd_root)) else VIDEO_DIR_LAB
+    return Path(sdd_root) / subdir / scene
 
 
 def video_mov_path(sdd_root: Path, scene: str, video_id: str) -> Path:
-    """Return the canonical ``video.mov`` path for a given (scene, video_id)."""
-    return scene_videos_dir(sdd_root, scene) / video_id / "video.mov"
+    """Return the canonical raw-video path for a given (scene, video_id).
+
+    Lab layout: ``<sdd_root>/videos/<scene>/<video_id>/video.mov``;
+    Kaggle layout: ``<sdd_root>/video/<scene>/<video_id>/video.mp4``.
+    """
+    ext = VIDEO_EXT_KAGGLE if _is_kaggle_root(Path(sdd_root)) else VIDEO_EXT_LAB
+    return scene_videos_dir(sdd_root, scene) / video_id / f"video{ext}"
 
 
 def annotation_path(sdd_root: Path, scene: str, video_id: str) -> Path:
