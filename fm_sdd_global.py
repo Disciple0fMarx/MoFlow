@@ -4,16 +4,21 @@ Aligned with Note Technique §5.2 (Global Video Encoder) and §9 (Étape 2).
 Reuses the existing ``ETHEncoder`` + ``ETHMotionTransformer`` stack; only the
 dataloader and CLI flags are SDD-specific.
 
+Dual-infrastructure defaults (see ``video_encoder.sdd_adapter``):
+the SDD root defaults to the Remote Lab Machine
+(`/home/efrei_stage/Desktop/Datasets/SDD`) and auto-switches to the Kaggle
+mount (`/kaggle/input/datasets/aryashah2k/stanford-drone-dataset`) when
+``/kaggle`` exists. An explicit ``--sdd_root`` always wins.
+
 Usage on the remote lab machine:
 
     python fm_sdd_global.py \\
-        --cfg cfg/eth_ucy/cor_fm.yml \\
+        --cfg cfg/sdd/cor_fm.yml \\
         --held_out_scene coupa \\
-        --sdd_root ~/Desktop/Datasets/SDD \\
-        --video_features_root ~/Desktop/Datasets/SDD/features/resnet18
+        --video_features_root /home/efrei_stage/Desktop/Datasets/SDD/features/resnet18
 
     # Evaluation
-    python fm_sdd_global.py --cfg cfg/eth_ucy/cor_fm.yml --held_out_scene coupa --eval
+    python fm_sdd_global.py --cfg cfg/sdd/cor_fm.yml --held_out_scene coupa --eval
 """
 from __future__ import annotations
 
@@ -36,6 +41,11 @@ from models.flow_matching import FlowMatcher
 from trainer.denoising_model_trainers import Trainer
 from utils.config import Config
 from utils.utils import back_up_code_git, log_config_to_file, set_random_seed
+from video_encoder.sdd_adapter import (
+    DEFAULT_SDD_ROOT,
+    expand_sdd_root,
+    is_kaggle,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,9 +58,13 @@ def parse_args() -> argparse.Namespace:
     # ---- SDD-specific -------------------------------------------------------
     p.add_argument(
         "--sdd_root",
-        default="~/Desktop/Datasets/SDD",
+        default=None,
         type=str,
-        help="Remote SDD path. Default: ~/Desktop/Datasets/SDD (hardcoded).",
+        help=(
+            "SDD dataset root. Default: the Remote Lab Machine root "
+            f"({DEFAULT_SDD_ROOT}); auto-switches to the Kaggle mount when "
+            "/kaggle exists. An explicit value always wins."
+        ),
     )
     p.add_argument(
         "--held_out_scene",
@@ -165,7 +179,9 @@ def init_basics(args: argparse.Namespace) -> tuple[Config, object, SummaryWriter
     cfg.max_num_ckpts = args.max_num_ckpts
 
     # ---- SDD knobs injected into cfg ----------------------------------------
-    cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT = str(Path(args.sdd_root).expanduser())
+    cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT = str(expand_sdd_root(args.sdd_root))
+    if is_kaggle() and args.sdd_root is None:
+        print(f"[fm_sdd_global] Kaggle detected → SDD root: {cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT}")
     cfg.MODEL.CONTEXT_ENCODER.HELD_OUT_SCENE = args.held_out_scene
     if args.video_features_root is not None:
         cfg.MODEL.CONTEXT_ENCODER.VIDEO_FEATURES_ROOT = str(
