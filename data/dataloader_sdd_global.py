@@ -166,11 +166,14 @@ def build_window_index(
     scenes_used: list[str] = []
     videos_per_scene: list[dict[str, int]] = []
 
-    for scene_idx, scene in enumerate(scenes):
+    for scene in scenes:
         ann_dir = root / "annotations" / scene
         if not ann_dir.is_dir():
             print(f"[sdd-index] skip missing scene dir: {ann_dir}")
             continue
+        # Compact index aligned with scenes_used/videos below — never use the
+        # raw enumerate() offset, or missing scene dirs desynchronize lookups.
+        scene_idx = len(scenes_used)
         scenes_used.append(scene)
         video_ids = sorted(p.name for p in ann_dir.iterdir() if p.is_dir())
         videos_per_scene.append({vid: i for i, vid in enumerate(video_ids)})
