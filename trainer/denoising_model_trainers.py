@@ -249,7 +249,12 @@ class Trainer(object):
                 self.ema.ema_model.train()
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = {k : v.to(self.device) for k, v in next(self.dl).items()}
+                    # None-safe transfer: no-video baselines yield None for
+                    # video feature keys (e.g. z_video_global).
+                    data = {
+                        k: v.to(self.device) if v is not None else None
+                        for k, v in next(self.dl).items()
+                    }
                     
                     log_dict = {'cur_epoch': self.step // iter_per_epoch}
 
@@ -534,9 +539,13 @@ class Trainer(object):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        for i_batch, data in enumerate(dl): 
+        for i_batch, data in enumerate(dl):
             bs = int(data['batch_size'])
-            data = {k : v.to(self.device) for k, v in data.items()}
+            # None-safe transfer: no-video baselines yield None for video keys.
+            data = {
+                k: v.to(self.device) if v is not None else None
+                for k, v in data.items()
+            }
 
             pred_traj, pred_traj_t, t_seq, y_t_seq, pred_score = self.sample_from_denoising_model(data)
 
