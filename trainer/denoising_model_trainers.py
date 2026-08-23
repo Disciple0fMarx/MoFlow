@@ -249,10 +249,10 @@ class Trainer(object):
                 self.ema.ema_model.train()
 
                 for _ in range(self.gradient_accumulate_every):
-                    # None-safe transfer: no-video baselines yield None for
-                    # video feature keys (e.g. z_video_global).
+                    # Transfer tensors only; lists/strings/None (metadata and
+                    # no-video keys) pass through untouched.
                     data = {
-                        k: v.to(self.device) if v is not None else None
+                        k: v.to(self.device) if hasattr(v, 'to') else v
                         for k, v in next(self.dl).items()
                     }
                     
@@ -541,9 +541,9 @@ class Trainer(object):
         start.record()
         for i_batch, data in enumerate(dl):
             bs = int(data['batch_size'])
-            # None-safe transfer: no-video baselines yield None for video keys.
+            # Transfer tensors only; lists/strings/None pass through untouched.
             data = {
-                k: v.to(self.device) if v is not None else None
+                k: v.to(self.device) if hasattr(v, 'to') else v
                 for k, v in data.items()
             }
 
