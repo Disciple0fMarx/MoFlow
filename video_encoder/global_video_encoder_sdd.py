@@ -20,9 +20,17 @@ this cache (see ``SDDFrameFeatureLookup.window`` in :mod:`sdd_adapter`).
 
 Two public entry points:
 
-* :class:`SDDGlobalVideoEncoder` — encodes a list of (scene, frame_id) rows.
-* :func:`build_sdd_frame_index` — parses ``~/Desktop/Datasets/SDD/annotations/**`` and
+* :class:`SDDGlobalVideoEncoder` — streams each SDD video **once**, encodes the
+  unique annotated frame ids in batches, and writes per-scene caches via
+  :meth:`SDDGlobalVideoEncoder.encode_split_to_cache`.
+* :func:`build_sdd_frame_index` — parses ``<sdd_root>/annotations/**`` and
   returns the canonical (scene, video_id, track_id, frame_id, ...) DataFrame.
+
+CLI (see :mod:`video_encoder.cli`)::
+
+    python -m video_encoder encode-sdd \
+        --sdd-root /home/efrei_stage/Desktop/Datasets/SDD \
+        --out ./features/resnet18
 """
 from __future__ import annotations
 
@@ -33,6 +41,7 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.io import read_image
@@ -121,26 +130,55 @@ def build_sdd_frame_index(
 def _build_resnet18(device: str | torch.device) -> tuple[torch.nn.Module, int, transforms.Compose]:
     """Return ``(model, feature_dim, preprocess)``.
 
-    Strictly 2D backbone (no temporal conv) — applied per-frame.
+    Delegates to :func:`backbones.build_backbone` so SDD features are computed
+    with the exact same frozen ResNet-18 + ImageNet preprocessing as the
+    ETH/UCY pipeline. Strictly 2D backbone (no temporal conv).
     """
-    from torchvision.models import resnet18, ResNet18_Weights
+    from .backbones import build_backbone
 
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-    model.fc = torch.nn.Identity()
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    preprocess = transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            ),
-        ]
-    )
-    return model.to(device), 512, preprocess
+    model, dim, preprocess = build_backbone("resnet18")
+    return model.to(device), dim, preprocess
+
+
+# ---------------------------------------------------------------------------
+# Streaming video reader (sequential decode, no full-video RAM load)
+# ---------------------------------------------------------------------------
+
+def _open_video_reader(video_path: Path):
+    """Yield ``(frame_idx, PIL RGB Image)`` for every frame, sequentially.
+
+    Tries ``decord`` first (mirrors :mod:`video_encoder.custom_video`), then
+    falls back to OpenCV. Only one decoded frame is held at a time — unlike
+    ``torchvision.io.read_video`` which materializes the entire clip.
+    """
+    try:  # preferred backend
+        import decord  # type: ignore
+
+        decord.bridge.set_bridge("native")
+        vr = decord.VideoReader(str(video_path))
+        n = len(vr)
+    except Exception:
+        vr, n = None, None
+    if vr is not None:
+        for i in range(n):
+            yield i, Image.fromarray(vr[i].asnumpy())
+        return
+
+    import cv2  # type: ignore
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {video_path}")
+    try:
+        idx = 0
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+            yield idx, Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            idx += 1
+    finally:
+        cap.release()
 
 
 # ---------------------------------------------------------------------------
@@ -282,18 +320,73 @@ class SDDGlobalVideoEncoder:
         manifest = pd.DataFrame(manifest_rows)
         return features, manifest
 
+    @torch.inference_mode()
+    def _encode_frames_stream(
+        self,
+        needed_by_video: dict[str, list[int]],
+        root: Path,
+        scene: str,
+    ) -> dict[int, np.ndarray]:
+        """Stream each SDD video once and encode only its annotated frame ids.
+
+        Returns ``{frame_id: feature_vec[D]}``. Frame ids requested beyond the
+        decoded length are reported and omitted (the lookup snaps to nearest).
+        """
+        feats_by_fid: dict[int, np.ndarray] = {}
+        for video_id in sorted(needed_by_video):
+            wanted = set(int(f) for f in needed_by_video[video_id])
+            vid_path = video_mov_path(root, scene, video_id)
+            if not vid_path.exists():
+                print(f"[sdd-encode] {scene}/{video_id}: missing video {vid_path}, skipping")
+                continue
+
+            buf_imgs: list[torch.Tensor] = []
+            buf_fids: list[int] = []
+
+            def flush() -> None:
+                if not buf_imgs:
+                    return
+                x = torch.stack(buf_imgs, dim=0).to(self.device, non_blocking=True)
+                y = self.model(x).detach().cpu().numpy().astype(np.float32)
+                for fid, vec in zip(buf_fids, y):
+                    feats_by_fid[fid] = vec
+                buf_imgs.clear()
+                buf_fids.clear()
+
+            n_decoded = 0
+            for idx, img in _open_video_reader(vid_path):
+                n_decoded = idx + 1
+                if idx in wanted:
+                    buf_imgs.append(self.preprocess(img))
+                    buf_fids.append(idx)
+                    if len(buf_imgs) >= self.batch_size:
+                        flush()
+            flush()
+
+            missing = wanted - feats_by_fid.keys()
+            if missing:
+                print(
+                    f"[sdd-encode] {scene}/{video_id}: {len(missing)} annotated "
+                    f"frame(s) beyond decoded length {n_decoded} "
+                    f"(e.g. {min(missing)}); they will nearest-snap at lookup time."
+                )
+        return feats_by_fid
+
     def encode_split_to_cache(
         self,
         sdd_root: str | Path | None,
         scenes: Iterable[str] | None,
-        out_dir: str | Path,
+        out_dir: str | Path = "./features/resnet18",
     ) -> dict[str, tuple[Path, Path]]:
-        """For each scene, encode every *unique* frame and write per-scene cache.
+        """For each scene, encode every *unique* annotated frame and write cache.
 
-        Output layout::
+        Output layout (consumed by ``SDDFrameFeatureLookup``)::
 
-            <out_dir>/<scene>.npy              # [N_frames, D] float32
+            <out_dir>/<scene>.npy               # [N_frames, D] float32
             <out_dir>/<scene>.manifest.parquet  # scene, video_id, frame_id, row_idx
+
+        ``out_dir`` defaults to the repo-local ``./features/resnet18`` because
+        the production SDD dataset directory is read-only.
 
         Returns ``{scene: (npy_path, parquet_path)}``.
         """
@@ -310,17 +403,48 @@ class SDDGlobalVideoEncoder:
                 continue
             # Unique frames across all (video_id, track_id) for this scene.
             df = build_sdd_frame_index(sdd_root=root, scenes=[scene])
-            unique = df[["scene", "video_id", "frame_id"]].drop_duplicates().reset_index(drop=True)
+            unique = (
+                df[["scene", "video_id", "frame_id"]]
+                .drop_duplicates()
+                .sort_values(["video_id", "frame_id"])
+                .drop_duplicates("frame_id")  # a frame shared by 2 videos → first video wins
+                .reset_index(drop=True)
+            )
             if unique.empty:
                 print(f"[sdd-encode] {scene}: no frames to encode, skipping")
                 continue
-            features, manifest = self.encode(unique, sdd_root=root)
+
+            needed: dict[str, list[int]] = {
+                vid: sorted(g["frame_id"].astype(int))
+                for vid, g in unique.groupby("video_id", sort=False)
+            }
+            vid_of = dict(zip(unique["frame_id"].astype(int), unique["video_id"]))
+
+            feats_by_fid = self._encode_frames_stream(needed, root, scene)
+            if not feats_by_fid:
+                print(f"[sdd-encode] {scene}: nothing decodable, skipping")
+                continue
+
+            fid_sorted = sorted(feats_by_fid)
+            features = np.stack([feats_by_fid[f] for f in fid_sorted]).astype(np.float32)
+            manifest = pd.DataFrame(
+                {
+                    "scene": scene,
+                    "video_id": [vid_of[f] for f in fid_sorted],
+                    "frame_id": np.asarray(fid_sorted, dtype=np.int64),
+                    "row_idx": np.arange(len(fid_sorted), dtype=np.int64),
+                }
+            )
+
             npy_path = out_dir / f"{scene}.npy"
             parquet_path = out_dir / f"{scene}.manifest.parquet"
             np.save(npy_path, features)
             manifest.to_parquet(parquet_path, index=False)
             written[scene] = (npy_path, parquet_path)
-            print(f"[sdd-encode] {scene}: {features.shape} → {npy_path}")
+            print(
+                f"[sdd-encode] {scene}: {features.shape} from "
+                f"{len(needed)} video(s) -> {npy_path}"
+            )
         return written
 
 

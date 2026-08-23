@@ -201,3 +201,6 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Feature caches (large binary artifacts, regenerated per machine)
+features/

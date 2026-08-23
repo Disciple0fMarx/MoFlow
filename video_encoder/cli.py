@@ -1,4 +1,4 @@
-"""CLI: python -m video_encoder {build-splits, encode, encode-video}."""
+"""CLI: python -m video_encoder {build-splits, encode, encode-video, encode-sdd}."""
 from __future__ import annotations
 
 import argparse
@@ -60,6 +60,22 @@ def _cmd_encode_video(args):
         print(f"  {k:>10s}  {v}")
 
 
+def _cmd_encode_sdd(args):
+    from .global_video_encoder_sdd import SDDGlobalVideoEncoder
+
+    enc = SDDGlobalVideoEncoder(
+        backbone="resnet18",
+        device=args.device,
+        batch_size=args.batch_size,
+    )
+    written = enc.encode_split_to_cache(
+        sdd_root=args.sdd_root,
+        scenes=args.scenes,
+        out_dir=args.out,
+    )
+    print(f"Done. Wrote {len(written)} scene cache(s) under {Path(args.out)}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="video_encoder")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -91,6 +107,29 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--device", default=None)
     sv.add_argument("--batch-size", type=int, default=32)
     sv.set_defaults(func=_cmd_encode_video)
+
+    ss = sub.add_parser(
+        "encode-sdd",
+        help="Encode SDD videos into per-scene feature caches (.npy + manifest).",
+    )
+    ss.add_argument(
+        "--sdd-root",
+        default=None,
+        help="SDD dataset root. Default: resolved via the dual-environment "
+        "matrix in video_encoder.sdd_adapter (Remote Lab Machine root, or the "
+        "Kaggle mount when /kaggle exists).",
+    )
+    ss.add_argument(
+        "--out",
+        default="./features/resnet18",
+        help="Output directory for <scene>.npy + <scene>.manifest.parquet. "
+        "Default: ./features/resnet18 (repo-local — the production SDD "
+        "dataset directory is read-only).",
+    )
+    ss.add_argument("--scenes", nargs="*", default=None, help="Scene subset (default: all 8).")
+    ss.add_argument("--device", default=None)
+    ss.add_argument("--batch-size", type=int, default=32)
+    ss.set_defaults(func=_cmd_encode_sdd)
 
     return p
 
