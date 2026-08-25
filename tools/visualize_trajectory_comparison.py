@@ -182,6 +182,15 @@ def plot_trajectory_comparison(
     base_all = _as_bundle(baseline_samples)
     ours_all = _as_bundle(ours_samples)
 
+    # ---- background FIRST: imshow before any trajectory is plotted --------
+    if background is not None:
+        if extent is None:  # default: full image, origin top-left (y down)
+            extent = (0.0, float(background.shape[1]),
+                      float(background.shape[0]), 0.0)
+        for ax_ in axes:
+            ax_.imshow(background, extent=extent, origin="upper", zorder=0,
+                       interpolation="bilinear", aspect="equal")
+
     _, labels_r = _draw_panel(
         axes[0], obs, gt, base_all,
         best=_as_xy(baseline_best) if baseline_best is not None else None,
@@ -195,18 +204,13 @@ def plot_trajectory_comparison(
         units=units,
     )
 
+    # ---- enforce limits LAST so nothing can crop the frame ----------------
     if background is not None:
-        if extent is None:  # default: full image, origin top-left (y down)
-            extent = (0.0, float(background.shape[1]),
-                      float(background.shape[0]), 0.0)
-        for ax_ in axes:
-            ax_.imshow(background, extent=extent, origin="upper", zorder=0,
-                       interpolation="bilinear")
         x0, x1, yb, yt = extent
         for ax_ in axes:
             ax_.set_xlim(x0, x1)
-            # pixel-space orientation: y increases downward
-            ax_.set_ylim(yb, yt)
+            ax_.set_ylim(yb, yt)   # pixel-space orientation: y increases down
+            ax_.set_adjustable("box")
     else:
         _set_shared_data_limits(axes, [obs, gt, base_all, ours_all])
 
@@ -439,19 +443,38 @@ def _quiet_logger() -> logging.Logger:
 # ---------------------------------------------------------------------------
 # Background loading: the EXACT video frame at the present timestep
 # ---------------------------------------------------------------------------
-def _imread_rgb(path: Path) -> np.ndarray:
-    """Read an image as ``[H, W, 3]`` array (matplotlib or cv2 fallback)."""
-    try:
-        img = plt.imread(str(path))
-    except Exception:
-        import cv2  # matplotlib covers most formats; cv2 is the safety net
+def _console(msg: str) -> None:
+    """Print unconditionally — background diagnostics must never be silent."""
+    print(f"[viz:frame] {msg}")
 
-        img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
-    return img
+
+def _imread_rgb(path: Path) -> np.ndarray:
+    """Physically load an image file from disk as ``[H, W, 3]`` RGB.
+
+    Tries PIL first (JPEG/PNG native), then OpenCV, then matplotlib.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return np.asarray(im.convert("RGB"))
+    except Exception:
+        pass
+    try:
+        import cv2
+
+        return cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+    except Exception:
+        return plt.imread(str(path))
 
 
 def _decode_video_frame(video_path: Path, frame_idx: int) -> np.ndarray:
-    """Decode a single frame via cv2 seek (no whole-video loading)."""
+    """Decode a single frame via cv2 (seek first, sequential-grab fallback).
+
+    ``CAP_PROP_POS_FRAMES`` seeks are unreliable on some codecs; when the
+    seeked read fails the frame is retrieved by grabbing sequentially from
+    the start. The capture handle is always released.
+    """
     import cv2
 
     cap = cv2.VideoCapture(str(video_path))
@@ -460,17 +483,44 @@ def _decode_video_frame(video_path: Path, frame_idx: int) -> np.ndarray:
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         idx = min(max(int(frame_idx), 0), max(total - 1, 0))
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, bgr = cap.read()
-        if not ok:
+
+        if not ok or bgr is None:  # seek failed -> sequential grab
+            cap.release()
+            cap = cv2.VideoCapture(str(video_path))
+            for _ in range(idx):
+                if not cap.grab():
+                    break
+            ok, bgr = cap.retrieve()
+
+        if not ok or bgr is None:
             raise IOError(f"failed to read frame {idx} of {video_path}")
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     finally:
         cap.release()  # free the handle immediately
 
 
+def _materialize_frame_cache(
+    frames_dir: Path, frame_idx: int, img_rgb: np.ndarray
+) -> Path | None:
+    """Persist a video-decoded frame so later runs hit the fast file path."""
+    try:
+        from PIL import Image
+
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        out = frames_dir / f"frame{int(frame_idx):06d}.jpg"
+        if not out.exists():
+            Image.fromarray(img_rgb).save(out, quality=92)
+        return out
+    except Exception as exc:  # read-only roots etc. -> skip caching
+        _console(f"could not cache frame ({exc})")
+        return None
+
+
 def load_anchor_frame(
-    sdd_root: str | Path | None,
+    sdd_root: str | Path,
     scene: str,
     video_id: str,
     anchor_frame: int,
@@ -478,62 +528,79 @@ def load_anchor_frame(
 ) -> tuple[np.ndarray, tuple[float, float, float, float], str] | None:
     """Load the video frame backing the plotted window's coordinates.
 
-    SDD annotations (and therefore the dataloader's absolute trajectories)
+    ``sdd_root`` MUST be the already-resolved dataset root (never ``None``):
+    use :func:`video_encoder.sdd_adapter.expand_sdd_root` at the call site so
+    platform defaults (lab / Kaggle mounts) apply.
+
+    SDD annotations — and therefore the dataloader's absolute trajectories —
     are pixel coordinates of the source video, whose resolution never changes
-    within a clip — so the frame at ``anchor_frame`` (the last observation
-    step) is the exact spatial context for this sample.
+    within a clip; the frame at ``anchor_frame`` (the last observation step)
+    is the exact spatial context of the plotted sample.
 
     Resolution order (first hit wins):
       1. explicit ``override`` path (--background);
-      2. pre-extracted JPEG ``<root>/videos/<scene>/<vid>/frames/
-         frame{anchor:06d}.jpg`` (+1 variant tolerates 0-based annotation
-         ids against 1-based extraction);
-      3. static ``referenceframe.jpg`` (official SDD layout, then videos/);
-      4. direct cv2 seek-decode from the raw video at ``anchor_frame``.
+      2. physically stored frames: ``<root>/{videos,frames}/<scene>/<vid>/
+         frames/frame{anchor:06d}.{jpg,png}`` (+1 variant tolerates 0-based
+         annotation ids against 1-based extraction);
+      3. static ``referenceframe.jpg`` (official SDD layout);
+      4. direct cv2 decode from the raw video — the decoded frame is cached
+         to disk as a JPEG so subsequent runs take path (2).
 
-    Returns ``(image, extent=(0, W, H, 0), source_tag)`` or ``None``.
+    Returns ``(image, extent=(0, W, H, 0), source_tag)`` or ``None``
+    (loudly reported — a missing background is never silent).
     """
+    root = Path(sdd_root)
+    a = int(anchor_frame)
     candidates: list[tuple[str, Path]] = []
     if override is not None:
         candidates.append(("override", Path(override)))
-    root: Path | None = None
-    if sdd_root is not None:
-        root = Path(expand_sdd_root(sdd_root))
-        frames_dir = root / "videos" / scene / video_id / "frames"
-        candidates.extend(
-            [
-                ("exact-extracted", frames_dir / f"frame{int(anchor_frame):06d}.jpg"),
-                ("exact-extracted+1", frames_dir / f"frame{int(anchor_frame) + 1:06d}.jpg"),
-                ("reference", root / "frames" / scene / video_id / "referenceframe.jpg"),
-                ("reference-videos", root / "videos" / scene / video_id / "referenceframe.jpg"),
-            ]
-        )
+    frames_dirs = [
+        root / "videos" / scene / video_id / "frames",
+        root / "frames" / scene / video_id / "frames",
+    ]
+    for d in frames_dirs:
+        for suffix in (a, a + 1):
+            for ext in ("jpg", "png"):
+                tag = "exact-extracted" if suffix == a else "exact-extracted+1"
+                candidates.append((tag, d / f"frame{suffix:06d}.{ext}"))
+    candidates.append(
+        ("reference", root / "frames" / scene / video_id / "referenceframe.jpg")
+    )
+    candidates.append(
+        ("reference-videos", root / "videos" / scene / video_id / "referenceframe.jpg")
+    )
+
     for source, cand in candidates:
         if cand.exists():
             img = _imread_rgb(cand)
-            logger.info("[%s/%s] background (%s): %s", scene, video_id,
-                        source, cand)
+            _console(
+                f"[{scene}/{video_id}] background '{source}' @frame {a}: "
+                f"{cand} ({img.shape[1]}x{img.shape[0]}px)"
+            )
             return img, (0.0, float(img.shape[1]), float(img.shape[0]), 0.0), source
 
-    if root is not None:
-        video = video_mov_path(root, scene, video_id)
-        if not video.exists():  # tolerate non-canonical extensions
-            alt = video.with_suffix(".mp4")
-            video = alt if alt.exists() else video
-        try:
-            img = _decode_video_frame(video, int(anchor_frame))
-            logger.info("[%s/%s] background (video-decode @%d): %s",
-                        scene, video_id, int(anchor_frame), video)
-            h, w = img.shape[:2]
-            return img, (0.0, float(w), float(h), 0.0), "video-decode"
-        except Exception as exc:
-            logger.warning("[%s/%s] video frame extraction failed: %s",
-                           scene, video_id, exc)
+    # ---- last resort: decode straight from the raw video -------------------
+    video = video_mov_path(root, scene, video_id)
+    if not video.exists():  # tolerate non-canonical extensions/layouts
+        alt = video.with_suffix(".mp4")
+        video = alt if alt.exists() else video
+    try:
+        img = _decode_video_frame(video, a)
+    except Exception as exc:
+        _console(
+            f"[{scene}/{video_id}] NO BACKGROUND AVAILABLE: every candidate "
+            f"path missed and video decoding failed ({exc}). "
+            f"Figure will render without scene context."
+        )
+        return None
 
-    logger.warning(
-        "[%s/%s] no frame found; plotting without background", scene, video_id
+    _materialize_frame_cache(root / "videos" / scene / video_id / "frames", a, img)
+    h, w = img.shape[:2]
+    _console(
+        f"[{scene}/{video_id}] background 'video-decode' @frame {a}: "
+        f"{video} ({w}x{h}px) — cached for future runs"
     )
-    return None
+    return img, (0.0, float(w), float(h), 0.0), "video-decode"
 
 
 # ---------------------------------------------------------------------------
@@ -691,8 +758,12 @@ def run_scene(scene: str, args: argparse.Namespace) -> Path | None:
         anchor_frame = int(anchor_frame[0]) if anchor_frame is not None else 0
         background = extent = None
         if not getattr(args, "no_background", False):
+            # NOTE: resolve the platform default HERE — args.sdd_root is None
+            # when relying on the lab/Kaggle default, and passing None through
+            # would skip every lookup and silently yield a white background.
+            resolved_root = expand_sdd_root(args.sdd_root)
             loaded = load_anchor_frame(
-                args.sdd_root, scene, video_id, anchor_frame,
+                resolved_root, scene, video_id, anchor_frame,
                 override=getattr(args, "background", None),
             )
             if loaded is not None:
