@@ -141,6 +141,20 @@ logger = logging.getLogger("viz")
 # ---------------------------------------------------------------------------
 # Plotting core (side-by-side panels)
 # ---------------------------------------------------------------------------
+def _padded_bbox(
+    arrays: list[np.ndarray], margin: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Union bounding box of all arrays (+ ``margin`` on every side).
+
+    Every array is ``[N, >=2]`` (or bundle ``[K, F, 2]``); only X/Y matter.
+    Returns ``(lo[2], hi[2])`` corners of the padded rectangle.
+    """
+    pts = np.concatenate([np.asarray(a).reshape(-1, 2) for a in arrays])
+    lo = pts.min(axis=0) - margin
+    hi = pts.max(axis=0) + margin
+    return lo, hi
+
+
 def plot_trajectory_comparison(
     obs_traj: np.ndarray,
     gt_traj: np.ndarray,
@@ -154,6 +168,7 @@ def plot_trajectory_comparison(
     extent: tuple[float, float, float, float] | None = None,
     units: str = "m",
     panel_titles: tuple[str, str] = ("No Video (baseline)", "Global VE"),
+    margin: float = 150.0,
 ):
     """Render a 1x2 figure: each model's prediction vs the shared ground truth.
 
@@ -171,9 +186,15 @@ def plot_trajectory_comparison(
             y pointing down).
         units: axis-unit suffix (``px`` when a background is overlaid).
         panel_titles: per-panel titles identifying the two checkpoints.
+        margin: contextual margin (image pixels) added around the union
+            bounding box of ALL plotted trajectories before zooming; the
+            padded box is clamped to the frame extent.
 
-    Both axes end up with strictly identical limits: image-extent-derived
-    when a background is present, otherwise a common data bounding box.
+    Both axes end up with strictly identical limits and zoom level: the
+    dynamically zoomed bounding box when a background is present, a common
+    padded data bounding box otherwise. In image space the Y-axis is
+    inverted (limits handed to matplotlib bottom-value-first) so the frame
+    renders upright.
     """
     fig, axes = plt.subplots(1, 2, figsize=(14, 7), sharex=True, sharey=True)
 
@@ -204,12 +225,27 @@ def plot_trajectory_comparison(
         units=units,
     )
 
-    # ---- enforce limits LAST so nothing can crop the frame ----------------
+    # ---- enforce limits LAST: dynamic zoom shared by both panels ----------
     if background is not None:
         x0, x1, yb, yt = extent
+        y_lo, y_hi = min(yb, yt), max(yb, yt)
+        # union bbox over EVERYTHING plotted (history, GT, both K-bundles);
+        # bests are bundle members so they cannot fall outside this box.
+        lo, hi = _padded_bbox([obs, gt, base_all, ours_all], margin)
+        xmin = max(x0, lo[0])
+        xmax = min(x1, hi[0])
+        ymin = max(y_lo, lo[1])
+        ymax = min(y_hi, hi[1])
+        if xmax - xmin < 1.0:  # degenerate after clamping -> keep sane span
+            c = 0.5 * (xmin + xmax)
+            xmin, xmax = c - 0.5, c + 0.5
+        if ymax - ymin < 1.0:
+            c = 0.5 * (ymin + ymax)
+            ymin, ymax = c - 0.5, c + 0.5
         for ax_ in axes:
-            ax_.set_xlim(x0, x1)
-            ax_.set_ylim(yb, yt)   # pixel-space orientation: y increases down
+            ax_.set_xlim(xmin, xmax)
+            # inverted Y: hand matplotlib the larger value as the axes bottom
+            ax_.set_ylim(ymax, ymin)
             ax_.set_adjustable("box")
     else:
         _set_shared_data_limits(axes, [obs, gt, base_all, ours_all])
@@ -802,6 +838,7 @@ def run_scene(scene: str, args: argparse.Namespace) -> Path | None:
         background=background,
         extent=extent,
         units=units,
+        margin=float(getattr(args, "zoom_margin", 150.0)),
     )
     return save_path
 
@@ -824,6 +861,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "automatic anchor-frame lookup)")
     p.add_argument("--no-background", action="store_true",
                    help="skip frame lookup and plot on white")
+    p.add_argument("--zoom-margin", type=float, default=150.0,
+                   help="contextual margin in pixels added around the union "
+                        "bounding box of all plotted trajectories when a "
+                        "video frame background is shown (default: 150)")
     p.add_argument("--demo", action="store_true",
                    help="render a synthetic styling demo (no checkpoints needed)")
     return p.parse_args(argv)
