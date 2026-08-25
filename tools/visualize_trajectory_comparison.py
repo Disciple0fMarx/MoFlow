@@ -4,14 +4,20 @@ For each held-out SDD scene this script loads the trained no-video baseline
 (``_SDD_ho<scene>_novid``) and the global-video model (``_SDD_ho<scene>_vid``),
 samples the full ``K``-hypothesis future distribution from both on the *same*
 observation window drawn from the native ``SDDGlobalDataset`` test split, and
-renders a single comparison figure showing:
+renders a side-by-side comparison figure:
 
-* the multimodal prediction bundles (all ``K`` heads, low-alpha lines),
-* the min-ADE best hypothesis of each model (thick line),
-* discrete timestep markers along every path,
-* optionally the SDD reference frame of the source video as background —
-  trajectories live in the annotation pixel space of that exact frame, so
-  overlaying is an exact coordinate match (origin top-left, y down).
+* **left panel** — No Video baseline vs ground truth,
+* **right panel** — Global VE vs ground truth,
+
+both overlaid on the EXACT video frame at the present timestep (the final
+observation step, ``anchor_frame`` of the plotted window). Trajectories live
+in the annotation pixel space of the source video, so overlaying is an exact
+coordinate match (origin top-left, y down). Each panel shows the observed
+history, the ground-truth future, the full multimodal prediction bundle
+(all ``K`` heads, low alpha) and the min-ADE best hypothesis highlighted
+with a thick line; discrete timesteps are marked along every path. Both
+panels share identical axis limits and the same background frame so the
+layouts are directly comparable.
 
 Design notes
 ------------
@@ -28,7 +34,9 @@ Design notes
   - predictions are detached, unnormalized and moved to host NumPy arrays
     immediately after inference;
   - ``torch.cuda.empty_cache()`` (and ``gc.collect()``) are called between
-    the two checkpoints and again at the end of every scene.
+    the two checkpoints and again at the end of every scene;
+  - the background frame is decoded once per scene (cv2 seek, released
+    immediately) and reused by both panels.
 
 Usage::
 
@@ -36,8 +44,8 @@ Usage::
     python tools/visualize_trajectory_comparison.py --demo
 
     # real evaluation (lab machine)
-    python tools/visualize_trajectory_comparison.py \
-        --scenes gates quad \
+    python tools/visualize_trajectory_comparison.py \\
+        --scenes gates quad \\
         --video_features_root ./features/resnet18
 
 Figures are written to ``visualizations/<scene>_trajectory_comparison.png``
@@ -65,7 +73,7 @@ matplotlib.rcParams.update(
         "mathtext.fontset": "stix",
         "font.size": 13,
         "axes.labelsize": 13,
-        "axes.titlesize": 14,
+        "axes.titlesize": 13,
         "legend.fontsize": 12,
         "xtick.labelsize": 11,
         "ytick.labelsize": 11,
@@ -101,14 +109,17 @@ from models.backbone_eth_ucy import ETHMotionTransformer  # noqa: E402
 from models.flow_matching import FlowMatcher  # noqa: E402
 from utils.config import Config  # noqa: E402
 from utils.normalization import unnormalize_min_max  # noqa: E402
-from video_encoder.sdd_adapter import expand_sdd_root  # noqa: E402
+from video_encoder.sdd_adapter import (  # noqa: E402
+    expand_sdd_root,
+    video_mov_path,
+)
 
 CFG_PATH = REPO_ROOT / "cfg" / "sdd" / "cor_fm.yml"
 RESULTS_DIR = REPO_ROOT / "results_sdd" / "cor_fm"
 DEFAULT_OUT_DIR = REPO_ROOT / "visualizations"
 
 # Bundled samples: low-alpha lines exposing the multimodal distribution;
-# best hypotheses: the previously-established headline styling, kept thick.
+# best hypotheses: thick highlight lines, one colour per model.
 SAMPLE_STYLE_BASE = {"linestyle": "-", "linewidth": 0.9, "marker": "o",
                      "markersize": 2}
 STYLE = {
@@ -116,19 +127,19 @@ STYLE = {
                 "marker": "o", "markersize": 3, "label": "History"},
     "gt": {"color": "green", "linestyle": "-", "linewidth": 1.8,
            "marker": "o", "markersize": 3, "label": "Ground truth"},
-    "baseline_best": {"color": "blue", "linewidth": 2.0, "alpha": 0.7,
+    "baseline_best": {"color": "blue", "linewidth": 2.4, "alpha": 0.85,
                       "marker": "o", "markersize": 3,
-                      "label": "No Video (best-of-K)"},
-    "ours_best": {"color": "red", "linewidth": 3.0, "alpha": 0.9,
+                      "label": "Best-of-K (min-ADE)"},
+    "ours_best": {"color": "red", "linewidth": 2.4, "alpha": 0.85,
                   "marker": "o", "markersize": 3,
-                  "label": "Global VE (best-of-K)"},
+                  "label": "Best-of-K (min-ADE)"},
 }
 
 logger = logging.getLogger("viz")
 
 
 # ---------------------------------------------------------------------------
-# Plotting core
+# Plotting core (side-by-side panels)
 # ---------------------------------------------------------------------------
 def plot_trajectory_comparison(
     obs_traj: np.ndarray,
@@ -139,80 +150,119 @@ def plot_trajectory_comparison(
     ours_best: np.ndarray | None = None,
     title: str | None = None,
     save_path: str | Path | None = None,
-    ax=None,
     background: np.ndarray | None = None,
     extent: tuple[float, float, float, float] | None = None,
     units: str = "m",
+    panel_titles: tuple[str, str] = ("No Video (baseline)", "Global VE"),
 ):
-    """Render history vs ground truth vs both prediction distributions.
+    """Render a 1x2 figure: each model's prediction vs the shared ground truth.
 
     Args:
-        obs_traj: ``[T, 2]`` observed history.
-        gt_traj: ``[F, 2]`` ground-truth future.
+        obs_traj: ``[T, 2]`` observed history (identical in both panels).
+        gt_traj: ``[F, 2]`` ground-truth future (identical in both panels).
         baseline_samples / ours_samples: ``[K, F, 2]`` hypothesis bundles;
-            every head is drawn as a low-alpha line so the multimodality of
-            the FlowMatcher output is visible.
-        baseline_best / ours_best: optional ``[F, 2]`` min-ADE trajectories
+            every head is drawn as a low-alpha marker line so the multimodal
+            FlowMatcher output stays visible.
+        baseline_best / ours_best: optional ``[F, 2]`` min-ADE trajectories,
             drawn as thick highlight lines on top of their bundles.
-        background: optional HxW(x3) image drawn behind everything; requires
-            ``extent=(x0, x1, y1, y0)`` in trajectory coordinates (for SDD
-            pixel-space overlays: ``(0, W, H, 0)``, origin top-left).
-        units: axis-unit suffix for the labels (``px`` when a background is
-            overlaid, ``m`` otherwise).
-    Inputs accept torch tensors or arrays shaped ``[.., T, 2]`` (agent 0 is
-    used when extra leading dims are present).
+        background: optional HxW(x3) image drawn behind BOTH panels; requires
+            ``extent=(x0, x1, y_bottom, y_top)`` in trajectory coordinates
+            (SDD pixel-space overlays use ``(0, W, H, 0)``: origin top-left,
+            y pointing down).
+        units: axis-unit suffix (``px`` when a background is overlaid).
+        panel_titles: per-panel titles identifying the two checkpoints.
+
+    Both axes end up with strictly identical limits: image-extent-derived
+    when a background is present, otherwise a common data bounding box.
     """
-    standalone = ax is None
-    if standalone:
-        fig, ax = plt.subplots(figsize=(7, 7))
-    else:
-        fig = ax.figure
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7), sharex=True, sharey=True)
 
     obs = _as_xy(obs_traj)
     gt = _as_xy(gt_traj)
-    base = _as_bundle(baseline_samples)
-    ours = _as_bundle(ours_samples)
+    base_all = _as_bundle(baseline_samples)
+    ours_all = _as_bundle(ours_samples)
+
+    _, labels_r = _draw_panel(
+        axes[0], obs, gt, base_all,
+        best=_as_xy(baseline_best) if baseline_best is not None else None,
+        best_style=STYLE["baseline_best"], panel_title=panel_titles[0],
+        units=units,
+    )
+    handles_r, _ = _draw_panel(
+        axes[1], obs, gt, ours_all,
+        best=_as_xy(ours_best) if ours_best is not None else None,
+        best_style=STYLE["ours_best"], panel_title=panel_titles[1],
+        units=units,
+    )
 
     if background is not None:
         if extent is None:  # default: full image, origin top-left (y down)
-            extent = (0, background.shape[1], background.shape[0], 0)
-        ax.imshow(background, extent=extent, origin="upper", zorder=0,
-                  interpolation="bilinear")
-        ax.set_xlim(extent[0], extent[1])
-        # (H, 0): pixel-space orientation — y increases downward so the
-        # annotation coordinates land exactly on their image locations.
-        ax.set_ylim(extent[2], extent[3])
+            extent = (0.0, float(background.shape[1]),
+                      float(background.shape[0]), 0.0)
+        for ax_ in axes:
+            ax_.imshow(background, extent=extent, origin="upper", zorder=0,
+                       interpolation="bilinear")
+        x0, x1, yb, yt = extent
+        for ax_ in axes:
+            ax_.set_xlim(x0, x1)
+            # pixel-space orientation: y increases downward
+            ax_.set_ylim(yb, yt)
+    else:
+        _set_shared_data_limits(axes, [obs, gt, base_all, ours_all])
 
-    def draw_bundle(bundle, color, label):
-        for i, hyp in enumerate(bundle):
-            ax.plot(hyp[:, 0], hyp[:, 1], color=color, alpha=0.15,
-                    label=label if i == 0 else "_nolegend_",
-                    zorder=2, **SAMPLE_STYLE_BASE)
-
-    ax.plot(obs[:, 0], obs[:, 1], zorder=4, **STYLE["history"])
-    ax.scatter(obs[-1, 0], obs[-1, 1], color="black", marker="s", s=70,
-               zorder=5)
-    ax.plot(gt[:, 0], gt[:, 1], zorder=4, **STYLE["gt"])
-
-    draw_bundle(base, "blue", "No Video samples")
-    draw_bundle(ours, "red", "Global VE samples")
-    if baseline_best is not None:
-        b = _as_xy(baseline_best)
-        ax.plot(b[:, 0], b[:, 1], zorder=5, **STYLE["baseline_best"])
-    if ours_best is not None:
-        o = _as_xy(ours_best)
-        ax.plot(o[:, 0], o[:, 1], zorder=5, **STYLE["ours_best"])
-
-    ax.set_xlabel(f"x [{units}]")
-    ax.set_ylabel(f"y [{units}]")
-    ax.set_title(title if title is not None else "Trajectory Comparison")
-    ax.legend(loc="best", frameon=True, framealpha=0.9)
-    ax.set_aspect("equal", adjustable="datalim")
+    axes[1].set_ylabel("")
+    fig.suptitle(title if title is not None else "Trajectory Comparison")
+    if handles_r:
+        fig.legend(handles_r, labels_r, loc="lower center", ncol=4,
+                   frameon=True, framealpha=0.9)
 
     if save_path is not None:
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"[viz] wrote {save_path}")
-    return ax
+    return fig, axes
+
+
+def _draw_panel(ax, obs, gt, samples, best, best_style, panel_title, units):
+    """Draw history + GT + sample bundle + highlighted best on one axis.
+
+    Returns the artist handles and labels used for the figure-level legend.
+    """
+    ax.set_title(panel_title)
+    (h_hist,) = ax.plot(obs[:, 0], obs[:, 1], zorder=4, **STYLE["history"])
+    ax.scatter(obs[-1, 0], obs[-1, 1], color="black", marker="s", s=70,
+               zorder=5)
+    (h_gt,) = ax.plot(gt[:, 0], gt[:, 1], zorder=4, **STYLE["gt"])
+
+    h_sample = None
+    for i, hyp in enumerate(np.asarray(samples)):
+        kwargs = {"label": "Predicted samples" if i == 0 else "_nolegend_"}
+        (artist,) = ax.plot(hyp[:, 0], hyp[:, 1],
+                            color=best_style["color"], alpha=0.15,
+                            zorder=2, **kwargs, **SAMPLE_STYLE_BASE)
+        if h_sample is None:
+            h_sample = artist
+
+    handles = [h_hist, h_gt]
+    if h_sample is not None:
+        handles.append(h_sample)
+    if best is not None:
+        (h_best,) = ax.plot(best[:, 0], best[:, 1], zorder=5, **best_style)
+        handles.append(h_best)
+    labels = [h.get_label() for h in handles]
+
+    ax.set_xlabel(f"x [{units}]")
+    return handles, labels
+
+
+def _set_shared_data_limits(axes, arrays) -> None:
+    """Give every axis the same limits spanning all plotted trajectories."""
+    pts = np.concatenate([np.asarray(a).reshape(-1, 2) for a in arrays])
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    span = np.maximum(hi - lo, 1e-6)
+    lo, hi = lo - 0.08 * span, hi + 0.08 * span
+    for ax_ in axes:
+        ax_.set_xlim(lo[0], hi[0])
+        ax_.set_ylim(lo[1], hi[1])
 
 
 def _as_xy(traj) -> np.ndarray:
@@ -387,59 +437,101 @@ def _quiet_logger() -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# Background loading (SDD reference frames)
+# Background loading: the EXACT video frame at the present timestep
 # ---------------------------------------------------------------------------
 def _imread_rgb(path: Path) -> np.ndarray:
-    """Read an image as ``[H, W, 3]`` uint8-ish array (matplotlib or cv2)."""
+    """Read an image as ``[H, W, 3]`` array (matplotlib or cv2 fallback)."""
     try:
         img = plt.imread(str(path))
     except Exception:
-        import cv2  # local fallback; matplotlib handles most formats anyway
+        import cv2  # matplotlib covers most formats; cv2 is the safety net
 
         img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
     return img
 
 
-def load_background_image(
-    sdd_root: str | Path | None, scene: str, video_id: str,
+def _decode_video_frame(video_path: Path, frame_idx: int) -> np.ndarray:
+    """Decode a single frame via cv2 seek (no whole-video loading)."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"cannot open video: {video_path}")
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        idx = min(max(int(frame_idx), 0), max(total - 1, 0))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, bgr = cap.read()
+        if not ok:
+            raise IOError(f"failed to read frame {idx} of {video_path}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    finally:
+        cap.release()  # free the handle immediately
+
+
+def load_anchor_frame(
+    sdd_root: str | Path | None,
+    scene: str,
+    video_id: str,
+    anchor_frame: int,
     override: str | Path | None = None,
-) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
-    """Locate and read the reference frame backing the annotations.
+) -> tuple[np.ndarray, tuple[float, float, float, float], str] | None:
+    """Load the video frame backing the plotted window's coordinates.
 
     SDD annotations (and therefore the dataloader's absolute trajectories)
-    are pixel coordinates in the reference frame of each video, so the
-    returned ``extent=(0, W, H, 0)`` aligns trajectories exactly on top of
-    the image (origin top-left, y pointing down).
+    are pixel coordinates of the source video, whose resolution never changes
+    within a clip — so the frame at ``anchor_frame`` (the last observation
+    step) is the exact spatial context for this sample.
 
-    Candidate locations, first hit wins:
+    Resolution order (first hit wins):
       1. explicit ``override`` path (--background);
-      2. ``<sdd_root>/frames/<scene>/<video_id>/referenceframe.jpg``
-         (official SDD layout);
-      3. ``<sdd_root>/videos/<scene>/<video_id>/referenceframe.jpg``;
-      4. first extracted frame ``<sdd_root>/videos/<scene>/<video_id>/
-         frames/frame000001.jpg`` (layout produced by ``video_encoder``).
-    Returns ``None`` when nothing is found (figure falls back to white).
+      2. pre-extracted JPEG ``<root>/videos/<scene>/<vid>/frames/
+         frame{anchor:06d}.jpg`` (+1 variant tolerates 0-based annotation
+         ids against 1-based extraction);
+      3. static ``referenceframe.jpg`` (official SDD layout, then videos/);
+      4. direct cv2 seek-decode from the raw video at ``anchor_frame``.
+
+    Returns ``(image, extent=(0, W, H, 0), source_tag)`` or ``None``.
     """
-    candidates: list[Path] = []
+    candidates: list[tuple[str, Path]] = []
     if override is not None:
-        candidates.append(Path(override))
+        candidates.append(("override", Path(override)))
+    root: Path | None = None
     if sdd_root is not None:
         root = Path(expand_sdd_root(sdd_root))
+        frames_dir = root / "videos" / scene / video_id / "frames"
         candidates.extend(
             [
-                root / "frames" / scene / video_id / "referenceframe.jpg",
-                root / "videos" / scene / video_id / "referenceframe.jpg",
-                root / "videos" / scene / video_id / "frames" / "frame000001.jpg",
+                ("exact-extracted", frames_dir / f"frame{int(anchor_frame):06d}.jpg"),
+                ("exact-extracted+1", frames_dir / f"frame{int(anchor_frame) + 1:06d}.jpg"),
+                ("reference", root / "frames" / scene / video_id / "referenceframe.jpg"),
+                ("reference-videos", root / "videos" / scene / video_id / "referenceframe.jpg"),
             ]
         )
-    for cand in candidates:
+    for source, cand in candidates:
         if cand.exists():
             img = _imread_rgb(cand)
-            logger.info("[%s/%s] background: %s", scene, video_id, cand)
-            return img, (0.0, float(img.shape[1]), float(img.shape[0]), 0.0)
+            logger.info("[%s/%s] background (%s): %s", scene, video_id,
+                        source, cand)
+            return img, (0.0, float(img.shape[1]), float(img.shape[0]), 0.0), source
+
+    if root is not None:
+        video = video_mov_path(root, scene, video_id)
+        if not video.exists():  # tolerate non-canonical extensions
+            alt = video.with_suffix(".mp4")
+            video = alt if alt.exists() else video
+        try:
+            img = _decode_video_frame(video, int(anchor_frame))
+            logger.info("[%s/%s] background (video-decode @%d): %s",
+                        scene, video_id, int(anchor_frame), video)
+            h, w = img.shape[:2]
+            return img, (0.0, float(w), float(h), 0.0), "video-decode"
+        except Exception as exc:
+            logger.warning("[%s/%s] video frame extraction failed: %s",
+                           scene, video_id, exc)
+
     logger.warning(
-        "[%s/%s] no reference frame found; plotting without background",
-        scene, video_id,
+        "[%s/%s] no frame found; plotting without background", scene, video_id
     )
     return None
 
@@ -482,7 +574,7 @@ def get_batch_for_scene(scene: str, args: argparse.Namespace) -> dict:
     verbatim by BOTH checkpoints; the baseline simply ignores
     ``z_video_global`` because it was trained with ``USE_VIDEO=False``.
     The batch carries ``scene``/``video_id``/``anchor_frame`` metadata used
-    for background lookup.
+    to resolve the exact background frame.
     """
     cfg = _build_cfg(scene, "vid", args)
     dset = SDDGlobalDataset(
@@ -522,7 +614,7 @@ def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict[str, np.nd
     detached and converted to NumPy before returning so no CUDA memory
     outlives this call. Predictions are returned in the relative frame
     (origin = last observed position); ``obs_abs`` provides the absolute
-    pixel anchor required to map them onto the reference frame.
+    pixel anchor required to map them onto the video frame.
     """
     device = cfg.device
     with torch.inference_mode():
@@ -595,14 +687,16 @@ def run_scene(scene: str, args: argparse.Namespace) -> Path | None:
                 torch.cuda.empty_cache()
 
         video_id = batch_cpu.get("video_id", [""])[0]
-        background = None
+        anchor_frame = batch_cpu.get("anchor_frame", None)
+        anchor_frame = int(anchor_frame[0]) if anchor_frame is not None else 0
+        background = extent = None
         if not getattr(args, "no_background", False):
-            loaded = load_background_image(
-                args.sdd_root, scene, video_id,
+            loaded = load_anchor_frame(
+                args.sdd_root, scene, video_id, anchor_frame,
                 override=getattr(args, "background", None),
             )
             if loaded is not None:
-                background, _ = loaded
+                background, extent, _ = loaded
     finally:
         del batch_cpu
         gc.collect()
@@ -635,6 +729,7 @@ def run_scene(scene: str, args: argparse.Namespace) -> Path | None:
         title=f"SDD '{scene}' — No Video vs Global VE",
         save_path=save_path,
         background=background,
+        extent=extent,
         units=units,
     )
     return save_path
@@ -655,26 +750,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="prefer the EMA weights over the raw model weights")
     p.add_argument("--background", default=None,
                    help="explicit path to a background image (overrides the "
-                        "automatic reference-frame lookup)")
+                        "automatic anchor-frame lookup)")
     p.add_argument("--no-background", action="store_true",
-                   help="skip background lookup and plot on white")
+                   help="skip frame lookup and plot on white")
     p.add_argument("--demo", action="store_true",
                    help="render a synthetic styling demo (no checkpoints needed)")
     return p.parse_args(argv)
 
 
 def run_demo(out_dir: str | Path) -> Path:
-    """Styling self-check: synthetic distribution over a synthetic backdrop."""
+    """Styling self-check: synthetic distributions over a synthetic frame."""
     rng = np.random.default_rng(0)
     t = np.linspace(0, 4 * np.pi, 12)
-    obs = np.stack([t / 8, np.sin(t / 2)], axis=-1)
+    obs = np.stack([t / 8 + 20, np.sin(t / 2) + 30], axis=-1)
     gt = np.stack(
         [obs[-1, 0] + np.linspace(0, 3, 12), obs[-1, 1] + np.linspace(0, 2.5, 12)],
         axis=-1,
     )
 
     def bundle(scale: float) -> np.ndarray:
-        modes = np.array([[0.0, 0.6], [1.4, 0.0]])  # bimodal ground truth-ish
+        modes = np.array([[0.0, 0.6], [1.4, 0.0]])  # bimodal spread
         out = np.empty((20, 12, 2))
         for k in range(20):
             mode = modes[k % 2] + rng.normal(scale=scale, size=2)
@@ -682,14 +777,15 @@ def run_demo(out_dir: str | Path) -> Path:
             out[k] += rng.normal(scale=scale * 0.3, size=(12, 2))
         return out
 
-    grad = np.linspace(0, 255, 64 * 48, dtype=np.uint8).reshape(48, 64)
-    background = np.repeat(grad[..., None], 3, axis=-1)  # fake backdrop
+    grad = np.linspace(0, 255, 96 * 72, dtype=np.uint8).reshape(72, 96)
+    background = np.repeat(grad[..., None], 3, axis=-1)  # fake video frame
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     save_path = out / "demo_trajectory_comparison.png"
     plot_trajectory_comparison(
         obs, gt, bundle(0.35), bundle(0.35),
-        baseline_best=bundle(0.35)[0], ours_best=bundle(0.35)[0],
+        baseline_best=bundle(0.35)[rng.integers(20)],
+        ours_best=bundle(0.35)[rng.integers(20)],
         title="Demo — No Video vs Global VE",
         save_path=save_path, background=background, units="px",
     )
