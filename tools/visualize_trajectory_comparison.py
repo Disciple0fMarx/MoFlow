@@ -1,10 +1,17 @@
 """Publication-ready trajectory comparison: No Video baseline vs Global VE.
 
 For each held-out SDD scene this script loads the trained no-video baseline
-(`_SDD_ho<scene>_novid`) and the global-video model (`_SDD_ho<scene>_vid`),
-samples future trajectories from both on the *same* observation window drawn
-from the native ``SDDGlobalDataset`` test split, selects the best-of-K
-hypothesis by min-ADE, and renders a single comparison figure.
+(``_SDD_ho<scene>_novid``) and the global-video model (``_SDD_ho<scene>_vid``),
+samples the full ``K``-hypothesis future distribution from both on the *same*
+observation window drawn from the native ``SDDGlobalDataset`` test split, and
+renders a single comparison figure showing:
+
+* the multimodal prediction bundles (all ``K`` heads, low-alpha lines),
+* the min-ADE best hypothesis of each model (thick line),
+* discrete timestep markers along every path,
+* optionally the SDD reference frame of the source video as background —
+  trajectories live in the annotation pixel space of that exact frame, so
+  overlaying is an exact coordinate match (origin top-left, y down).
 
 Design notes
 ------------
@@ -18,8 +25,8 @@ Design notes
   - one CPU batch per scene, shared verbatim by both checkpoints;
   - only ONE model resident on the GPU at any time (built, sampled, freed);
   - sampling wrapped in ``torch.inference_mode()``;
-  - predictions are detached, unnormalized, reduced to best-of-K and moved
-    to host NumPy arrays immediately after inference;
+  - predictions are detached, unnormalized and moved to host NumPy arrays
+    immediately after inference;
   - ``torch.cuda.empty_cache()`` (and ``gc.collect()``) are called between
     the two checkpoints and again at the end of every scene.
 
@@ -100,11 +107,21 @@ CFG_PATH = REPO_ROOT / "cfg" / "sdd" / "cor_fm.yml"
 RESULTS_DIR = REPO_ROOT / "results_sdd" / "cor_fm"
 DEFAULT_OUT_DIR = REPO_ROOT / "visualizations"
 
+# Bundled samples: low-alpha lines exposing the multimodal distribution;
+# best hypotheses: the previously-established headline styling, kept thick.
+SAMPLE_STYLE_BASE = {"linestyle": "-", "linewidth": 0.9, "marker": "o",
+                     "markersize": 2}
 STYLE = {
-    "history": {"color": "black", "linestyle": "--", "linewidth": 1.6, "label": "History"},
-    "gt": {"color": "green", "linestyle": "-", "linewidth": 1.8, "label": "Ground truth"},
-    "baseline": {"color": "blue", "linestyle": "-", "linewidth": 2.0, "alpha": 0.7, "label": "No Video"},
-    "ours": {"color": "red", "linestyle": "-", "linewidth": 3.0, "alpha": 0.9, "label": "Global VE"},
+    "history": {"color": "black", "linestyle": "--", "linewidth": 1.6,
+                "marker": "o", "markersize": 3, "label": "History"},
+    "gt": {"color": "green", "linestyle": "-", "linewidth": 1.8,
+           "marker": "o", "markersize": 3, "label": "Ground truth"},
+    "baseline_best": {"color": "blue", "linewidth": 2.0, "alpha": 0.7,
+                      "marker": "o", "markersize": 3,
+                      "label": "No Video (best-of-K)"},
+    "ours_best": {"color": "red", "linewidth": 3.0, "alpha": 0.9,
+                  "marker": "o", "markersize": 3,
+                  "label": "Global VE (best-of-K)"},
 }
 
 logger = logging.getLogger("viz")
@@ -116,17 +133,34 @@ logger = logging.getLogger("viz")
 def plot_trajectory_comparison(
     obs_traj: np.ndarray,
     gt_traj: np.ndarray,
-    pred_baseline: np.ndarray,
-    pred_video: np.ndarray,
+    baseline_samples: np.ndarray,
+    ours_samples: np.ndarray,
+    baseline_best: np.ndarray | None = None,
+    ours_best: np.ndarray | None = None,
     title: str | None = None,
     save_path: str | Path | None = None,
     ax=None,
+    background: np.ndarray | None = None,
+    extent: tuple[float, float, float, float] | None = None,
+    units: str = "m",
 ):
-    """Render history vs ground truth vs both model predictions.
+    """Render history vs ground truth vs both prediction distributions.
 
-    All inputs are coerced with :func:`_as_xy`, i.e. any of ``[T, 2]``,
-    ``[A, T, 2]`` or ``[B, A, T, 2]`` array-likes (NumPy or Torch) are accepted;
-    agent 0 is plotted.
+    Args:
+        obs_traj: ``[T, 2]`` observed history.
+        gt_traj: ``[F, 2]`` ground-truth future.
+        baseline_samples / ours_samples: ``[K, F, 2]`` hypothesis bundles;
+            every head is drawn as a low-alpha line so the multimodality of
+            the FlowMatcher output is visible.
+        baseline_best / ours_best: optional ``[F, 2]`` min-ADE trajectories
+            drawn as thick highlight lines on top of their bundles.
+        background: optional HxW(x3) image drawn behind everything; requires
+            ``extent=(x0, x1, y1, y0)`` in trajectory coordinates (for SDD
+            pixel-space overlays: ``(0, W, H, 0)``, origin top-left).
+        units: axis-unit suffix for the labels (``px`` when a background is
+            overlaid, ``m`` otherwise).
+    Inputs accept torch tensors or arrays shaped ``[.., T, 2]`` (agent 0 is
+    used when extra leading dims are present).
     """
     standalone = ax is None
     if standalone:
@@ -136,18 +170,41 @@ def plot_trajectory_comparison(
 
     obs = _as_xy(obs_traj)
     gt = _as_xy(gt_traj)
-    base = _as_xy(pred_baseline)
-    ours = _as_xy(pred_video)
+    base = _as_bundle(baseline_samples)
+    ours = _as_bundle(ours_samples)
 
-    ax.plot(obs[:, 0], obs[:, 1], **STYLE["history"])
-    ax.scatter(obs[-1, 0], obs[-1, 1], color="black", marker="s", s=70, zorder=5)
+    if background is not None:
+        if extent is None:  # default: full image, origin top-left (y down)
+            extent = (0, background.shape[1], background.shape[0], 0)
+        ax.imshow(background, extent=extent, origin="upper", zorder=0,
+                  interpolation="bilinear")
+        ax.set_xlim(extent[0], extent[1])
+        # (H, 0): pixel-space orientation — y increases downward so the
+        # annotation coordinates land exactly on their image locations.
+        ax.set_ylim(extent[2], extent[3])
 
-    ax.plot(gt[:, 0], gt[:, 1], **STYLE["gt"])
-    ax.plot(base[:, 0], base[:, 1], **STYLE["baseline"])
-    ax.plot(ours[:, 0], ours[:, 1], **STYLE["ours"])
+    def draw_bundle(bundle, color, label):
+        for i, hyp in enumerate(bundle):
+            ax.plot(hyp[:, 0], hyp[:, 1], color=color, alpha=0.15,
+                    label=label if i == 0 else "_nolegend_",
+                    zorder=2, **SAMPLE_STYLE_BASE)
 
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
+    ax.plot(obs[:, 0], obs[:, 1], zorder=4, **STYLE["history"])
+    ax.scatter(obs[-1, 0], obs[-1, 1], color="black", marker="s", s=70,
+               zorder=5)
+    ax.plot(gt[:, 0], gt[:, 1], zorder=4, **STYLE["gt"])
+
+    draw_bundle(base, "blue", "No Video samples")
+    draw_bundle(ours, "red", "Global VE samples")
+    if baseline_best is not None:
+        b = _as_xy(baseline_best)
+        ax.plot(b[:, 0], b[:, 1], zorder=5, **STYLE["baseline_best"])
+    if ours_best is not None:
+        o = _as_xy(ours_best)
+        ax.plot(o[:, 0], o[:, 1], zorder=5, **STYLE["ours_best"])
+
+    ax.set_xlabel(f"x [{units}]")
+    ax.set_ylabel(f"y [{units}]")
     ax.set_title(title if title is not None else "Trajectory Comparison")
     ax.legend(loc="best", frameon=True, framealpha=0.9)
     ax.set_aspect("equal", adjustable="datalim")
@@ -166,6 +223,16 @@ def _as_xy(traj) -> np.ndarray:
     while traj.ndim > 2:  # [B, A, T, 2] / [A, T, 2] -> [T, 2]
         traj = traj[0]
     return traj
+
+
+def _as_bundle(samples) -> np.ndarray:
+    """Coerce predictions to ``[K, F, 2]`` (leading B/A dims collapsed)."""
+    if hasattr(samples, "detach"):
+        samples = samples.detach().cpu().numpy()
+    samples = np.asarray(samples, dtype=np.float64)
+    while samples.ndim > 3:  # [B, A, K, F, 2] / [A, K, F, 2]
+        samples = samples[0]
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +387,64 @@ def _quiet_logger() -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
+# Background loading (SDD reference frames)
+# ---------------------------------------------------------------------------
+def _imread_rgb(path: Path) -> np.ndarray:
+    """Read an image as ``[H, W, 3]`` uint8-ish array (matplotlib or cv2)."""
+    try:
+        img = plt.imread(str(path))
+    except Exception:
+        import cv2  # local fallback; matplotlib handles most formats anyway
+
+        img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+    return img
+
+
+def load_background_image(
+    sdd_root: str | Path | None, scene: str, video_id: str,
+    override: str | Path | None = None,
+) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
+    """Locate and read the reference frame backing the annotations.
+
+    SDD annotations (and therefore the dataloader's absolute trajectories)
+    are pixel coordinates in the reference frame of each video, so the
+    returned ``extent=(0, W, H, 0)`` aligns trajectories exactly on top of
+    the image (origin top-left, y pointing down).
+
+    Candidate locations, first hit wins:
+      1. explicit ``override`` path (--background);
+      2. ``<sdd_root>/frames/<scene>/<video_id>/referenceframe.jpg``
+         (official SDD layout);
+      3. ``<sdd_root>/videos/<scene>/<video_id>/referenceframe.jpg``;
+      4. first extracted frame ``<sdd_root>/videos/<scene>/<video_id>/
+         frames/frame000001.jpg`` (layout produced by ``video_encoder``).
+    Returns ``None`` when nothing is found (figure falls back to white).
+    """
+    candidates: list[Path] = []
+    if override is not None:
+        candidates.append(Path(override))
+    if sdd_root is not None:
+        root = Path(expand_sdd_root(sdd_root))
+        candidates.extend(
+            [
+                root / "frames" / scene / video_id / "referenceframe.jpg",
+                root / "videos" / scene / video_id / "referenceframe.jpg",
+                root / "videos" / scene / video_id / "frames" / "frame000001.jpg",
+            ]
+        )
+    for cand in candidates:
+        if cand.exists():
+            img = _imread_rgb(cand)
+            logger.info("[%s/%s] background: %s", scene, video_id, cand)
+            return img, (0.0, float(img.shape[1]), float(img.shape[0]), 0.0)
+    logger.warning(
+        "[%s/%s] no reference frame found; plotting without background",
+        scene, video_id,
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Native hooks
 # ---------------------------------------------------------------------------
 def build_model_and_cfg(scene: str, vid_status: str, args: argparse.Namespace):
@@ -356,6 +481,8 @@ def get_batch_for_scene(scene: str, args: argparse.Namespace) -> dict:
     The batch is fetched once with the video branch enabled and shared
     verbatim by BOTH checkpoints; the baseline simply ignores
     ``z_video_global`` because it was trained with ``USE_VIDEO=False``.
+    The batch carries ``scene``/``video_id``/``anchor_frame`` metadata used
+    for background lookup.
     """
     cfg = _build_cfg(scene, "vid", args)
     dset = SDDGlobalDataset(
@@ -389,11 +516,13 @@ def _move_to_device(batch: dict, device: str) -> dict:
 
 
 def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict[str, np.ndarray]:
-    """Sample best-of-K futures for one scene batch and return host arrays.
+    """Sample full K-hypothesis futures for one batch and return host arrays.
 
     Everything runs under ``torch.inference_mode()``; GPU tensors are
     detached and converted to NumPy before returning so no CUDA memory
-    outlives this call.
+    outlives this call. Predictions are returned in the relative frame
+    (origin = last observed position); ``obs_abs`` provides the absolute
+    pixel anchor required to map them onto the reference frame.
     """
     device = cfg.device
     with torch.inference_mode():
@@ -411,7 +540,7 @@ def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict[str, np.nd
                 pred, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1
             )
 
-        # detach + offload to host RAM immediately
+        # detach + offload to host RAM immediately: [N=(b a), K, F, 2]
         preds_np = rearrange(
             pred.detach().cpu().numpy(), "b k a f d -> (b a) k f d"
         )
@@ -423,19 +552,30 @@ def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict[str, np.nd
         batch_cpu["fut_traj_original_scale"].numpy(), "b a f d -> (b a) f d"
     ).astype(np.float64)
     # past_full columns: [abs_x, abs_y, rel_x, rel_y, vel_x, vel_y];
-    # the relative frame shares its origin with the GT/predictions.
-    obs_np = rearrange(
-        batch_cpu["past_traj_original_scale"].numpy()[..., 2:4],
-        "b a p d -> (b a) p d",
-    ).astype(np.float64)
+    # the relative frame shares its origin (last observed point) with the
+    # GT/predictions, while cols 0:2 give the absolute pixel anchor.
+    past_full = batch_cpu["past_traj_original_scale"].numpy()
+    obs_np = rearrange(past_full[..., 2:4], "b a p d -> (b a) p d").astype(np.float64)
+    obs_abs = rearrange(past_full[..., 0:2], "b a p d -> (b a) p d")[0].astype(np.float64)
 
     best, _ = select_best_of_k(preds_np, gt_np)
-    return {"obs": obs_np, "gt": gt_np, "preds_all": preds_np, "pred_best": best}
+    return {
+        "obs": obs_np,
+        "obs_abs": obs_abs,
+        "gt": gt_np,
+        "preds_all": preds_np,
+        "pred_best": best,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Scene orchestration (strict memory hygiene)
 # ---------------------------------------------------------------------------
+def _to_absolute(arrs: list[np.ndarray], anchor: np.ndarray) -> list[np.ndarray]:
+    """Shift relative-frame arrays into annotation pixel space."""
+    return [arr + anchor[None, :] for arr in arrs]
+
+
 def run_scene(scene: str, args: argparse.Namespace) -> Path | None:
     """Evaluate both checkpoints on ``scene`` and render the comparison."""
     out_dir = Path(args.out_dir)
@@ -453,24 +593,49 @@ def run_scene(scene: str, args: argparse.Namespace) -> Path | None:
                 del denoiser, cfg
                 gc.collect()
                 torch.cuda.empty_cache()
+
+        video_id = batch_cpu.get("video_id", [""])[0]
+        background = None
+        if not getattr(args, "no_background", False):
+            loaded = load_background_image(
+                args.sdd_root, scene, video_id,
+                override=getattr(args, "background", None),
+            )
+            if loaded is not None:
+                background, _ = loaded
     finally:
         del batch_cpu
         gc.collect()
         torch.cuda.empty_cache()
 
-    obs = results["novid"]["obs"][0]
-    gt = results["novid"]["gt"][0]
-    base = results["novid"]["pred_best"][0]
-    ours = results["vid"]["pred_best"][0]
+    novid, vid = results["novid"], results["vid"]
+    obs, gt = novid["obs"][0], novid["gt"][0]
+    base_all, ours_all = novid["preds_all"][0], vid["preds_all"][0]
+    base_best, ours_best = novid["pred_best"][0], vid["pred_best"][0]
+
+    if background is not None:
+        # Trajectories are stored relative to the last observed point whose
+        # ABSOLUTE position (annotation pixels) anchors them on the frame.
+        anchor = novid["obs_abs"][-1]
+        obs = obs + anchor[None, :]
+        gt, base_best, ours_best = _to_absolute([gt, base_best, ours_best], anchor)
+        base_all, ours_all = _to_absolute([base_all, ours_all], anchor)
+        units = "px"
+    else:
+        units = "m"
 
     save_path = out_dir / f"{scene}_trajectory_comparison.png"
     plot_trajectory_comparison(
         obs,
         gt,
-        base,
-        ours,
+        base_all,
+        ours_all,
+        baseline_best=base_best,
+        ours_best=ours_best,
         title=f"SDD '{scene}' — No Video vs Global VE",
         save_path=save_path,
+        background=background,
+        units=units,
     )
     return save_path
 
@@ -488,21 +653,46 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--sampling_steps", type=int, default=10)
     p.add_argument("--use-ema", action="store_true",
                    help="prefer the EMA weights over the raw model weights")
+    p.add_argument("--background", default=None,
+                   help="explicit path to a background image (overrides the "
+                        "automatic reference-frame lookup)")
+    p.add_argument("--no-background", action="store_true",
+                   help="skip background lookup and plot on white")
     p.add_argument("--demo", action="store_true",
                    help="render a synthetic styling demo (no checkpoints needed)")
     return p.parse_args(argv)
 
 
 def run_demo(out_dir: str | Path) -> Path:
-    """Styling self-check with synthetic geometry (no repo deps required)."""
+    """Styling self-check: synthetic distribution over a synthetic backdrop."""
+    rng = np.random.default_rng(0)
     t = np.linspace(0, 4 * np.pi, 12)
     obs = np.stack([t / 8, np.sin(t / 2)], axis=-1)
-    gt = np.stack([obs[-1, 0] + np.linspace(0, 3, 12), obs[-1, 1] + np.linspace(0, 2.5, 12)], axis=-1)
-    noise_b = lambda: gt + np.random.randn(12, 2) * 0.35
-    save_path = Path(out_dir) / "demo_trajectory_comparison.png"
-    plot_trajectory_comparison(obs, gt, noise_b(), noise_b(),
-                               title="Demo — No Video vs Global VE",
-                               save_path=save_path)
+    gt = np.stack(
+        [obs[-1, 0] + np.linspace(0, 3, 12), obs[-1, 1] + np.linspace(0, 2.5, 12)],
+        axis=-1,
+    )
+
+    def bundle(scale: float) -> np.ndarray:
+        modes = np.array([[0.0, 0.6], [1.4, 0.0]])  # bimodal ground truth-ish
+        out = np.empty((20, 12, 2))
+        for k in range(20):
+            mode = modes[k % 2] + rng.normal(scale=scale, size=2)
+            out[k] = gt + mode[None, :] * np.linspace(0, 1, 12)[:, None]
+            out[k] += rng.normal(scale=scale * 0.3, size=(12, 2))
+        return out
+
+    grad = np.linspace(0, 255, 64 * 48, dtype=np.uint8).reshape(48, 64)
+    background = np.repeat(grad[..., None], 3, axis=-1)  # fake backdrop
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    save_path = out / "demo_trajectory_comparison.png"
+    plot_trajectory_comparison(
+        obs, gt, bundle(0.35), bundle(0.35),
+        baseline_best=bundle(0.35)[0], ours_best=bundle(0.35)[0],
+        title="Demo — No Video vs Global VE",
+        save_path=save_path, background=background, units="px",
+    )
     return save_path
 
 
