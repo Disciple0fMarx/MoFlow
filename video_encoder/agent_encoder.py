@@ -1,6 +1,20 @@
 """
 Agent-Centric Video Encoder for MoFlow.
 Extracts per-agent visual features from crops around agent positions.
+
+Two public entry points:
+
+* :class:`AgentVideoEncoder` — the core time-shared ResNet-18 encoder that
+  turns ``[B, A, T_obs, C, H, W]`` raw crops into ``[B, A, T_obs, D]``
+  agent-specific visual tokens.
+* :class:`CompactAgentVideoEncoder` — a lightweight, fully-convolutional
+  alternative intended to run on smaller crops with lower compute.  Uses the
+  same ``[B, A, T_obs, C, H, W] -> [B, A, T_obs, D]`` contract so it is a
+  drop-in replacement for :class:`AgentVideoEncoder`.
+
+The crop tensors themselves are produced by
+:mod:`data.agent_crop_sdd` (:func:`extract_agent_crops` /
+:class:`SDDAgentCropDataset`) from the raw ``annotations.txt`` bounding boxes.
 """
 from __future__ import annotations
 
@@ -77,6 +91,12 @@ class AgentVideoEncoder(nn.Module):
         # 1. Flatten Batch, Agents, and Time dimensions: (B*A*T, 3, H, W)
         x = rearrange(video_crops, 'b a t c h w -> (b a t) c h w')
 
+        # Resize to the backbone's canonical input size (224x224) if needed.
+        if H != 224 or W != 224:
+            x = nn.functional.interpolate(
+                x, size=(224, 224), mode="bilinear", align_corners=False
+            )
+
         # 2. Extract spatial features via ResNet-18 backbone: (B*A*T, 512, 7, 7)
         spatial_features = self.backbone(x)
 
@@ -95,3 +115,48 @@ class AgentVideoEncoder(nn.Module):
         )
 
         return agent_video_features
+
+
+class CompactAgentVideoEncoder(nn.Module):
+    """Lightweight fully-convolutional agent video encoder (drop-in for #VE).
+
+    A compact stack of 3x3 2D convolutions + max-pool + global-average-pool
+    that maps small crops to ``[B, A, T_obs, D]`` visual tokens.  No external
+    ImageNet weights, so it is robust when pretraining weights are unavailable
+    on the lab machine.  Suitable for running directly on the 64x64 crops from
+    :func:`data.agent_crop_sdd.extract_agent_crops`.
+
+    ``forward(video_crops)`` accepts any crop resolution >= 8 and returns
+    ``[B, A, T_obs, d_model]``.
+    """
+
+    def __init__(self, d_model: int = 128, in_channels: int = 3, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),               # 64 -> 32
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),               # 32 -> 16
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),               # 16 -> 8
+            nn.AdaptiveAvgPool2d(1),       # -> [.., 128, 1, 1]
+        )
+        self.token_projection = nn.Linear(128, d_model)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, video_crops: torch.Tensor) -> torch.Tensor:
+        """[B, A, T, C, H, W] -> [B, A, T, d_model]."""
+        B, A, T, C, H, W = video_crops.shape
+        x = rearrange(video_crops, "b a t c h w -> (b a t) c h w")
+        x = self.features(x)                    # [B*A*T, 128, 1, 1]
+        x = x.flatten(start_dim=1)              # [B*A*T, 128]
+        x = self.dropout(x)
+        x = self.token_projection(x)            # [B*A*T, d_model]
+        return rearrange(x, "(b a t) d -> b a t d", b=B, a=A, t=T)
