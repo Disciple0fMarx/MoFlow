@@ -21,7 +21,7 @@ see ``data/agent_crop_window.py``).
 
 VRAM safeguards layered in on top of the Trainer's Accelerator:
 * ``--grad_accum_steps`` (Native: passed to ``Trainer(gradient_accumulate_every=)``);
-* AMP via the Trainer's Accelerator ``mixed_precision`` (f16 on CUDA);
+* AMP via the Trainer's Accelerator ``mixed_precision`` (fp16 on CUDA);
 * DataLoader ``pin_memory`` + ``prefetch_factor``/worker tuning;
 * ``torch.cuda.empty_cache()`` at evaluation boundaries.
 
@@ -219,9 +219,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--amp",
-        default="f16",
-        choices=["no", "f16", "bf16"],
-        help="Accelerator mixed_precision for the Trainer's AMP (f16 on CUDA).",
+        default="fp16",
+        choices=["no", "fp16", "bf16"],
+        help="Accelerator mixed_precision for the Trainer's AMP (fp16 on CUDA).",
     )
     p.add_argument("--num_workers", default=2, type=int)
     p.add_argument("--prefetch_factor", default=2, type=int)
@@ -363,7 +363,7 @@ class AgentTrainer(Trainer):
     The base ``Trainer`` owns the HuggingFace Accelerator, constructed inside
     ``__init__`` without exposing its ``mixed_precision``.  We monkey-patch the
     module-level ``Accelerator`` symbol *before* ``super().__init__`` so the base
-    builds its accelerator with the CLI-selected precision (f16/bf16 on CUDA),
+    builds its accelerator with the CLI-selected precision (fp16/bf16 on CUDA),
     then restore the original symbol.  This is the requested AMP safeguard and
     avoids re-preparing model/opt/loaders with a second accelerator.
 
@@ -412,7 +412,7 @@ def main() -> None:
     train_loader, test_loader = build_data_loaders(cfg, args)
     denoiser = build_network(cfg, logger)
 
-    # AMP: default f16 on CUDA, bf16 requested explicitly, no on CPU.
+    # AMP: default fp16 on CUDA, bf16 requested explicitly, no on CPU.
     if args.amp != "no" and cfg.device == "cpu":
         print("[fm_sdd_agent] --amp ignored (no CUDA detected).")
         amp = "no"

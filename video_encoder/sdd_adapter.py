@@ -112,6 +112,80 @@ def video_mov_path(sdd_root: Path, scene: str, video_id: str) -> Path:
     return scene_videos_dir(sdd_root, scene) / video_id / f"video{ext}"
 
 
+#: Directory layout names to try, in order (Lab ``videos/`` then Kaggle ``video/``).
+VIDEO_DIR_CANDIDATES = ("videos", "video")
+#: File extensions to try, in order, covering common raw-drone wrappers.
+VIDEO_EXT_CANDIDATES = (".mov", ".MOV", ".mp4", ".MP4", ".avi", ".AVI")
+#: File name stem for the raw video within each ``<scene>/<video_id>/`` folder.
+VIDEO_FILE_STEM = "video"
+
+
+def _resolve_video_candidates(sdd_root: Path, scene: str, video_id: str) -> list[Path]:
+    """Yield every plausible absolute raw-video path for ``(scene, video_id)``.
+
+    Enumerates each layout dir (``videos/``, ``video/``) crossed with each
+    extension, always returning absolute paths so warnings are actionable.
+    """
+    cur_dir = Path(sdd_root) if sdd_root else Path.cwd()
+    candidates: list[Path] = []
+    for layout in VIDEO_DIR_CANDIDATES:
+        for ext in VIDEO_EXT_CANDIDATES:
+            candidates.append(
+                (cur_dir / layout / scene / video_id / f"{VIDEO_FILE_STEM}{ext}").resolve()
+            )
+    return candidates
+
+
+def find_video_path(
+    sdd_root: str | Path | None,
+    scene: str,
+    video_id: str,
+    verify_open: bool = True,
+) -> Path | None:
+    """Dynamically resolve the raw video for ``(scene, video_id)``.
+
+    Unlike the fixed-layout :func:`video_mov_path`, this scans **both** the Lab
+    (``videos/``) and Kaggle (``video/``) directory layouts across the common
+    extensions (``.mov/.MOV/.mp4/.MP4/.avi/.AVI``).  The first path that exists
+    on disk is returned; when ``verify_open`` is set, the file must also open
+    with ``cv2.VideoCapture`` for it to be accepted (guards against 0-byte or
+    corrupt files).
+
+    Returns ``None`` (and logs an explicit ``WARNING`` with the exact absolute
+    paths that were attempted) when no candidate exists or opens.  Do not
+    silently swallow a missing video — surface it so callers can trace the
+    SDD layout.
+    """
+    import logging
+
+    logger = logging.getLogger("sdd_adapter")
+    root = expand_sdd_root(sdd_root)
+    candidates = _resolve_video_candidates(root, scene, video_id)
+
+    # Fast path: an existing file is good enough unless we must verify it opens.
+    existing = [p for p in candidates if p.is_file()]
+    for path in existing:
+        if not verify_open:
+            return path
+        import cv2
+
+        cap = cv2.VideoCapture(str(path))
+        ok = cap.isOpened()
+        cap.release()
+        if ok:
+            return path
+
+    attempted = ", ".join(str(p) for p in candidates)
+    logger.warning(
+        "find_video_path: could not resolve/open a raw video for scene=%r video_id=%r. "
+        "Paths attempted (absolute): %s",
+        scene,
+        video_id,
+        attempted,
+    )
+    return None
+
+
 def annotation_path(sdd_root: Path, scene: str, video_id: str) -> Path:
     return scene_annotations_dir(sdd_root, scene) / video_id / "annotations.txt"
 

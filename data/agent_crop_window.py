@@ -31,7 +31,7 @@ from typing import Sequence
 
 import numpy as np
 
-from video_encoder.sdd_adapter import expand_sdd_root, video_mov_path
+from video_encoder.sdd_adapter import expand_sdd_root, find_video_path
 from data.agent_crop_sdd import (
     CropExtractor,
     DEFAULT_CROP_SIZE,
@@ -117,7 +117,10 @@ class SDDAgentWindowDataset:
         for (scene, video_id), idx_ls in groups.items():
             annotations = parse_annotations(self.root, scene, video_id)
             tracks = build_tracks(annotations)
-            video_path = video_mov_path(self.root, scene, video_id)
+            # Dynamic resolution across layouts/extensions; logs a WARNING with
+            # the attempted absolute paths on failure. ``None`` marks every
+            # window in this group invalid (black-crop fallback downstream).
+            video_path = find_video_path(self.root, scene, video_id)
 
             # Collect the union of frames this group's windows need, decode each
             # exactly once per group with a single forward scan of the video.
@@ -164,19 +167,32 @@ class SDDAgentWindowDataset:
 
     def _decode_needed(
         self,
-        video_path: Path,
+        video_path: Path | None,
         needed: Sequence[int],
         cache: dict[int, np.ndarray],
     ) -> None:
         """Walk a single VideoCapture forward, decoding exactly the frames in
-        ``needed`` (ascending) and caching them in ``cache``."""
+        ``needed`` (ascending) and caching them in ``cache``.
+
+        Frame indexing: SDD annotation ``frame`` ids are 0-based OpenCV ordinals
+        (video frame 0 == annotation ``frame=0``), so ``grab()``/``retrieve()``
+        are stepped directly to each ``frame_id``.  A ``None`` ``video_path``
+        (resolution already failed → the warning was already logged) leaves the
+        cache empty, marking the group's windows invalid downstream.
+        """
+        import logging
         import cv2
 
         if not needed:
             return
+        if video_path is None:
+            return
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            # Missing/unreadable video → leave cache empty (valid=False downstream).
+            logging.getLogger("agent_crop_window").warning(
+                "cv2.VideoCapture failed to open video at absolute path %s",
+                str(Path(video_path).resolve()),
+            )
             cap.release()
             return
         try:

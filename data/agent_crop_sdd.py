@@ -53,7 +53,7 @@ from video_encoder.sdd_adapter import (
     SDD_SCENES,
     annotation_path,
     expand_sdd_root,
-    video_mov_path,
+    find_video_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -330,17 +330,31 @@ def decode_frame(video_path: str | Path, frame_id: int) -> np.ndarray | None:
     counter up to ``frame_id`` and grab the requested frame.  Returns the BGR
     frame ``[H, W, 3]`` or ``None`` if the video cannot be opened or the frame
     is past the end.
+
+    ``video_path`` must already be resolved by the caller (e.g. via
+    :func:`video_encoder.sdd_adapter.find_video_path`).
+
+    Frame indexing: SDD annotation ``frame`` ids are 0-based OpenCV ordinals
+    (video frame 0 == annotation ``frame=0``).  ``CAP_PROP_POS_FRAMES`` and the
+    sequential counter compare against the frame count using the same
+    convention, so a frame past the end is rejected rather than silently
+    off-by-one.
     """
+    import logging
     import cv2
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
+        logging.getLogger("agent_crop_sdd").warning(
+            "decode_frame: cv2.VideoCapture failed to open video at absolute path %s",
+            str(Path(video_path).resolve()),
+        )
         return None
     try:
         count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if 0 < count <= frame_id:
             return None
-        # Position at the requested frame.
+        # Position at the requested (0-based) frame.
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -392,6 +406,10 @@ def extract_agent_crops(
         valid &= track.lost[safe] == 0
     if not bool(np.all(valid)):
         return None
+    if video_path is None:
+        # Video could not be resolved/opened; the explicit WARNING listing the
+        # attempted absolute paths was already emitted by find_video_path.
+        return None
 
     extractor = CropExtractor(crop_size=crop_size, padding=padding, pad_value=pad_value)
     crops = []
@@ -422,9 +440,9 @@ class SDDAgentCropDataset(Dataset):
     -----
     * Frames are decoded lazily on demand.  For throughput, pre-extracting
       crops to disk (or caching decoded frames) is recommended.
-    * We reuse :func:`video_encoder.sdd_adapter.video_mov_path` so the Lab
-      (``videos/…``/``.mov``) and Kaggle (``video/…``/``.mp4``) layouts both
-      work without extra configuration.
+    * We reuse :func:`video_encoder.sdd_adapter.find_video_path`, which scans
+      both the Lab (``videos/…``/``.mov``) and Kaggle (``video/…``/``.mp4``)
+      layouts and file extensions, so no extra configuration is needed.
     """
 
     def __init__(
@@ -442,7 +460,9 @@ class SDDAgentCropDataset(Dataset):
         self.root = expand_sdd_root(sdd_root)
         self.scene = scene
         self.video_id = video_id
-        self.video_path = video_mov_path(self.root, scene, video_id)
+        # Dynamically resolve the raw video across layouts/extensions; logs an
+        # explicit WARNING with the attempted absolute paths when it fails.
+        self.video_path = find_video_path(self.root, scene, video_id)
 
         self.annotations = parse_annotations(self.root, scene, video_id)
         self.tracks = build_tracks(self.annotations)
