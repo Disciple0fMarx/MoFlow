@@ -427,8 +427,8 @@ class ETHEncoder(nn.Module):
             # dimension for each query position), to satisfy the letter of the requirement.
 
             # Create identity mask: allow each query to attend to all keys in its sequence
-            # Shape: [B*A, 1, P] -> for query position i, allow attending to key positions 0..P-1
-            identity_mask = torch.ones(B * A, 1, P, dtype=torch.bool, device=past_traj.device)
+            # nn.MultiheadAttention with 3-D query wants a 2-D key_padding_mask [B*A, P].
+            identity_mask = torch.ones(B * A, P, dtype=torch.bool, device=past_traj.device)
 
             # Apply cross-attention: Q=z_traj, K=z_agent_video, V=z_agent_video
             z_local_fused, _ = self.cross_attn_agent(
@@ -441,28 +441,33 @@ class ETHEncoder(nn.Module):
             # Reshape back to [B, A, D]
             z_local_fused = z_local_fused.reshape(B, A, -1)  # [B, A, D]
 
-            # Step 3: Scene-Level Fusion (Q=z_local_fused, K=V=z_video_global)
-            # Expand z_video_global to [B, A, P, D] to match temporal dimension
-            z_video_global_expanded = z_video.unsqueeze(1).expand(B, A, P, self.video_dim)  # [B, A, P, D]
+            if z_video is not None:
+                # Step 3: Scene-Level Fusion (Q=z_local_fused, K=V=z_video_global)
+                # Expand z_video_global to [B, A, P, D] to match temporal dimension
+                z_video_global_expanded = z_video.unsqueeze(1).expand(B, A, P, self.video_dim)  # [B, A, P, D]
 
-            # Reshape for cross-attention: [B*A, 1, D] and [B*A, P, D]
-            q_local = z_local_fused.reshape(B * A, 1, -1)  # [B*A, 1, D]
-            k_video = z_video_global_expanded.reshape(B * A, P, -1)  # [B*A, P, D]
-            v_video = k_video  # [B*A, P, D]
+                # Reshape for cross-attention: [B*A, 1, D] and [B*A, P, D]
+                q_local = z_local_fused.reshape(B * A, 1, -1)  # [B*A, 1, D]
+                k_video = z_video_global_expanded.reshape(B * A, P, -1)  # [B*A, P, D]
+                v_video = k_video  # [B*A, P, D]
 
-            # Create identity mask for scene-level fusion (same logic as above)
-            identity_mask_scene = torch.ones(B * A, 1, P, dtype=torch.bool, device=past_traj.device)
+                # Create identity mask for scene-level fusion (same logic as above)
+                identity_mask_scene = torch.ones(B * A, P, dtype=torch.bool, device=past_traj.device)
 
-            # Apply cross-attention: Q=z_local_fused, K=V=z_video_global
-            z_ctx, _ = self.cross_attn_scene(
-                query=q_local,
-                key=k_video,
-                value=v_video,
-                key_padding_mask=~identity_mask_scene
-            )
+                # Apply cross-attention: Q=z_local_fused, K=V=z_video_global
+                z_ctx, _ = self.cross_attn_scene(
+                    query=q_local,
+                    key=k_video,
+                    value=v_video,
+                    key_padding_mask=~identity_mask_scene
+                )
 
-            # Reshape back to [B, A, D]
-            z_ctx = z_ctx.reshape(B, A, -1)  # [B, A, D]
+                # Reshape back to [B, A, D]
+                z_ctx = z_ctx.reshape(B, A, -1)  # [B, A, D]
+            else:
+                # Agent-centric only (USE_VIDEO=False): no scene-level features.
+                # The agent-fused context is already the final context.
+                z_ctx = z_local_fused
 
         else:
             # Fall back to existing variant A behavior
