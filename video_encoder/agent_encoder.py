@@ -32,6 +32,7 @@ class AgentVideoEncoder(nn.Module):
         pretrained=True,
         freeze_blocks=2,
         spatial_dropout_rate=0.5,
+        chunk_size=64,
     ):
         super().__init__()
 
@@ -45,6 +46,11 @@ class AgentVideoEncoder(nn.Module):
 
         self.feature_dim = 512
         self.d_model = d_model
+        # Max number of images fed to the CNN in a single forward pass.  Splits
+        # the huge [B*A*P, C, H, W] batch into micro-batches so we never run
+        # e.g. 5120 frames through the backbone at once (OOM on lab GPU).  The
+        # pooling + projection happen per-sample, so chunking is exact.
+        self.chunk_size = int(chunk_size)
 
         # Freeze early blocks if specified
         if freeze_blocks > 0:
@@ -81,10 +87,14 @@ class AgentVideoEncoder(nn.Module):
                 for param in self.backbone[i].parameters():
                     param.requires_grad = False
 
-    def forward(self, video_crops):
+    def forward(self, video_crops, chunk_size=None):
         """
         Input:  [Batch, Agents, T_obs(8), Channels(3), H, W]
         Output: [Batch, Agents, T_obs, D]
+
+        chunk_size: optional per-call override of the micro-batching limit
+        (defaults to ``self.chunk_size``).  ``None`` runs the whole batch in a
+        single backbone forward (original behaviour).
         """
         B, A, T, C, H, W = video_crops.shape
 
@@ -92,22 +102,26 @@ class AgentVideoEncoder(nn.Module):
         x = rearrange(video_crops, 'b a t c h w -> (b a t) c h w')
 
         # Resize to the backbone's canonical input size (224x224) if needed.
+        # Cheap resize on the whole tensor (not the memory-heavy part).
         if H != 224 or W != 224:
             x = nn.functional.interpolate(
                 x, size=(224, 224), mode="bilinear", align_corners=False
             )
 
-        # 2. Extract spatial features via ResNet-18 backbone: (B*A*T, 512, 7, 7)
-        spatial_features = self.backbone(x)
-
-        # 3. Apply spatial dropout
-        spatial_features = self.spatial_dropout(spatial_features)
-
-        # 4. Global average pool over spatial dimensions: (B*A*T, 512)
-        pooled_features = torch.mean(spatial_features, dim=[2, 3])
-
-        # 5. Project to D_MODEL: (B*A*T, D)
-        projected_features = self.token_projection(pooled_features)
+        # 2. Extract spatial features via ResNet-18 backbone, micro-batched to
+        #    bound peak VRAM.  Pooling + projection are per-image, so the chunk
+        #    boundary is exact and the concatenated output matches a monolithic
+        #    forward pass.
+        n = x.shape[0]
+        lim = self.chunk_size if chunk_size is None else chunk_size
+        spatial_pooled = []
+        for start in range(0, n, lim):
+            xc = x[start : start + lim]
+            fc = self.backbone(xc)                                  # [chunk, 512, 7, 7]
+            fc = self.spatial_dropout(fc)
+            fc = torch.mean(fc, dim=[2, 3])                          # [chunk, 512]
+            spatial_pooled.append(self.token_projection(fc))        # [chunk, D]
+        projected_features = torch.cat(spatial_pooled, dim=0)       # [B*A*T, D]
 
         # 6. Reshape back to (B, A, T, D)
         agent_video_features = rearrange(
@@ -130,9 +144,12 @@ class CompactAgentVideoEncoder(nn.Module):
     ``[B, A, T_obs, d_model]``.
     """
 
-    def __init__(self, d_model: int = 128, in_channels: int = 3, dropout: float = 0.1) -> None:
+    def __init__(self, d_model: int = 128, in_channels: int = 3, dropout: float = 0.1, chunk_size: int = 256) -> None:
         super().__init__()
         self.d_model = d_model
+        # Max number of images fed to the conv stack in a single forward pass
+        # (micro-batching prevents OOM for large [B*A*T] crop batches).
+        self.chunk_size = int(chunk_size)
         self.features = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
@@ -151,12 +168,18 @@ class CompactAgentVideoEncoder(nn.Module):
         self.token_projection = nn.Linear(128, d_model)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, video_crops: torch.Tensor) -> torch.Tensor:
-        """[B, A, T, C, H, W] -> [B, A, T, d_model]."""
+    def forward(self, video_crops: torch.Tensor, chunk_size: int | None = None) -> torch.Tensor:
+        """[B, A, T, C, H, W] -> [B, A, T, d_model] (micro-batched backbone)."""
         B, A, T, C, H, W = video_crops.shape
         x = rearrange(video_crops, "b a t c h w -> (b a t) c h w")
-        x = self.features(x)                    # [B*A*T, 128, 1, 1]
-        x = x.flatten(start_dim=1)              # [B*A*T, 128]
-        x = self.dropout(x)
-        x = self.token_projection(x)            # [B*A*T, d_model]
+        n = x.shape[0]
+        lim = self.chunk_size if chunk_size is None else chunk_size
+        outs = []
+        for start in range(0, n, lim):
+            xc = x[start : start + lim]
+            fc = self.features(xc)                  # [chunk, 128, 1, 1]
+            fc = fc.flatten(start_dim=1)            # [chunk, 128]
+            fc = self.dropout(fc)
+            outs.append(self.token_projection(fc))  # [chunk, d_model]
+        x = torch.cat(outs, dim=0)                  # [B*A*T, d_model]
         return rearrange(x, "(b a t) d -> b a t d", b=B, a=A, t=T)

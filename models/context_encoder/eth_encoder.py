@@ -72,6 +72,9 @@ class ETHEncoder(nn.Module):
         self.agent_crop_size = self.model_cfg.get('AGENT_CROP_SIZE', [64, 64])
         self.resnet_freeze_blocks = self.model_cfg.get('RESNET_FREEZE_BLOCKS', 2)
         self.spatial_dropout_rate = self.model_cfg.get('SPATIAL_DROPOUT_RATE', 0.5)
+        # Micro-batch limit for the agent CNN backbone (avoids OOM from feeding
+        # the whole [B*A*T] crop batch through the CNN at once).
+        self.agent_encoder_chunk_size = self.model_cfg.get('AGENT_ENCODER_CHUNK_SIZE', 64)
 
         if self.use_agent_video and self.use_tri_modal_fusion:
             self.agent_video_encoder = AgentVideoEncoder(
@@ -79,6 +82,7 @@ class ETHEncoder(nn.Module):
                 pretrained=True,
                 freeze_blocks=self.resnet_freeze_blocks,
                 spatial_dropout_rate=self.spatial_dropout_rate,
+                chunk_size=self.agent_encoder_chunk_size,
             )
         else:
             self.agent_video_encoder = None

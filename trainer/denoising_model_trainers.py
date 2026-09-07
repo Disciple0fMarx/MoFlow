@@ -539,78 +539,85 @@ class Trainer(object):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        for i_batch, data in enumerate(dl):
-            bs = int(data['batch_size'])
-            # Transfer tensors only; lists/strings/None pass through untouched.
-            data = {
-                k: v.to(self.device) if hasattr(v, 'to') else v
-                for k, v in data.items()
-            }
+        # Free VRAM before validation sampling: the sampling loop runs a fresh
+        # multi-trajectory denoising pass per batch (with a CNN backbone in the
+        # agent-video config) on top of the batching buffers.  Populations the
+        # free-memory cache so the OOM from accumulated training buffers is
+        # avoided.
+        torch.cuda.empty_cache()
+        with torch.no_grad():
+            for i_batch, data in enumerate(dl):
+                bs = int(data['batch_size'])
+                # Transfer tensors only; lists/strings/None pass through untouched.
+                data = {
+                    k: v.to(self.device) if hasattr(v, 'to') else v
+                    for k, v in data.items()
+                }
 
-            pred_traj, pred_traj_t, t_seq, y_t_seq, pred_score = self.sample_from_denoising_model(data)
+                pred_traj, pred_traj_t, t_seq, y_t_seq, pred_score = self.sample_from_denoising_model(data)
 
-            fut_traj = rearrange(data['fut_traj_original_scale'], 'b a f d -> (b a) f d')               # [B, A, T, F] -> [B * A, T, F]
-            fut_traj_gt = fut_traj.unsqueeze(1).repeat(1, self.cfg.denoising_head_preds, 1, 1)          # [B * A, K, T, F]
-            distances = (fut_traj_gt - pred_traj).norm(p=2, dim=-1)                                     # [B * A, K, T]
+                fut_traj = rearrange(data['fut_traj_original_scale'], 'b a f d -> (b a) f d')               # [B, A, T, F] -> [B * A, T, F]
+                fut_traj_gt = fut_traj.unsqueeze(1).repeat(1, self.cfg.denoising_head_preds, 1, 1)          # [B * A, K, T, F]
+                distances = (fut_traj_gt - pred_traj).norm(p=2, dim=-1)                                     # [B * A, K, T]
 
-            distances_t = (pred_traj_t - fut_traj_gt.unsqueeze(1)).norm(p=2, dim=-1)                    # [B * A, S, K, T]
-            
-            ade_fde_ = self.compute_ADE_FDE(distances_t, self.cfg.future_frames)                        # 4 * [S], denoising steps
-           
-
-            if self.cfg.dataset == 'nba':
-                freq = 5 
-                factor_time = 1
-            elif self.cfg.dataset == 'eth_ucy':
-                freq = 3
-                factor_time = 1.2
-            elif self.cfg.dataset == 'sdd':
-                freq = 3
-                factor_time = 1.2
+                distances_t = (pred_traj_t - fut_traj_gt.unsqueeze(1)).norm(p=2, dim=-1)                    # [B * A, S, K, T]
                 
-            for time in range(1, 5):
-                ade, fde, ade_avg, fde_avg = self.compute_ADE_FDE(distances, int(time * freq))
-                jade, jfde, jade_avg, jfde_avg = self.compute_JADE_JFDE(distances, int(time * freq)) 
-                a_var, f_var = self.compute_avar_fvar(pred_traj, int(time * freq))
-                masd = self.compute_MASD(pred_traj, int(time * freq))
-                performance_joint['JADE_min'][time - 1] += jade.item()
-                performance_joint['JFDE_min'][time - 1] += jfde.item()
-                performance_joint['JADE_avg'][time - 1] += jade_avg.item()
-                performance_joint['JFDE_avg'][time - 1] += jfde_avg.item()
-                performance['ADE_min'][time - 1] += ade.item()
-                performance['FDE_min'][time - 1] += fde.item()
-                performance['ADE_avg'][time - 1] += ade_avg.item()
-                performance['FDE_avg'][time - 1] += fde_avg.item()
-                performance['A_var'][time - 1] += a_var.item()
-                performance['F_var'][time - 1] += f_var.item()
-                performance['MASD'][time - 1] += masd.item()
+                ade_fde_ = self.compute_ADE_FDE(distances_t, self.cfg.future_frames)                        # 4 * [S], denoising steps
+               
 
-            assert freq * 4 == self.cfg.future_frames, 'Freq {} and number of frames {} do not match'.format(freq, self.cfg.future_frames)
-             
-            num_trajs += fut_traj.shape[0]
+                if self.cfg.dataset == 'nba':
+                    freq = 5 
+                    factor_time = 1
+                elif self.cfg.dataset == 'eth_ucy':
+                    freq = 3
+                    factor_time = 1.2
+                elif self.cfg.dataset == 'sdd':
+                    freq = 3
+                    factor_time = 1.2
+                    
+                for time in range(1, 5):
+                    ade, fde, ade_avg, fde_avg = self.compute_ADE_FDE(distances, int(time * freq))
+                    jade, jfde, jade_avg, jfde_avg = self.compute_JADE_JFDE(distances, int(time * freq)) 
+                    a_var, f_var = self.compute_avar_fvar(pred_traj, int(time * freq))
+                    masd = self.compute_MASD(pred_traj, int(time * freq))
+                    performance_joint['JADE_min'][time - 1] += jade.item()
+                    performance_joint['JFDE_min'][time - 1] += jfde.item()
+                    performance_joint['JADE_avg'][time - 1] += jade_avg.item()
+                    performance_joint['JFDE_avg'][time - 1] += jfde_avg.item()
+                    performance['ADE_min'][time - 1] += ade.item()
+                    performance['FDE_min'][time - 1] += fde.item()
+                    performance['ADE_avg'][time - 1] += ade_avg.item()
+                    performance['FDE_avg'][time - 1] += fde_avg.item()
+                    performance['A_var'][time - 1] += a_var.item()
+                    performance['F_var'][time - 1] += f_var.item()
+                    performance['MASD'][time - 1] += masd.item()
 
-            # save the denoising samples
-            if self.save_samples:
-                cutoff_timesteps = 5  # only save the last 5 timesteps sampling latents to reduce the storage size
+                assert freq * 4 == self.cfg.future_frames, 'Freq {} and number of frames {} do not match'.format(freq, self.cfg.future_frames)
+                 
+                num_trajs += fut_traj.shape[0]
 
-                y_t_seq = y_t_seq[:, -cutoff_timesteps:]
-                y_t_seq = rearrange(y_t_seq, 'b s k a (f d) -> b s k a f d', f=self.cfg.future_frames)
+                # save the denoising samples
+                if self.save_samples:
+                    cutoff_timesteps = 5  # only save the last 5 timesteps sampling latents to reduce the storage size
 
-                pred_traj = rearrange(pred_traj, '(b a) k f d -> b k a f d', b=bs)  # [B, K, A, T, F]
-            
-                num_datapoints = len(y_t_seq)
+                    y_t_seq = y_t_seq[:, -cutoff_timesteps:]
+                    y_t_seq = rearrange(y_t_seq, 'b s k a (f d) -> b s k a f d', f=self.cfg.future_frames)
 
-                t_seq_ls = [t_seq]
-                y_t_seq_ls = [y_t_seq]
-                y_pred_data_ls = [pred_traj]
-                x_data_ls = [data]
-                pred_score_ls = [pred_score]
-
-                solver_tag = self.cfg.get('solver_tag', '')
-                save_name = f'denoising_samples_{status}_batch_{i_batch}_{num_datapoints}_{solver_tag}'
-                self.save_latent_states(t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls, save_name)
+                    pred_traj = rearrange(pred_traj, '(b a) k f d -> b k a f d', b=bs)  # [B, K, A, T, F]
                 
-                t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls = [], [], [], [], []
+                    num_datapoints = len(y_t_seq)
+
+                    t_seq_ls = [t_seq]
+                    y_t_seq_ls = [y_t_seq]
+                    y_pred_data_ls = [pred_traj]
+                    x_data_ls = [data]
+                    pred_score_ls = [pred_score]
+
+                    solver_tag = self.cfg.get('solver_tag', '')
+                    save_name = f'denoising_samples_{status}_batch_{i_batch}_{num_datapoints}_{solver_tag}'
+                    self.save_latent_states(t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls, save_name)
+                    
+                    t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls = [], [], [], [], []
                 
         end.record()
         torch.cuda.synchronize()

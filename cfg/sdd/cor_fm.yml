@@ -45,6 +45,7 @@ MODEL:
         AGENT_CROP_SIZE: [64, 64] # [height, width] for crops
         RESNET_FREEZE_BLOCKS: 2   # Frozen ResNet blocks
         SPATIAL_DROPOUT_RATE: 0.5 # Dropout after backbone
+        AGENT_ENCODER_CHUNK_SIZE: 64  # micro-batch images per backbone forward (OOM guard)
 
         D_MODEL: 128
         NUM_ATTN_LAYERS: 4
