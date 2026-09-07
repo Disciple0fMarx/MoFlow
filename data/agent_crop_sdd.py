@@ -50,11 +50,57 @@ from video_encoder.sdd_adapter import (
     COL_XMIN,
     COL_YMAX,
     COL_YMIN,
+    REFERENCE_IMAGE_NAME,
     SDD_SCENES,
     annotation_path,
     expand_sdd_root,
     find_video_path,
 )
+
+
+def log_video_resolution_diagnostic(scene: str, video_id: str, video_path=None) -> None:
+    """Emit an explicit diagnostic when a raw video cannot be resolved.
+
+    Prints the exact absolute path that *was* generated, whether it exists on
+    disk (``os.path.exists``), and whether ``cv2.VideoCapture`` can open it
+    (``cap.isOpened``).  Called only when :func:`find_video_path` returns
+    ``None`` — i.e. the fallback path that ultimately black-fills crops.
+    """
+    import logging
+    import os
+
+    logger = logging.getLogger("agent_crop_sdd")
+    if video_path is not None:
+        p = Path(video_path).resolve()
+        exists = os.path.exists(p)
+        opened = False
+        if exists:
+            try:
+                import cv2
+
+                cap = cv2.VideoCapture(str(p))
+                opened = cap.isOpened()
+                cap.release()
+            except Exception as exc:  # pragma: no cover - env-dependent
+                logger.warning("cv2 import/open raised: %s", exc)
+        logger.warning(
+            "VIDEO-DIAG scene=%r video_id=%r absolute_path=%s exists=%s cap_isOpened=%s "
+            "(reference.jpg probe: %s)",
+            scene,
+            video_id,
+            str(p),
+            exists,
+            opened,
+            (p.parent / REFERENCE_IMAGE_NAME).is_file(),
+        )
+    else:
+        logger.warning(
+            "VIDEO-DIAG scene=%r video_id=%r video_path=None — resolver could not "
+            "locate any raw video; see the sdd_adapter WARNING above for attempted "
+            "absolute paths + live listing.",
+            scene,
+            video_id,
+        )
 
 # ---------------------------------------------------------------------------
 # 10-column annotation schema (exact indices per the task spec)
@@ -463,6 +509,8 @@ class SDDAgentCropDataset(Dataset):
         # Dynamically resolve the raw video across layouts/extensions; logs an
         # explicit WARNING with the attempted absolute paths when it fails.
         self.video_path = find_video_path(self.root, scene, video_id)
+        if self.video_path is None:
+            log_video_resolution_diagnostic(scene, video_id, video_path=None)
 
         self.annotations = parse_annotations(self.root, scene, video_id)
         self.tracks = build_tracks(self.annotations)

@@ -17,10 +17,16 @@ B. **Kaggle** (compute proxy — VRAM profiling with dummy caches)::
 Resolution order: explicit argument > Kaggle auto-detection > Lab default.
 All CLI parsers and function signatures default to the **Lab machine values**;
 Kaggle is handled via :func:`is_kaggle` auto-detection or explicit overrides.
+
+Raw-video resolution (:func:`find_video_path`) combines a fixed layout grid
+(``videos/`` vs ``video/``, ``.mov/.MOV/.mp4/.MP4/.avi/.AVI``) with a **live
+directory scan**, so annotation/video folder-name mismatches (``video0`` vs
+``0`` vs ``video_0``, zero-padding, casing) do not black-out crops.
 """
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -118,22 +124,110 @@ VIDEO_DIR_CANDIDATES = ("videos", "video")
 VIDEO_EXT_CANDIDATES = (".mov", ".MOV", ".mp4", ".MP4", ".avi", ".AVI")
 #: File name stem for the raw video within each ``<scene>/<video_id>/`` folder.
 VIDEO_FILE_STEM = "video"
+#: Fallback still image used by some SDD mirrors when the raw video is absent.
+REFERENCE_IMAGE_NAME = "reference.jpg"
+
+
+def _normalize_video_key(name: str) -> str:
+    """Return a comparable numeric core from a video folder name.
+
+    Strips every non-digit, so ``video001``, ``0001``, ``video_1`` and ``1`` all
+    reduce to ``1``.  Used to match an annotation ``video_id`` (e.g. ``video0``)
+    against the actual on-disk video subdirectory name (e.g. ``0`` or ``video_0``).
+    """
+    digits = re.sub(r"\D", "", str(name))
+    return digits.lstrip("0") or "0"
+
+
+def _video_dir_by_listing(video_scene_dir: Path, video_id: str) -> Path | None:
+    """Locate the video subdir matching ``video_id`` via a **live listing**.
+
+    Tries the exact directory name first, then falls back to a numeric fuzzy
+    match against every subdirectory of ``video_scene_dir``.  This tolerates the
+    lab-machine naming mismatches called out in the debug notes (``video0`` vs
+    ``0`` vs ``video_0``, zero-padding, casing).
+    """
+    exact = video_scene_dir / video_id
+    if exact.is_dir():
+        return exact
+    if not video_scene_dir.is_dir():
+        return None
+    want = _normalize_video_key(video_id)
+    for p in sorted(video_scene_dir.iterdir()):
+        if p.is_dir() and _normalize_video_key(p.name) == want:
+            return p
+    return None
+
+
+def _existing_video_files_in_dir(video_dir: Path) -> list[Path]:
+    """Return the existing, non-empty raw-video files inside ``video_dir``.
+
+    Prefers the canonical ``video<ext>`` name, then falls back to any
+    ``.mov/.MOV/.mp4/.MP4/.avi/.AVI`` glob so differently-named raw videos
+    (``raw.mov`` etc.) still resolve.  Does not consider ``reference.jpg``
+    (see :data:`REFERENCE_IMAGE_NAME`) a *video* — it is only surfaced for
+    diagnostics.
+    """
+    outs: list[Path] = []
+    for ext in VIDEO_EXT_CANDIDATES:
+        p = video_dir / f"{VIDEO_FILE_STEM}{ext}"
+        if p.is_file() and p.stat().st_size > 0 and p not in outs:
+            outs.append(p)
+    for pattern in ("*.mov", "*.MOV", "*.mp4", "*.MP4", "*.avi", "*.AVI"):
+        outs.extend(
+            p for p in video_dir.glob(pattern)
+            if p.is_file() and p.stat().st_size > 0 and p not in outs
+        )
+    return outs
+
+
+def _listing_context(sdd_root: Path, scene: str) -> str:
+    """Build a diagnostic string of what actually exists under the scene video dirs."""
+    parts = []
+    for layout in VIDEO_DIR_CANDIDATES:
+        d = Path(sdd_root) / layout / scene
+        if d.is_dir():
+            entries = sorted(str(p.name) for p in d.iterdir())
+            parts.append(f"{d} -> {entries}")
+        else:
+            parts.append(f"{d} -> MISSING")
+    return "; ".join(parts)
 
 
 def _resolve_video_candidates(sdd_root: Path, scene: str, video_id: str) -> list[Path]:
     """Yield every plausible absolute raw-video path for ``(scene, video_id)``.
 
-    Enumerates each layout dir (``videos/``, ``video/``) crossed with each
-    extension, always returning absolute paths so warnings are actionable.
+    Combines the fixed ``<layout>/<scene>/<video_id>/video<ext>`` grid with a
+    **live directory scan** of ``videos/<scene>/`` and ``video/<scene>/`` so a
+    mismatch between the annotation subdir name (``video0``) and the video
+    subdir name (``0``, ``video_0``, ``0001``) still resolves.  Also tries the
+    user-documented ``video<video_id>`` folder spelling as a second grid row.
+
+    Duplicate absolute paths are de-duplicated (in order).
     """
     cur_dir = Path(sdd_root) if sdd_root else Path.cwd()
+    video_scene_dirs = [cur_dir / layout / scene for layout in VIDEO_DIR_CANDIDATES]
+
     candidates: list[Path] = []
-    for layout in VIDEO_DIR_CANDIDATES:
-        for ext in VIDEO_EXT_CANDIDATES:
-            candidates.append(
-                (cur_dir / layout / scene / video_id / f"{VIDEO_FILE_STEM}{ext}").resolve()
-            )
-    return candidates
+    for vsc in video_scene_dirs:
+        # 1. Fixed grid: <scene>/<video_id>/video<ext> and <scene>/video<video_id>/video<ext>
+        for vdir_name in (video_id, f"{VIDEO_FILE_STEM}{video_id}"):
+            for ext in VIDEO_EXT_CANDIDATES:
+                candidates.append((vsc / vdir_name / f"{VIDEO_FILE_STEM}{ext}").resolve())
+        # 2. Live listing: exact-name or numeric-fuzzy-matched subdir -> its files
+        matched = _video_dir_by_listing(vsc, video_id)
+        if matched is not None:
+            for f in _existing_video_files_in_dir(matched):
+                candidates.append(f.resolve())
+
+    # De-duplicate while preserving order.
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for p in candidates:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
 
 
 def find_video_path(
@@ -146,15 +240,22 @@ def find_video_path(
 
     Unlike the fixed-layout :func:`video_mov_path`, this scans **both** the Lab
     (``videos/``) and Kaggle (``video/``) directory layouts across the common
-    extensions (``.mov/.MOV/.mp4/.MP4/.avi/.AVI``).  The first path that exists
-    on disk is returned; when ``verify_open`` is set, the file must also open
-    with ``cv2.VideoCapture`` for it to be accepted (guards against 0-byte or
-    corrupt files).
+    extensions (``.mov/.MOV/.mp4/.MP4/.avi/.AVI``), and additionally performs a
+    **live directory listing** so annotation/video folder name mismatches
+    (``video0`` vs ``0`` vs ``video_0``, zero-padding, casing) do not silently
+    fall through to the black-crop path.
 
-    Returns ``None`` (and logs an explicit ``WARNING`` with the exact absolute
-    paths that were attempted) when no candidate exists or opens.  Do not
-    silently swallow a missing video — surface it so callers can trace the
-    SDD layout.
+    When ``verify_open`` is set, a candidate must open with ``cv2.VideoCapture``
+    to be accepted; but if *every* existing file fails the open probe, the
+    largest existing non-empty file is returned as a best-effort fallback so a
+    transient codec-probe false-negative cannot black-out an entire scene.  The
+    decode path is the source of truth for actual decodability and logs its own
+    absolute-path warning on failure.
+
+    Returns ``None`` only when no candidate file exists at all — and logs an
+    explicit ``WARNING`` containing the attempted absolute paths *and* a live
+    listing of the scene's ``videos/`` + ``video/`` directories so the lab
+    layout can be traced.
     """
     import logging
 
@@ -162,26 +263,42 @@ def find_video_path(
     root = expand_sdd_root(sdd_root)
     candidates = _resolve_video_candidates(root, scene, video_id)
 
-    # Fast path: an existing file is good enough unless we must verify it opens.
     existing = [p for p in candidates if p.is_file()]
-    for path in existing:
-        if not verify_open:
-            return path
+    if existing:
         import cv2
 
-        cap = cv2.VideoCapture(str(path))
-        ok = cap.isOpened()
-        cap.release()
-        if ok:
-            return path
+        if verify_open:
+            for path in existing:
+                cap = cv2.VideoCapture(str(path))
+                ok = cap.isOpened()
+                cap.release()
+                if ok:
+                    return path
+            # Every existing file failed the open probe: fall back to the
+            # largest (most likely to be a genuine, decodable raw video).  The
+            # decode step re-verifies and emits its own absolute-path warning.
+            best = max(existing, key=lambda p: p.stat().st_size)
+            logger.warning(
+                "find_video_path: scene=%r video_id=%r — %d existing candidate(s) "
+                "failed the cv2.VideoCapture open probe; falling back to the "
+                "largest file %s for decode.",
+                scene,
+                video_id,
+                len(existing),
+                best,
+            )
+            return best
+        return existing[0]
 
     attempted = ", ".join(str(p) for p in candidates)
     logger.warning(
-        "find_video_path: could not resolve/open a raw video for scene=%r video_id=%r. "
-        "Paths attempted (absolute): %s",
+        "find_video_path: could not resolve a raw video for scene=%r video_id=%r. "
+        "Paths attempted (absolute): %s. "
+        "Live listing: %s",
         scene,
         video_id,
         attempted,
+        _listing_context(root, scene),
     )
     return None
 
