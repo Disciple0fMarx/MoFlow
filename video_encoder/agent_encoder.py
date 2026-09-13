@@ -18,11 +18,15 @@ The crop tensors themselves are produced by
 """
 from __future__ import annotations
 
+import logging
+
 import torch
 import torch.nn as nn
 import torchvision.models as models
 from torchvision.models import ResNet18_Weights
 from einops import rearrange
+
+logger = logging.getLogger(__name__)
 
 
 class AgentVideoEncoder(nn.Module):
@@ -32,7 +36,8 @@ class AgentVideoEncoder(nn.Module):
         pretrained=True,
         freeze_blocks=2,
         spatial_dropout_rate=0.5,
-        chunk_size=64,
+        chunk_size=32,
+        check_finite=True,
     ):
         super().__init__()
 
@@ -49,8 +54,14 @@ class AgentVideoEncoder(nn.Module):
         # Max number of images fed to the CNN in a single forward pass.  Splits
         # the huge [B*A*P, C, H, W] batch into micro-batches so we never run
         # e.g. 5120 frames through the backbone at once (OOM on lab GPU).  The
-        # pooling + projection happen per-sample, so chunking is exact.
+        # pooling + projection happen per-sample, so chunking is exact.  Kept
+        # small (32) so cuDNN never runs out of workspace for the fp16 conv
+        # algorithm selection under AMP.
         self.chunk_size = int(chunk_size)
+        # Sanitize non-finite crop values before the backbone: cuDNN fp16
+        # convolutions fail hard (CUDNN_STATUS_EXECUTION_FAILED) on NaN/Inf
+        # inputs.  Disable only if profiling shows the reduction is a problem.
+        self.check_finite = bool(check_finite)
 
         # Freeze early blocks if specified
         if freeze_blocks > 0:
@@ -98,6 +109,11 @@ class AgentVideoEncoder(nn.Module):
         """
         B, A, T, C, H, W = video_crops.shape
 
+        if B * A * T == 0:
+            # No images: never touch cuDNN.  Return a correctly-shaped token
+            # tensor so downstream attention/fusion stays consistent.
+            return video_crops.new_zeros((B, A, T, self.d_model))
+
         # 1. Flatten Batch, Agents, and Time dimensions: (B*A*T, 3, H, W)
         x = rearrange(video_crops, 'b a t c h w -> (b a t) c h w')
 
@@ -108,20 +124,48 @@ class AgentVideoEncoder(nn.Module):
                 x, size=(224, 224), mode="bilinear", align_corners=False
             )
 
-        # 2. Extract spatial features via ResNet-18 backbone, micro-batched to
+        # 2. Contiguity + finiteness guards (cuDNN hardening).
+        #
+        #    * ``rearrange``/``interpolate`` may return a *view*; slicing
+        #      ``x[start:start+lim]`` of an already-non-contiguous tensor yields
+        #      a non-contiguous chunk, and cuDNN conv raises
+        #      ``CUDNN_STATUS_EXECUTION_FAILED`` on such inputs.  Forcing
+        #      contiguity up-front makes every chunk a contiguous view (a
+        #      no-op when ``x`` is already contiguous).
+        #    * NaN/Inf in the (fp16/Autocast) conv input also triggers
+        #      ``CUDNN_STATUS_EXECUTION_FAILED``.  The black-crop fallback injects
+        #      finite zeros, but spikes elsewhere can poison a chunk — sanitize
+        #      once per forward instead of failing on the first conv.
+        x = x.contiguous()
+        if self.check_finite:
+            if not torch.isfinite(x).all().item():
+                n_nonfinite = int((~torch.isfinite(x)).sum().item())
+                logger.warning(
+                    "%s.forward: %d non-finite crop value(s); replacing them "
+                    "with 0 (black-crop semantics) before the CNN backbone.",
+                    type(self).__name__,
+                    n_nonfinite,
+                )
+                x = torch.nan_to_num(x, nan=0.0, posinf=255.0, neginf=0.0)
+
+        # 3. Extract spatial features via ResNet-18 backbone, micro-batched to
         #    bound peak VRAM.  Pooling + projection are per-image, so the chunk
         #    boundary is exact and the concatenated output matches a monolithic
-        #    forward pass.
+        #    forward pass.  The final chunk is allowed to be smaller (uneven
+        #    tail); empty chunks are skipped so ``torch.cat`` never sees [].
         n = x.shape[0]
         lim = self.chunk_size if chunk_size is None else chunk_size
         spatial_pooled = []
         for start in range(0, n, lim):
             xc = x[start : start + lim]
-            fc = self.backbone(xc)                                  # [chunk, 512, 7, 7]
+            if xc.numel() == 0:
+                continue
+            xc = xc.contiguous()                                # belt-and-suspenders
+            fc = self.backbone(xc)                              # [chunk, 512, 7, 7]
             fc = self.spatial_dropout(fc)
-            fc = torch.mean(fc, dim=[2, 3])                          # [chunk, 512]
-            spatial_pooled.append(self.token_projection(fc))        # [chunk, D]
-        projected_features = torch.cat(spatial_pooled, dim=0)       # [B*A*T, D]
+            fc = torch.mean(fc, dim=[2, 3])                     # [chunk, 512]
+            spatial_pooled.append(self.token_projection(fc))    # [chunk, D]
+        projected_features = torch.cat(spatial_pooled, dim=0)   # [B*A*T, D]
 
         # 6. Reshape back to (B, A, T, D)
         agent_video_features = rearrange(
@@ -144,12 +188,14 @@ class CompactAgentVideoEncoder(nn.Module):
     ``[B, A, T_obs, d_model]``.
     """
 
-    def __init__(self, d_model: int = 128, in_channels: int = 3, dropout: float = 0.1, chunk_size: int = 256) -> None:
+    def __init__(self, d_model: int = 128, in_channels: int = 3, dropout: float = 0.1, chunk_size: int = 128, check_finite: bool = True) -> None:
         super().__init__()
         self.d_model = d_model
         # Max number of images fed to the conv stack in a single forward pass
-        # (micro-batching prevents OOM for large [B*A*T] crop batches).
+        # (micro-batching prevents OOM / cuDNN-workspace exhaustion for large
+        # [B*A*T] crop batches).
         self.chunk_size = int(chunk_size)
+        self.check_finite = bool(check_finite)
         self.features = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
@@ -171,12 +217,29 @@ class CompactAgentVideoEncoder(nn.Module):
     def forward(self, video_crops: torch.Tensor, chunk_size: int | None = None) -> torch.Tensor:
         """[B, A, T, C, H, W] -> [B, A, T, d_model] (micro-batched backbone)."""
         B, A, T, C, H, W = video_crops.shape
+
+        if B * A * T == 0:
+            return video_crops.new_zeros((B, A, T, self.d_model))
+
         x = rearrange(video_crops, "b a t c h w -> (b a t) c h w")
+        x = x.contiguous()
+        if self.check_finite and not torch.isfinite(x).all().item():
+            n_nonfinite = int((~torch.isfinite(x)).sum().item())
+            logger.warning(
+                "%s.forward: %d non-finite crop value(s); replacing them with 0.",
+                type(self).__name__,
+                n_nonfinite,
+            )
+            x = torch.nan_to_num(x, nan=0.0, posinf=255.0, neginf=0.0)
+
         n = x.shape[0]
         lim = self.chunk_size if chunk_size is None else chunk_size
         outs = []
         for start in range(0, n, lim):
             xc = x[start : start + lim]
+            if xc.numel() == 0:
+                continue
+            xc = xc.contiguous()
             fc = self.features(xc)                  # [chunk, 128, 1, 1]
             fc = fc.flatten(start_dim=1)            # [chunk, 128]
             fc = self.dropout(fc)
