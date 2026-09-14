@@ -7,7 +7,7 @@ from models.utils import polyline_encoder
 from models.context_encoder.mtr_encoder import SinusoidalPosEmb
 from einops import rearrange
 import math
-from video_encoder.agent_encoder import AgentVideoEncoder
+from video_encoder.agent_encoder import AgentVideoEncoder, CompactAgentVideoEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -76,15 +76,26 @@ class ETHEncoder(nn.Module):
         # workspace exhaustion from feeding the whole [B*A*T] crop batch through
         # the CNN at once).
         self.agent_encoder_chunk_size = self.model_cfg.get('AGENT_ENCODER_CHUNK_SIZE', 32)
+        # Backbone selection: 'resnet18' = the ImageNet-pretrained AgentVideoEncoder
+        # (original lab training); 'compact' = the lightweight fully-convolutional
+        # CompactAgentVideoEncoder (backbone `features` keys, no pretrained weights).
+        self.agent_encoder_type = str(self.model_cfg.get('AGENT_ENCODER_TYPE', 'resnet18')).lower()
 
         if self.use_agent_video and self.use_tri_modal_fusion:
-            self.agent_video_encoder = AgentVideoEncoder(
-                d_model=dim,
-                pretrained=True,
-                freeze_blocks=self.resnet_freeze_blocks,
-                spatial_dropout_rate=self.spatial_dropout_rate,
-                chunk_size=self.agent_encoder_chunk_size,
-            )
+            if self.agent_encoder_type == 'compact':
+                self.agent_video_encoder = CompactAgentVideoEncoder(
+                    d_model=dim,
+                    dropout=self.spatial_dropout_rate,
+                    chunk_size=self.agent_encoder_chunk_size,
+                )
+            else:
+                self.agent_video_encoder = AgentVideoEncoder(
+                    d_model=dim,
+                    pretrained=True,
+                    freeze_blocks=self.resnet_freeze_blocks,
+                    spatial_dropout_rate=self.spatial_dropout_rate,
+                    chunk_size=self.agent_encoder_chunk_size,
+                )
         else:
             self.agent_video_encoder = None
 

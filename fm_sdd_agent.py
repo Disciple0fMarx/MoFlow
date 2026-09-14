@@ -171,6 +171,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--crop_size", default=64, type=int)
     p.add_argument("--padding", default=0, type=int)
     p.add_argument("--no_drop_lost", action="store_true")
+    p.add_argument(
+        "--agent_encoder",
+        default="resnet18",
+        choices=["resnet18", "compact"],
+        help="Agent-crop video backbone: resnet18 = ImageNet-pretrained "
+             "AgentVideoEncoder; compact = lightweight all-convolutional "
+             "CompactAgentVideoEncoder (no external weights).",
+    )
 
     # ---- Standard overrides (mirror fm_sdd_global.py / fm_eth.py) -----------
     p.add_argument("--epochs", default=None, type=int)
@@ -292,6 +300,7 @@ def init_basics(args: argparse.Namespace) -> tuple[Config, object, SummaryWriter
     cfg.MODEL.CONTEXT_ENCODER.USE_AGENT_VIDEO = True
     cfg.MODEL.CONTEXT_ENCODER.USE_TRI_MODAL_FUSION = True
     cfg.MODEL.CONTEXT_ENCODER.AGENT_CROP_SIZE = [args.crop_size, args.crop_size]
+    cfg.MODEL.CONTEXT_ENCODER.AGENT_ENCODER_TYPE = args.agent_encoder
 
     tag += f"SDD_ho{args.held_out_scene}_agent"
     tag = tag.replace("__", "_")
