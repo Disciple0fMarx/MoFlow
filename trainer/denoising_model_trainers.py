@@ -4,6 +4,7 @@ import copy
 import math
 import os
 import pickle
+import csv
 import numpy as np 
 import matplotlib.pyplot as plt
 
@@ -505,7 +506,71 @@ class Trainer(object):
 
         save_path = os.path.join(self.cfg.sample_dir, f'{file_name}.pkl')
         self.logger.info("Saving the denoising samples to {}".format(save_path))
-        pickle.dump(states_to_save, open(save_path, 'wb'))
+        # Write + fsync atomically: intermediate state logs must survive a
+        # crash mid-evaluation, so the file is fully on disk on return.
+        with open(save_path, 'wb') as f:
+            pickle.dump(states_to_save, f)
+            f.flush()
+            os.fsync(f.fileno())
+
+    #: CSV columns (accumulated metric SUMS + running trajectory count, so a
+    #: downstream parser can always recompute the true averages from the most
+    #: recently flushed row, even when the run crashed mid-evaluation).
+    _EVAL_CSV_COLS = (
+        ['dataset', 'held_out_scene', 'status', 'num_trajs', 'failed_batches', 'partial']
+        + [f'{m}_{t}s' for t in range(1, 5) for m in (
+            'ADE_min', 'FDE_min', 'ADE_avg', 'FDE_avg',
+            'JADE_min', 'JFDE_min', 'JADE_avg', 'JFDE_avg',
+            'A_var', 'F_var', 'MASD')]
+    )
+
+    def _flush_eval_csv(self, performance, performance_joint, num_trajs, status,
+                        failed_batches=0, partial=True):
+        """Append a durable CSV row for the CURRENT accumulated metrics.
+
+        Called after every successfully evaluated batch (``partial=True``) and
+        once more after the loop finishes (``partial=False``). Every row is
+        fsync'd to disk before returning, so a mid-evaluation crash can never
+        lose more than the single in-flight batch — the LATEST row on disk is a
+        sane partial snapshot that ``tools/parse_evaluation_logs.py``-style
+        parsers can consume.
+
+        Values are stored as SUMS over ``num_trajs`` trajectories; divide by
+        ``num_trajs`` to recover the exact averages that the logger prints.
+        """
+        path = os.path.join(self.cfg.log_dir, f'eval_{status}_metrics.csv')
+        write_header = not os.path.exists(path)
+        row = {
+            'dataset': self.cfg.dataset,
+            'held_out_scene': str(self.cfg.MODEL.CONTEXT_ENCODER.get('HELD_OUT_SCENE', '')),
+            'status': str(status),
+            'num_trajs': int(num_trajs),
+            'failed_batches': int(failed_batches),
+            'partial': int(bool(partial)),
+        }
+        for t in range(4):
+            row[f'ADE_min_{t+1}s'] = float(performance['ADE_min'][t])
+            row[f'FDE_min_{t+1}s'] = float(performance['FDE_min'][t])
+            row[f'ADE_avg_{t+1}s'] = float(performance['ADE_avg'][t])
+            row[f'FDE_avg_{t+1}s'] = float(performance['FDE_avg'][t])
+            row[f'JADE_min_{t+1}s'] = float(performance_joint['JADE_min'][t])
+            row[f'JFDE_min_{t+1}s'] = float(performance_joint['JFDE_min'][t])
+            row[f'JADE_avg_{t+1}s'] = float(performance_joint['JADE_avg'][t])
+            row[f'JFDE_avg_{t+1}s'] = float(performance_joint['JFDE_avg'][t])
+            row[f'A_var_{t+1}s'] = float(performance['A_var'][t])
+            row[f'F_var_{t+1}s'] = float(performance['F_var'][t])
+            row[f'MASD_{t+1}s'] = float(performance['MASD'][t])
+
+        # stat-mode append + os-level flush guarantees the row hits disk NOW.
+        with open(path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(self._EVAL_CSV_COLS)
+            writer.writerow([row[c] for c in self._EVAL_CSV_COLS])
+            f.flush()
+            os.fsync(f.fileno())
+        self.logger.info('[eval {status}] flushed metrics CSV: {path} (partial={partial})'.format(
+            status=status, path=path, partial=bool(partial)))
 
     
     def eval_dataloader(self, testing_mode=False, training_err_check=False):
@@ -546,84 +611,140 @@ class Trainer(object):
         # avoided.
         torch.cuda.empty_cache()
         with torch.no_grad():
+            failed_batches = 0
+            # Pre-initialise loop-scoped names so an evaluation where the FIRST
+            # batch fails still reaches the logging/return path below.
+            freq = factor_time = 0
+            fut_traj_gt = None
             for i_batch, data in enumerate(dl):
-                bs = int(data['batch_size'])
-                # Transfer tensors only; lists/strings/None pass through untouched.
-                data = {
-                    k: v.to(self.device) if hasattr(v, 'to') else v
-                    for k, v in data.items()
-                }
+                # Robust evaluation: a per-batch guard lets evaluation continue
+                # when ONE batch fails.  RuntimeError covers CUDA OOM
+                # (torch.cuda.OutOfMemoryError subclasses it) and intra-op
+                # launch failures; ValueError covers tensor shape mismatches in
+                # this batch (e.g. a lost-frame window producing a short crop).
+                # The failed batch is skipped and the remaining batches still
+                # accumulate; the CSV flush below never emits a partial-write
+                # batch, so totals stay consistent.
+                try:
+                    bs = int(data['batch_size'])
+                    # Transfer tensors only; lists/strings/None pass through untouched.
+                    data = {
+                        k: v.to(self.device) if hasattr(v, 'to') else v
+                        for k, v in data.items()
+                    }
 
-                pred_traj, pred_traj_t, t_seq, y_t_seq, pred_score = self.sample_from_denoising_model(data)
+                    pred_traj, pred_traj_t, t_seq, y_t_seq, pred_score = self.sample_from_denoising_model(data)
 
-                fut_traj = rearrange(data['fut_traj_original_scale'], 'b a f d -> (b a) f d')               # [B, A, T, F] -> [B * A, T, F]
-                fut_traj_gt = fut_traj.unsqueeze(1).repeat(1, self.cfg.denoising_head_preds, 1, 1)          # [B * A, K, T, F]
-                distances = (fut_traj_gt - pred_traj).norm(p=2, dim=-1)                                     # [B * A, K, T]
+                    fut_traj = rearrange(data['fut_traj_original_scale'], 'b a f d -> (b a) f d')               # [B, A, T, F] -> [B * A, T, F]
+                    fut_traj_gt = fut_traj.unsqueeze(1).repeat(1, self.cfg.denoising_head_preds, 1, 1)          # [B * A, K, T, F]
+                    distances = (fut_traj_gt - pred_traj).norm(p=2, dim=-1)                                     # [B * A, K, T]
 
-                distances_t = (pred_traj_t - fut_traj_gt.unsqueeze(1)).norm(p=2, dim=-1)                    # [B * A, S, K, T]
-                
-                ade_fde_ = self.compute_ADE_FDE(distances_t, self.cfg.future_frames)                        # 4 * [S], denoising steps
-               
+                    distances_t = (pred_traj_t - fut_traj_gt.unsqueeze(1)).norm(p=2, dim=-1)                    # [B * A, S, K, T]
 
-                if self.cfg.dataset == 'nba':
-                    freq = 5 
-                    factor_time = 1
-                elif self.cfg.dataset == 'eth_ucy':
-                    freq = 3
-                    factor_time = 1.2
-                elif self.cfg.dataset == 'sdd':
-                    freq = 3
-                    factor_time = 1.2
-                    
-                for time in range(1, 5):
-                    ade, fde, ade_avg, fde_avg = self.compute_ADE_FDE(distances, int(time * freq))
-                    jade, jfde, jade_avg, jfde_avg = self.compute_JADE_JFDE(distances, int(time * freq)) 
-                    a_var, f_var = self.compute_avar_fvar(pred_traj, int(time * freq))
-                    masd = self.compute_MASD(pred_traj, int(time * freq))
-                    performance_joint['JADE_min'][time - 1] += jade.item()
-                    performance_joint['JFDE_min'][time - 1] += jfde.item()
-                    performance_joint['JADE_avg'][time - 1] += jade_avg.item()
-                    performance_joint['JFDE_avg'][time - 1] += jfde_avg.item()
-                    performance['ADE_min'][time - 1] += ade.item()
-                    performance['FDE_min'][time - 1] += fde.item()
-                    performance['ADE_avg'][time - 1] += ade_avg.item()
-                    performance['FDE_avg'][time - 1] += fde_avg.item()
-                    performance['A_var'][time - 1] += a_var.item()
-                    performance['F_var'][time - 1] += f_var.item()
-                    performance['MASD'][time - 1] += masd.item()
+                    ade_fde_ = self.compute_ADE_FDE(distances_t, self.cfg.future_frames)                        # 4 * [S], denoising steps
 
-                assert freq * 4 == self.cfg.future_frames, 'Freq {} and number of frames {} do not match'.format(freq, self.cfg.future_frames)
-                 
-                num_trajs += fut_traj.shape[0]
+                    if self.cfg.dataset == 'nba':
+                        freq = 5
+                        factor_time = 1
+                    elif self.cfg.dataset == 'eth_ucy':
+                        freq = 3
+                        factor_time = 1.2
+                    elif self.cfg.dataset == 'sdd':
+                        freq = 3
+                        factor_time = 1.2
 
-                # save the denoising samples
-                if self.save_samples:
-                    cutoff_timesteps = 5  # only save the last 5 timesteps sampling latents to reduce the storage size
+                    # Compute the batch's contribution into LOCAL dicts first,
+                    # then commit atomically — a failure anywhere in this batch
+                    # leaves the global performance totals untouched.
+                    perf_local = {k: list(v) for k, v in performance.items()}
+                    joint_local = {k: list(v) for k, v in performance_joint.items()}
+                    for time in range(1, 5):
+                        ade, fde, ade_avg, fde_avg = self.compute_ADE_FDE(distances, int(time * freq))
+                        jade, jfde, jade_avg, jfde_avg = self.compute_JADE_JFDE(distances, int(time * freq))
+                        a_var, f_var = self.compute_avar_fvar(pred_traj, int(time * freq))
+                        masd = self.compute_MASD(pred_traj, int(time * freq))
+                        perf_local['ADE_min'][time - 1] += ade.item()
+                        perf_local['FDE_min'][time - 1] += fde.item()
+                        perf_local['ADE_avg'][time - 1] += ade_avg.item()
+                        perf_local['FDE_avg'][time - 1] += fde_avg.item()
+                        perf_local['A_var'][time - 1] += a_var.item()
+                        perf_local['F_var'][time - 1] += f_var.item()
+                        perf_local['MASD'][time - 1] += masd.item()
+                        joint_local['JADE_min'][time - 1] += jade.item()
+                        joint_local['JFDE_min'][time - 1] += jfde.item()
+                        joint_local['JADE_avg'][time - 1] += jade_avg.item()
+                        joint_local['JFDE_avg'][time - 1] += jfde_avg.item()
 
-                    y_t_seq = y_t_seq[:, -cutoff_timesteps:]
-                    y_t_seq = rearrange(y_t_seq, 'b s k a (f d) -> b s k a f d', f=self.cfg.future_frames)
+                    assert freq * 4 == self.cfg.future_frames, 'Freq {} and number of frames {} do not match'.format(freq, self.cfg.future_frames)
 
-                    pred_traj = rearrange(pred_traj, '(b a) k f d -> b k a f d', b=bs)  # [B, K, A, T, F]
-                
-                    num_datapoints = len(y_t_seq)
+                    # commit the fully-successful batch atomically
+                    for k in performance:
+                        performance[k] = perf_local[k]
+                    for k in performance_joint:
+                        performance_joint[k] = joint_local[k]
+                    num_trajs += fut_traj.shape[0]
 
-                    t_seq_ls = [t_seq]
-                    y_t_seq_ls = [y_t_seq]
-                    y_pred_data_ls = [pred_traj]
-                    x_data_ls = [data]
-                    pred_score_ls = [pred_score]
+                    # save the denoising samples
+                    if self.save_samples:
+                        cutoff_timesteps = 5  # only save the last 5 timesteps sampling latents to reduce the storage size
 
-                    solver_tag = self.cfg.get('solver_tag', '')
-                    save_name = f'denoising_samples_{status}_batch_{i_batch}_{num_datapoints}_{solver_tag}'
-                    self.save_latent_states(t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls, save_name)
-                    
-                    t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls = [], [], [], [], []
+                        y_t_seq = y_t_seq[:, -cutoff_timesteps:]
+                        y_t_seq = rearrange(y_t_seq, 'b s k a (f d) -> b s k a f d', f=self.cfg.future_frames)
+
+                        pred_traj = rearrange(pred_traj, '(b a) k f d -> b k a f d', b=bs)  # [B, K, A, T, F]
+
+                        num_datapoints = len(y_t_seq)
+
+                        t_seq_ls = [t_seq]
+                        y_t_seq_ls = [y_t_seq]
+                        y_pred_data_ls = [pred_traj]
+                        x_data_ls = [data]
+                        pred_score_ls = [pred_score]
+
+                        solver_tag = self.cfg.get('solver_tag', '')
+                        save_name = f'denoising_samples_{status}_batch_{i_batch}_{num_datapoints}_{solver_tag}'
+                        self.save_latent_states(t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls, save_name)
+
+                        t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls = [], [], [], [], []
+
+                except (RuntimeError, ValueError) as e:
+                    failed_batches += 1
+                    self.logger.warning(
+                        'Eval batch %d skipped (%s): %s',
+                        i_batch, type(e).__name__, e,
+                    )
+                    # Free VRAM before the next batch so one OOM does not
+                    # cascade into all remaining batches.
+                    torch.cuda.empty_cache()
+                    continue
+
+                # Durable incremental checkpoint: flush the accumulated metrics
+                # to the CSV right after this scene/batch completes, so a crash
+                # cannot lose everything that was evaluated before it.
+                self._flush_eval_csv(
+                    performance, performance_joint, num_trajs, status,
+                    failed_batches=failed_batches, partial=True,
+                )
+
+            # final durable flush of the aggregated totals
+            self._flush_eval_csv(
+                performance, performance_joint, num_trajs, status,
+                failed_batches=failed_batches, partial=False,
+            )
                 
         end.record()
         torch.cuda.synchronize()
         self.logger.info(f'Total runtime: {start.elapsed_time(end):5f} ms')
         self.logger.info(f'Runtime per scene: {start.elapsed_time(end)/len(dl.dataset):5f} ms')
         self.logger.info(f'Number of scenes: {dl.dataset}')
+        if num_trajs == 0:
+            # Every batch failed: avoid dividing by zero in the metric logs and
+            # surface the failure instead of returning NaNs.
+            self.logger.warning(
+                'Evaluation recorded 0 trajectories (%d/%d batches failed); skipping metric logging.',
+                failed_batches, len(dl),
+            )
+            return fut_traj_gt, performance, num_trajs
         cur_epoch = self.step // (self.train_num_steps // self.cfg.OPTIMIZATION.NUM_EPOCHS)
         if not testing_mode: 
             self.logger.info(f'{self.step}/{self.train_num_steps}, running inference on {num_trajs} agents (trajectories)')

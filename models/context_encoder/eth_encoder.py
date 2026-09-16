@@ -47,6 +47,43 @@ class SocialTransformer(nn.Module):
         return h_feat
 
 
+class DynamicFeatureGate(nn.Module):
+    """Learnable gate between the kinematic and video feature streams.
+
+    ``h_fused = h_kin + sigmoid(W @ h_vid + b) * h_vid``
+
+    The sigmoid-bounded, per-dimension gate lets the network COMPLETELY
+    suppress a noisy video channel (``gate -> 0``, falling back to the pure
+    kinematic stream) or pass it through untouched (``gate -> 1``). This is the
+    negative-transfer mitigation: on scenes where video conditioning hurts
+    (coupa/gates), the gate learns to attenuate; on dense scenes (bookstore/
+    nexus) it keeps the video residual.
+
+    Weights are initialised so that ``sigmoid(W @ h_vid + b) ~ 1`` at
+    ``step 0`` (``W ~ 0``, ``b = +2``), making the module a near no-op
+    ``h_fused ~ h_kin + h_vid`` that only learns to gate once the data shows
+    video features are harmful.
+    """
+
+    def __init__(self, dim: int, init_bias: float = 2.0) -> None:
+        super().__init__()
+        self.gate = nn.Linear(dim, dim, bias=True)
+        # Identity-pass initialisation: W ~ N(0, 0.02), b = +2 -> sigmoid ~ 1.
+        nn.init.normal_(self.gate.weight, mean=0.0, std=0.02)
+        nn.init.constant_(self.gate.bias, init_bias)
+
+    def forward(self, h_kin, h_vid):
+        """
+        Args:
+            h_kin: [B, A, D] pure-kinematic trajectory embedding (z_traj).
+            h_vid: [B, A, D] video-conditioned context (agent/scene fusion).
+        Returns:
+            h_fused: [B, A, D] kinematic stream + gated video residual.
+        """
+        gate = torch.sigmoid(self.gate(h_vid))   # [B, A, D] per-dim in (0, 1)
+        return h_kin + gate * h_vid              # [B, A, D]
+
+
 class ETHEncoder(nn.Module):
     def __init__(self, config, use_pre_norm):
         super().__init__()
@@ -131,9 +168,16 @@ class ETHEncoder(nn.Module):
         if self.use_tri_modal_fusion:
             self.cross_attn_agent = nn.MultiheadAttention(embed_dim=dim, num_heads=self.model_cfg.NUM_ATTN_HEAD, batch_first=True)
             self.cross_attn_scene = nn.MultiheadAttention(embed_dim=dim, num_heads=self.model_cfg.NUM_ATTN_HEAD, batch_first=True)
+            # Dynamic feature gating (kinematic + video fusion).  Adds two tiny
+            # parameter sets to the state dict, so enabling it for an experiment
+            # requires (re)training from scratch or a checkpoint trained with
+            # USE_VIDEO_GATING: True.
+            self.use_video_gating = bool(self.model_cfg.get('USE_VIDEO_GATING', False))
+            self.video_gate = DynamicFeatureGate(dim) if self.use_video_gating else None
         else:
             self.cross_attn_agent = None
             self.cross_attn_scene = None
+            self.video_gate = None
 
         self.num_out_channels = dim
 
@@ -484,6 +528,17 @@ class ETHEncoder(nn.Module):
                 # Agent-centric only (USE_VIDEO=False): no scene-level features.
                 # The agent-fused context is already the final context.
                 z_ctx = z_local_fused
+
+            # ---- Dynamic feature gating ------------------------------------
+            # Suppress noisy video features: h_fused = h_kin + sigma(W h_vid + b)*h_vid.
+            #   h_kin : [B, A, D] pure-kinematic trajectory embedding (z_traj, the
+            #           social-encoder output WITHOUT any video concat).
+            #   h_vid : [B, A, D] video-conditioned context (z_ctx).
+            #   gate  : [B, A, D] sigmoid-bounded per-dim weights in (0, 1).
+            #   z_ctx : [B, A, D] kinematic + gated video residual (fed to the
+            #           motion decoder exactly as before).
+            if self.video_gate is not None:
+                z_ctx = self.video_gate(h_kin=agent_feature, h_vid=z_ctx)   # [B, A, D]
 
         else:
             # Fall back to existing variant A behavior

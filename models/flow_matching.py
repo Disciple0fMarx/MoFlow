@@ -346,6 +346,44 @@ class FlowMatcher(nn.Module):
 
         return y_t, y_data_at_t_ls, t_ls, y_t_ls, model_preds.pred_score
 
+    def _variety_loss(self, denoised_y):
+        """Repulsion-based variety penalty computed in NORMALIZED space.
+
+        ``denoised_y``: [B, K, A, F, D] denoised candidate futures in the
+        normalized data space (D=2 for xy; scale-free, so ``DIVERSITY_MARGIN``
+        stays meaningful across datasets).
+
+        Returns a scalar: mean over (B, A, ordered pairs) of
+        ``relu(DIVERSITY_MARGIN - mean_L2_pair)**2`` — a soft-margin hinge that
+        drives every pair of candidate trajectories apart until its mean L2
+        separation reaches the margin. Minimising it actively counters the
+        mode collapse induced by the winner-takes-all regression (all K heads
+        converging onto one mean trajectory): the sampling phase is forced to
+        spread candidates so they can cover diverse edge-case futures.
+        """
+        B, K, A, F, _ = denoised_y.shape
+        if K < 2:
+            return torch.zeros(1, device=denoised_y.device)
+
+        margin = float(self.cfg.OPTIMIZATION.get('DIVERSITY_MARGIN', 0.25))
+        # Pair-wise per-frame distances -> mean over the future horizon.
+        # diffs     : [B, K, K, A, F, 2]  (dim2-vs-dim1 candidate difference)
+        # pair_dist : [B, K, K, A]        (mean frame-wise L2 between heads)
+        diffs = denoised_y[:, :, None, ...] - denoised_y[:, None, ...]
+        # +eps inside the sqrt keeps the backward finite for the (zero-distance)
+        # self-pairs on the diagonal, which would otherwise yield 0 * inf = NaN.
+        pair_dist = (diffs.pow(2).sum(dim=-1) + 1e-12).sqrt().mean(dim=-1)
+
+        # Exclude the trivial self-pairs on the (K, K) diagonal.
+        eye = torch.eye(K, dtype=torch.bool, device=denoised_y.device)  # [K, K]
+        pair_dist = pair_dist.masked_fill(eye[None, :, :, None], 0.0)
+
+        # Average over the K*(K-1) ordered distinct pairs (both directions are
+        # present, so the count is K*K - K).
+        mean_pair = pair_dist.sum(dim=(1, 2)) / (K * (K - 1))            # [B, A]
+        hinge = torch.relu(margin - mean_pair).pow(2)                    # [B, A]
+        return hinge.mean()
+
     def p_losses(self, x_data, log_dict=None):
         """
         Denoising model training.
@@ -456,11 +494,30 @@ class FlowMatcher(nn.Module):
 
         loss_cls = loss_cls_b.mean()
 
+        # ---- Variety (diversity) calibration --------------------------------
+        # Upweight the diversity penalty so the K-candidate sampling phase
+        # generates multimodal edge-case futures instead of collapsing onto a
+        # single mean trajectory.  Weight from OPTIMIZATION.LOSS_WEIGHTS['div']
+        # (default 0.0 == disabled for backward compatibility) relative to the
+        # winner-takes-all regression head.
+        #   denoised_y   : [B, K, A, F, 2] (normalized candidate futures)
+        #   loss_div     : scalar hinge repulsion over all K-head pairs.
+        weight_div = self.cfg.OPTIMIZATION.LOSS_WEIGHTS.get('div', 0.0)
+        if weight_div > 0:
+            loss_div = self._variety_loss(denoised_y)          # scalar
+        else:
+            loss_div = torch.zeros(1, device=self.device)
+
         weight_reg = self.cfg.OPTIMIZATION.LOSS_WEIGHTS.get('reg', 1.0)
         weight_cls = self.cfg.OPTIMIZATION.LOSS_WEIGHTS.get('cls', 1.0)
         weight_vel = self.cfg.OPTIMIZATION.LOSS_WEIGHTS.get('vel', 0.2)
 
-        loss = weight_reg * loss_reg.mean() + weight_cls * loss_cls.mean() + weight_vel * loss_reg_vel.mean()
+        loss = (
+            weight_reg * loss_reg.mean()
+            + weight_cls * loss_cls.mean()
+            + weight_vel * loss_reg_vel.mean()
+            + weight_div * loss_div
+        )
 
         # record the loss for each denoising level
         flag_reset = self.loss_buffer.record_loss(t, loss_reg_b.detach(), epoch_id=log_dict['cur_epoch'])

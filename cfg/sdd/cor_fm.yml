@@ -47,6 +47,7 @@ MODEL:
         SPATIAL_DROPOUT_RATE: 0.5 # Dropout after backbone
         AGENT_ENCODER_CHUNK_SIZE: 32  # micro-batch images per backbone forward (OOM/cuDNN guard)
         AGENT_ENCODER_TYPE: resnet18   # agent-crop backbone: resnet18 (ImageNet pretrained) | compact (lightweight, no pretrained)
+        USE_VIDEO_GATING: True         # learnable kinematic+video gate (h_fused = h_kin + sigmoid(W h_vid + b) * h_vid); NOTE: adds params
 
         D_MODEL: 128
         NUM_ATTN_LAYERS: 4
@@ -84,4 +85,6 @@ OPTIMIZATION:
       'cls': 1.0, 
       'reg': 1.0, 
       'vel': 0.2,
+      'div': 0.1,  # diversity (variety) calibration: repulsion among K candidates
     }
+    DIVERSITY_MARGIN: 0.25  # hinge margin (normalized units) for the variety loss
