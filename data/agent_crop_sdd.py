@@ -245,14 +245,15 @@ class AgentTrack:
         )
 
     def valid_mask(
-        self, drop_lost: bool = True, drop_occluded: bool = False,
+        self, drop_lost: bool = False, drop_occluded: bool = False,
         drop_generated: bool = False,
     ) -> np.ndarray:
         """Boolean validity per frame from the lost/occluded/generated flags.
 
-        ``lost`` is on by default because a lost frame has no trustworthy
-        position to crop around.  ``occluded`` and ``generated`` lines remain
-        usable by default (the bbox is still present) but can be dropped.
+        ``lost`` frames are kept by default so the crop branch stays aligned
+        with the trajectory branch, which consumes every frame of a window.
+        ``occluded`` and ``generated`` lines remain usable by default (the
+        bbox is still present) but can be dropped.
         """
         mask = np.ones(self.frames.size, dtype=bool)
         if drop_lost:
@@ -417,7 +418,7 @@ def extract_agent_crops(
     past_frames: Sequence[int],
     crop_size: int = DEFAULT_CROP_SIZE,
     padding: int = DEFAULT_PADDING,
-    drop_lost: bool = True,
+    drop_lost: bool = False,
     pad_value: float | int = 0,
 ) -> np.ndarray | None:
     """Extract ``[T_obs, C, crop_size, crop_size]`` crops for one agent window.
@@ -501,7 +502,7 @@ class SDDAgentCropDataset(Dataset):
         crop_size: int = DEFAULT_CROP_SIZE,
         obs_frames: int = DEFAULT_OBS_FRAMES,
         padding: int = DEFAULT_PADDING,
-        drop_lost: bool = True,
+        drop_lost: bool = False,
     ) -> None:
         self.root = expand_sdd_root(sdd_root)
         self.scene = scene
