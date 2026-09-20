@@ -556,10 +556,15 @@ class SDDAgentCropDataset(Dataset):
             drop_lost=self.drop_lost,
         )
         if crops is None:
-            # Defensive fallback: black crops if the source frame could not be
-            # decoded (e.g. missing video file on a partial checkout).
-            crops = np.zeros(
-                (self.obs_frames, 3, self.crop_size, self.crop_size), dtype=np.uint8
+            # No black-crop fallback: a window whose crops cannot be produced is
+            # surfaced loudly (missing track / lost frame under strict mode /
+            # undecodable source) instead of silently corrupting the encoder.
+            raise RuntimeError(
+                f"Cannot extract agent crops for scene={self.scene!r} "
+                f"video_id={self.video_id!r} track_id={track_id} frames={frames.tolist()}."
+                f" video_path={self.video_path!r}. Check that every observed frame "
+                f"exists in the annotations and is decodable (strict drop_lost mode "
+                f"rejects 'lost' frames)."
             )
         return {
             "agent_crops": torch.from_numpy(np.ascontiguousarray(crops)),

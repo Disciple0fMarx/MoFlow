@@ -1,6 +1,16 @@
 import os
 import numpy as np
-import matplotlib.pyplot as plt
+
+try:
+    # Plotting is optional: the training/evaluation path never uses pyplot, and
+    # a broken/absent matplotlib (e.g. numpy-2 ABI mismatch, headless server)
+    # must not prevent the model from importing. Falls back to plt = None when
+    # unavailable; selecting the Agg backend keeps it safe on headless GPUs.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 
 import torch
 import torch.nn.functional as F

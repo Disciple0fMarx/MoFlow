@@ -1,8 +1,7 @@
 """Cross-Attention fusion between trajectory tokens and agent-centric video
 tokens for the CFM pipeline.
 
-Interaction contract (see CLAUDE.md "Tri-Modal Cascaded Cross-Attention
-Fusion"):
+Interaction contract (tri-modal cascaded cross-attention fusion):
   * The trajectory token ``z_traj`` acts as the **Query (Q)**.
   * The agent-centric video token ``z_agent_video`` acts as the **Key (K)**
     and **Value (V)**.

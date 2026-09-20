@@ -29,7 +29,8 @@ loaded automatically.
 Crops are fetched by :class:`~data.agent_crop_sdd.SDDAgentCropDataset` on the
 window dictated by the LOSO window index, so the trajectory features and the
 visual crops refer to the exact same (scene, video, track, anchor) — the strict
-coordinate synchronization required by CLAUDE.md. Trajectory features and
+coordinate synchronization that keeps crop centers aligned with the predicted
+trajectory points. Trajectory features and
 normalization statistics come from the native ``SDDGlobalDataset`` test split
 (identical semantics to production evaluation; stats cached once per scene
 under ``RESULTS_DIR/_norm_stats_ho<scene>.npz``).
@@ -511,7 +512,7 @@ def get_window_batch(
         crop_size=int(args.crop_size),
         obs_frames=SDD_PAST_FRAMES,
         padding=int(args.padding),
-        drop_lost=not args.no_drop_lost,
+        drop_lost=args.drop_lost,
     )
     crop_item = crop_ds[0]
     crops = crop_item["agent_crops"]  # [T_obs, C, S, S] uint8
@@ -691,7 +692,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--sdd-root", default=None)
     p.add_argument("--crop-size", type=int, default=64)
     p.add_argument("--padding", type=int, default=0)
-    p.add_argument("--no-drop-lost", action="store_true")
+    p.add_argument("--drop-lost", action="store_true",
+                   help="Strict opt-in: refusal of crops around 'lost' frames "
+                        "(default keeps them, matching training).")
     p.add_argument("--sampling-steps", type=int, default=10)
     p.add_argument("--use-ema", action="store_true",
                    help="prefer the EMA weights over the raw model weights")

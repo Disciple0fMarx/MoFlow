@@ -1,6 +1,6 @@
 """SDD-specific adapter for the global video encoder (note §5.2).
 
-Dual-infrastructure environment matrix (see OPENCODE_CONTEXT.md):
+Dual-infrastructure environment matrix:
 
 A. **Remote Lab Machine** (default / production — full multi-epoch training)::
 
@@ -305,6 +305,45 @@ def find_video_path(
 
 def annotation_path(sdd_root: Path, scene: str, video_id: str) -> Path:
     return scene_annotations_dir(sdd_root, scene) / video_id / "annotations.txt"
+
+
+#: Image file extensions probed by reference_image_path (still-image fallback).
+IMAGE_EXT_CANDIDATES = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+def reference_image_path(
+    sdd_root: str | Path | None,
+    scene: str,
+    video_id: str,
+) -> Path | None:
+    """Return the still-image fallback for ``(scene, video_id)``, if present.
+
+    Some SDD mirrors ship ``reference.jpg`` in each video directory when the raw
+    video itself is absent.  Preferring ``reference.jpg`` over any other image,
+    this scans both layout grids (``videos/`` and ``video/``) and applies the
+    same numeric folder-name normalization as :func:`find_video_path`, so a
+    ``video0`` vs ``0`` mismatch still resolves.
+
+    Returns ``None`` when no video directory (or no image inside it) exists —
+    such groups have no pixel source at all and must be surfaced, not black-filled.
+    """
+    root = expand_sdd_root(sdd_root)
+    for layout in VIDEO_DIR_CANDIDATES:
+        vsc = Path(root) / layout / scene
+        d = _video_dir_by_listing(vsc, video_id)
+        if d is None:
+            continue
+        canonical = d / REFERENCE_IMAGE_NAME
+        if canonical.is_file() and canonical.stat().st_size > 0:
+            return canonical
+        for p in sorted(d.iterdir()):
+            if (
+                p.is_file()
+                and p.stat().st_size > 0
+                and p.suffix.lower() in IMAGE_EXT_CANDIDATES
+            ):
+                return p
+    return None
 
 
 # Annotation column indices (whitespace-separated).

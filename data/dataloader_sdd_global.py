@@ -354,7 +354,7 @@ class SDDGlobalDataset(Dataset):
         # ---- Identity homography warning ------------------------------------
         print(
             "[SDDGlobalDataset] NOTE: using identity homography (pixels ≈ meters); "
-            "predictions are in pixel coordinates. See CLAUDE.md coordinate rules."
+            "predictions are in pixel coordinates (crop centers stay in frame space)."
         )
 
     # -----------------------------------------------------------------------

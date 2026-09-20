@@ -4,7 +4,7 @@ Pipeline (per the technical note, §3 / §5.2):
 
     Observed clip V = {I_{t-T_p+1}, ..., I_t}  (T_obs frames)
         |
-    CNN backbone (frame-by-frame, no 3D conv)           ← CLAUDE.md: strictly 2D
+    CNN backbone (frame-by-frame, no 3D conv)           ← strictly 2D
         |
     Per-frame feature z_t in R^D_raw
         |
@@ -124,7 +124,7 @@ def build_sdd_frame_index(
 
 
 # ---------------------------------------------------------------------------
-# Backbone: 2D ResNet-18 (CLAUDE.md non-negotiable)
+# Backbone: 2D ResNet-18 (architectural non-negotiable)
 # ---------------------------------------------------------------------------
 
 def _build_resnet18(device: str | torch.device) -> tuple[torch.nn.Module, int, transforms.Compose]:
@@ -271,7 +271,7 @@ class SDDGlobalVideoEncoder:
 
     def __post_init__(self) -> None:
         if self.backbone != "resnet18":
-            raise ValueError("Only resnet18 supported in v1 (CLAUDE.md: 2D backbone).")
+            raise ValueError("Only resnet18 supported in v1 (2D backbone constraint).")
         self.device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model, self.feature_dim, self.preprocess = _build_resnet18(self.device)
 

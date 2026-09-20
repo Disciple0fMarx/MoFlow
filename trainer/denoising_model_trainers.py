@@ -6,7 +6,15 @@ import os
 import pickle
 import csv
 import numpy as np 
-import matplotlib.pyplot as plt
+try:
+    # Plotting is optional: this trainer never calls pyplot, and a broken or
+    # absent matplotlib (numpy-2 ABI mismatch, headless GPU server) must not
+    # prevent training/eval from starting. Agg backend keeps it headless-safe.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 
 from glob import glob
 from pathlib import Path

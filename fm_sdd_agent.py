@@ -73,12 +73,12 @@ class SDDAgentCentricDataset(SDDGlobalDataset):
     Crops are fetched by :class:`~data.agent_crop_window.SDDAgentWindowDataset`
     using the *same* ``SDDWindowIndex`` rows, so the trajectory features and the
     visual crops for a given ``idx`` refer to the exact same (scene, video,
-    track, anchor) — preserving the strict coordinate synchronization required
-    by CLAUDE.md.  Each ``__getitem__`` additionally returns::
+    track, anchor) — preserving strict trajectory/video coordinate
+    synchronization.  Each ``__getitem__`` additionally returns::
 
         "agent_crops"        : [T_obs, C, S, S] uint8 tensor
-        "agent_crops_valid"  : bool (False when a source frame/lost flag rules
-                               the window out)
+        "agent_crops_valid"  : bool (always True unless the ``drop_lost`` strict
+                               policy rules a lost-frame window out)
     """
 
     def __init__(
@@ -90,7 +90,7 @@ class SDDAgentCentricDataset(SDDGlobalDataset):
         split: str | None = None,
         crop_size: int = 64,
         padding: int = 0,
-        drop_lost: bool = True,
+        drop_lost: bool = False,
     ) -> None:
         # The agent-centric branch is trajectory-only at the dataloader level
         # (no scene-level feature cache); enable the visual branch downstream.
@@ -113,8 +113,13 @@ class SDDAgentCentricDataset(SDDGlobalDataset):
         n_invalid = int((~self._crop_ds.valid).sum())
         if n_invalid:
             print(
-                f"[fm_sdd_agent] {n_invalid:,}/{len(self._crop_ds):,} windows lack a "
-                "usable crop (missing video or lost frame) → black crop fallback."
+                f"[fm_sdd_agent] {n_invalid:,}/{len(self._crop_ds):,} windows "
+                "dropped by the strict drop_lost policy (opt-in)."
+            )
+        else:
+            print(
+                f"[fm_sdd_agent] all {len(self._crop_ds):,} windows carry usable "
+                "agent-centric crops."
             )
 
     def __getitem__(self, idx: int) -> dict:
@@ -170,7 +175,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--crop_size", default=64, type=int)
     p.add_argument("--padding", default=0, type=int)
-    p.add_argument("--no_drop_lost", action="store_true")
+    p.add_argument(
+        "--drop_lost",
+        action="store_true",
+        help="Strict opt-in: mark windows containing a 'lost' frame invalid "
+             "(their crops are centered on the annotated box; default keeps them).",
+    )
     p.add_argument(
         "--agent_encoder",
         default="resnet18",
@@ -329,7 +339,7 @@ def build_data_loaders(cfg, args):
         held_out_scene=args.held_out_scene,
         crop_size=args.crop_size,
         padding=args.padding,
-        drop_lost=not args.no_drop_lost,
+        drop_lost=args.drop_lost,
     )
     train_dset = SDDAgentCentricDataset(training=True, split="train", **common)
     test_dset = SDDAgentCentricDataset(training=False, split="test", **common)
