@@ -15,9 +15,9 @@ Variants (each rendered independently, never combined in one panel):
 Checkpoints may be given explicitly (``--variant-ckpt no_video=/path.pt``,
 repeated) or discovered under ``--checkpoint-dir`` by scene run-tag:
 
-    agent_centric: <dir>/_SDD_ho<scene>_agent/models/checkpoint_best.pt
-    global_video:  <dir>/_SDD_ho<scene>_{globalvideo,vid,global}/models/checkpoint_best.pt
-    no_video:      <dir>/_SDD_ho<scene>_{novideo,baseline}/models/checkpoint_best.pt
+    "no_video":      `<dir>/_SDD_ho<scene>_{novid,novideo,baseline}/models/checkpoint_best.pt`
+    global_video:   `<dir>/_SDD_ho<scene>_{vid,globalvideo,global}/models/checkpoint_best.pt`
+    agent_centric:  `<dir>/_SDD_ho<scene>_agent/models/checkpoint_best.pt`
 
 When a checkpoint is missing for a variant it is skipped with a printed
 message — run with ``--variants agent_centric --variant-ckpt ...`` to be
@@ -181,9 +181,12 @@ def _build_variant_cfg(scene: str, variant: str, args: argparse.Namespace) -> Co
 # ---------------------------------------------------------------------------
 # Checkpoint resolution
 # ---------------------------------------------------------------------------
+# Run-tag naming scheme: _SDD_ho<scene>_novid | _SDD_ho<scene>_vid | _SDD_ho<scene>_agent.
+# The preferred tag is listed first; older aliases are kept as fallbacks.
 _DISCOVERY_SUFFIXES = {
-    "no_video": ["_SDD_ho{scene}_novideo", "_SDD_ho{scene}_baseline"],
-    "global_video": ["_SDD_ho{scene}_globalvideo", "_SDD_ho{scene}_vid",
+    "no_video": ["_SDD_ho{scene}_novid", "_SDD_ho{scene}_novideo",
+                 "_SDD_ho{scene}_baseline"],
+    "global_video": ["_SDD_ho{scene}_vid", "_SDD_ho{scene}_globalvideo",
                      "_SDD_ho{scene}_global"],
     "agent_centric": ["_SDD_ho{scene}_agent"],
 }
@@ -432,8 +435,21 @@ def run_scene_variant(
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
-    total = 0
     scenes = args.scenes if args.scenes else list(SDD_SCENES)
+
+    if args.discover_only:
+        missing = 0
+        for scene in scenes:
+            ckpts = resolve_variant_checkpoints(args, scene)
+            for variant in args.variants:
+                path = ckpts[variant]
+                if path is None:
+                    missing += 1
+                print(f"[viz-loop] {scene:12s} {variant:14s} -> {path if path else 'MISSING'}")
+        print(f"[viz-loop] discover: {missing} missing checkpoint(s) in {len(scenes)} scene(s)")
+        return 0 if missing == 0 else 1
+
+    total = 0
     for scene in scenes:
         ckpts = resolve_variant_checkpoints(args, scene)
         for variant in args.variants:
@@ -457,6 +473,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "no_video=/ckpt_a.pt global_video=/ckpt_b.pt")
     p.add_argument("--checkpoint-dir", default=None,
                    help="base results dir for run-tag discovery (results_sdd/cor_fm)")
+    p.add_argument("--discover-only", action="store_true",
+                   help="print the resolved scene/variant/checkpoint plan and exit "
+                        "(no model/data loading)")
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     p.add_argument("--sdd-root", default=None)
     p.add_argument("--video-features-root", default=None,
