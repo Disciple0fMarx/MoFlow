@@ -190,7 +190,22 @@ _DISCOVERY_SUFFIXES = {
                      "_SDD_ho{scene}_global"],
     "agent_centric": ["_SDD_ho{scene}_agent"],
 }
-CKPT_REL = Path("models") / "checkpoint_best.pt"
+
+#: Filenames probed inside a run directory, ``<dir>/models/`` first.
+CKPT_NAMES = ("checkpoint_best.pt", "checkpoint_best.pth",
+              "model_best.pt", "model_best.pth", "model.pt", "model.pth")
+
+
+def _find_checkpoint(run_dir: Path) -> Path | None:
+    """First existing checkpoint inside ``run_dir`` (``models/`` then flat)."""
+    for sub in (run_dir / "models", run_dir):
+        if not sub.is_dir():
+            continue
+        for name in CKPT_NAMES:
+            cand = sub / name
+            if cand.is_file() and cand.stat().st_size > 0:
+                return cand
+    return None
 
 
 def resolve_variant_checkpoints(
@@ -203,18 +218,25 @@ def resolve_variant_checkpoints(
         if variant in args.variant_ckpt:
             out[variant] = Path(args.variant_ckpt[variant])
             continue
-        # 2) discovery under --checkpoint-dir by scene run-tag
+        # 2) discovery under --checkpoint-dir by scene run-tag.
+        #    Explicit mapping: no_video -> <dir>/_SDD_ho<scene>_novid/models/...
+        #    global_video -> <dir>/_SDD_ho<scene>_vid/models/...
+        #    agent_centric -> <dir>/_SDD_ho<scene>_agent/models/...
         if args.checkpoint_dir is not None:
             base = Path(args.checkpoint_dir)
             found: Path | None = None
+            tried: list[str] = []
             for tag in _DISCOVERY_SUFFIXES[variant]:
-                cand = base / tag.format(scene=scene) / CKPT_REL
-                if cand.exists():
-                    found = cand
+                run_dir = base / tag.format(scene=scene)
+                tried.append(str(run_dir))
+                ck = _find_checkpoint(run_dir)
+                if ck is not None:
+                    found = ck
                     break
             out[variant] = found
             if found is None:
-                print(f"[viz-loop] {scene}/{variant}: no checkpoint found under {base}")
+                print(f"[viz-loop] {scene}/{variant}: no checkpoint found; "
+                      f"tried build dirs:\n" + "\n".join(f"  {t}" for t in tried))
             continue
         print(f"[viz-loop] {scene}/{variant}: no --variant-ckpt and no --checkpoint-dir")
         out[variant] = None
@@ -268,6 +290,18 @@ def _build_crop_index(
     return index
 
 
+def _as_batch_frame_id(anchor_frame: int | np.ndarray | torch.Tensor) -> torch.Tensor:
+    """Coerce an anchor frame id (int / numpy scalar / tensor) to ``[1]`` int32."""
+    if isinstance(anchor_frame, torch.Tensor):
+        arr = anchor_frame.detach().cpu().numpy()
+    else:
+        arr = np.asarray(anchor_frame)
+    arr = np.ravel(np.asarray(arr, dtype=np.int32))
+    if arr.size != 1:
+        arr = arr[:1]
+    return torch.from_numpy(arr)
+
+
 def make_window_batch(
     dset: SDDGlobalDataset,
     idx: int,
@@ -286,7 +320,7 @@ def make_window_batch(
         "batch_size": torch.tensor(1),
         "scene": [item["scene"]],
         "video_id": [item["video_id"]],
-        "anchor_frame": item["anchor_frame"].unsqueeze(0),
+        "anchor_frame": _as_batch_frame_id(item["anchor_frame"]),
     }
 
     zglob = item.get("z_video_global")
@@ -345,6 +379,28 @@ def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+def _resolve_video_features_root(args: argparse.Namespace) -> str | None:
+    """Locate per-scene ``<scene>.npy`` video-features when not explicit.
+
+    ``global_video`` needs cached global features for the scene; without them the
+    model receives zero placeholders and renders meaningless futures.  When
+    ``--video-features-root`` is omitted we probe the conventional layouts next to
+    the discovered checkpoints before giving up.
+    """
+    if args.video_features_root is not None:
+        return str(Path(args.video_features_root).expanduser())
+    bases = []
+    if args.checkpoint_dir is not None:
+        bases.append(Path(args.checkpoint_dir))
+    bases.append(Path(DEFAULT_OUT_DIR).parent / "results_sdd" / "cor_fm")
+    for base in bases:
+        for cand in ("features", "video_features", "results", "results/video_features"):
+            p = base / cand
+            if p.is_dir() and any(p.glob("*.npy")):
+                return str(p)
+    return None
+
+
 def run_scene_variant(
     scene: str, variant: str, ckpt_path: Path, args: argparse.Namespace
 ) -> int:
@@ -356,10 +412,17 @@ def run_scene_variant(
     cfg = _build_variant_cfg(scene, variant, args)
     denoiser = build_model(cfg, ckpt_state, args)
 
+    video_features_root = (
+        _resolve_video_features_root(args) if variant == "global_video" else None
+    )
+    if variant == "global_video" and video_features_root is None:
+        print("[viz-loop] WARNING global_video: no video features root found; "
+              "model receives zero placeholders. Pass --video-features-root "
+              "(dir of per-scene <scene>.npy) for meaningful renderings.")
     dset = SDDGlobalDataset(
         cfg, training=False, sdd_root=args.sdd_root, held_out_scene=scene,
         split="test", use_video=(variant == "global_video"),
-        video_features_root=args.video_features_root,
+        video_features_root=video_features_root,
     )
 
     crop_index = None

@@ -105,6 +105,9 @@ class SDDWindowIndex:
     def anchor_frame(self, i: int) -> int:
         return int(self.rows["anchor_frame"][i])
 
+    def track_id(self, i: int) -> int:
+        return int(self.rows["track_id"][i])
+
     def past_frame_ids(self, i: int) -> np.ndarray:
         a = self.anchor_frame(i)
         return np.arange(a - SDD_PAST_FRAMES + 1, a + 1, dtype=np.int32)
