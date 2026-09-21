@@ -245,6 +245,7 @@ def render_scene_trajectories(
     fde: float | None = None,
     zoom_margin: float = DEFAULT_ZOOM_MARGIN,
     show_metrics: bool = True,
+    fname_suffix: str | None = None,
     overwrite: bool = True,
 ) -> Path:
     """Render one publication-quality trajectory figure over a video frame.
@@ -260,13 +261,16 @@ def render_scene_trajectories(
         scene_id:   SDD scene name, used in the filename + title.
         variant_name: ``"no_video"``, ``"global_video"`` or ``"agent_centric"``.
         save_dir:   destination directory; the PNG is written to
-            ``{save_dir}/{scene_id}_ped{agent_id}_{variant_name}.png``.
+            ``{save_dir}/{scene_id}_ped{agent_id}_{variant_name}.png`` (or with
+            ``fname_suffix``: ``..._ped{agent_id}_{fname_suffix}_{variant_name}.png``).
         ade / fde:  optional precomputed best-of-K metrics (pixels). When
             omitted they are computed internally from ``predictions`` vs
             ``future_gt``.
         zoom_margin: pixel margin around the union of all plotted content
             (clamped to the frame) so trajectories stay readable.
         show_metrics: draw the best-of-K ADE/FDE text box.
+        fname_suffix: optional extra token embedded in the filename to
+            disambiguate multiple windows per pedestrian.
         overwrite:   silently replace an existing file (True, default) or
             raise ``FileExistsError``.
 
@@ -305,9 +309,13 @@ def render_scene_trajectories(
     # ---- safe filename tokens ----------------------------------------------
     safe_scene = re.sub(r"[^A-Za-z0-9_]+", "_", str(scene_id)).strip("_")
     safe_ped = re.sub(r"[^A-Za-z0-9_]+", "_", str(agent_id)).strip("_")
+    safe_suffix = re.sub(r"[^A-Za-z0-9_]+", "_", fname_suffix or "").strip("_")
     out_dir = Path(save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    save_path = out_dir / f"{safe_scene}_ped{safe_ped}_{variant_name}.png"
+    if safe_suffix:
+        save_path = out_dir / f"{safe_scene}_ped{safe_ped}_{safe_suffix}_{variant_name}.png"
+    else:
+        save_path = out_dir / f"{safe_scene}_ped{safe_ped}_{variant_name}.png"
     if save_path.exists() and not overwrite:
         raise FileExistsError(save_path)
 

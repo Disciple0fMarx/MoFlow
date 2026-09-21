@@ -1,9 +1,16 @@
 """Main evaluation/visualization loop: render academic SDD trajectory figures.
 
-Iterates every (scene, pedestrian) pair across the configured model variants
-and writes one standalone 300-DPI PNG per variant per pedestrian into
-``{out_dir}/{scene_id}_ped{agent_id}_{variant_name}.png`` (see
-:mod:`visualize_trajectories` for the exact rendering contract).
+By default **one random window per scene** is selected with a seedable RNG
+(``--num-samples`` / ``--seed``) and rendered across the configured model
+variants, so a (scene, pedestrian, frame) tuple produces one standalone
+300-DPI PNG per variant into
+``{out_dir}/{scene_id}_ped{agent_id}_{fname_suffix}_{variant_name}.png`` (see
+:mod:`visualize_trajectories` for the rendering contract).  The same window
+set is rendered for every variant so the figures are directly comparable.
+
+Target selection can be overridden with explicit filters: ``--ped-id``
+(track id) and/or ``--frame-id`` (anchor frame number).  When provided,
+random sampling is skipped and the single matching window is rendered.
 
 Variants (each rendered independently, never combined in one panel):
 
@@ -27,11 +34,14 @@ are pixel-identical to production evaluation.
 
 Example (lab machine)::
 
+    # 1 random window per scene, deterministic (1 PNG per variant)
     python run_visualize_trajectories.py \\
-        --scene coupa deathCircle \\
         --checkpoint-dir results_sdd/cor_fm \\
         --video-features-root results_sdd/video_features \\
-        --max-agents 5
+        --num-samples 1 --seed 42
+
+    # specific pedestrian + frame in one scene
+    python run_visualize_trajectories.py \\
 
     # checkpoint-free styling self-check
     python run_visualize_trajectories.py --demo
@@ -41,6 +51,7 @@ from __future__ import annotations
 import argparse
 import gc
 import logging
+import random
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -377,6 +388,66 @@ def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Target selection (random sampling / explicit ped+frame override)
+# ---------------------------------------------------------------------------
+def _scene_seed(seed: int, scene: str) -> int:
+    """Deterministic per-scene seed so picks stay reproducible for a scene
+    regardless of which scenes are run together."""
+    scene_hash = sum((i + 1) * ord(ch) for i, ch in enumerate(scene))
+    return int(seed) + scene_hash
+
+
+def _select_targets(scene: str, args: argparse.Namespace) -> list[int]:
+    """Choose the dataset window indices to render for ``scene``.
+
+    Explicit ``--ped-id``/``--frame-id`` override random sampling: the
+    candidates are filtered and the single (first, deterministic) match wins.
+    Otherwise ``--num-samples`` window indices are drawn per scene with the
+    seedable RNG (default 1).  The same target list is reused for every model
+    variant so figures are directly comparable.
+    """
+    cfg = Config(str(CFG_PATH), tag="viz-targets")
+    dset = SDDGlobalDataset(
+        cfg, training=False, sdd_root=args.sdd_root, held_out_scene=scene,
+        split="test", use_video=False,
+    )
+    windows = dset.windows
+    candidates = list(range(len(windows)))
+    if args.max_agents and args.max_agents > 0:
+        candidates = candidates[: int(args.max_agents)]
+    del dset, cfg
+    gc.collect()
+
+    ped_id = getattr(args, "ped_id", None)
+    frame_id = getattr(args, "frame_id", None)
+    if ped_id is not None or frame_id is not None:
+        if ped_id is not None:
+            candidates = [i for i in candidates if int(windows.track_id(i)) == ped_id]
+        if frame_id is not None:
+            candidates = [
+                i for i in candidates if int(windows.anchor_frame(i)) == frame_id
+            ]
+        targets = sorted(candidates)
+        if not targets:
+            print(f"[viz-loop] {scene}: no window matches ped_id={ped_id} "
+                  f"frame_id={frame_id}; skipping")
+            return []
+        if len(targets) > 1:
+            print(f"[viz-loop] {scene}: {len(targets)} windows match "
+                  f"ped_id={ped_id} frame_id={frame_id}; rendering first "
+                  f"(window idx {targets[0]}); pass --frame-id to disambiguate")
+        return targets[:1]
+
+    rng = random.Random(_scene_seed(args.seed, scene))
+    n = min(int(args.num_samples), len(candidates))
+    if n <= 0:
+        print(f"[viz-loop] {scene}: no candidate windows; skipping")
+        return []
+    targets = sorted(rng.sample(candidates, n))
+    return targets
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 def _resolve_video_features_root(args: argparse.Namespace) -> str | None:
@@ -402,9 +473,10 @@ def _resolve_video_features_root(args: argparse.Namespace) -> str | None:
 
 
 def run_scene_variant(
-    scene: str, variant: str, ckpt_path: Path, args: argparse.Namespace
+    scene: str, variant: str, ckpt_path: Path, args: argparse.Namespace,
+    targets: list[int],
 ) -> int:
-    """Loop over every pedestrian window in ``scene`` and render PNGs."""
+    """Render every selected window in ``scene`` for ``variant``."""
     if not ckpt_path.exists():
         raise FileNotFoundError(f"{variant} checkpoint missing: {ckpt_path}")
 
@@ -434,13 +506,22 @@ def run_scene_variant(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     n_windows = len(dset)
-    cap = int(args.max_agents) if args.max_agents and args.max_agents > 0 else n_windows
-    cap = min(cap, n_windows)
-    print(f"[viz-loop] {scene}/{variant}: rendering {cap}/{n_windows} windows "
-          f"(checkpoint {ckpt_path.name})")
+    valid = [int(i) for i in targets if 0 <= int(i) < n_windows]
+    skipped = len(targets) - len(valid)
+    if skipped:
+        print(f"[viz-loop] {scene}/{variant}: skipping {skipped} out-of-range "
+              f"window indices (dataset has {n_windows})")
+    if not valid:
+        print(f"[viz-loop] {scene}/{variant}: no windows to render; skipping")
+        del dset, cfg, ckpt_state
+        gc.collect()
+        torch.cuda.empty_cache()
+        return 0
+    print(f"[viz-loop] {scene}/{variant}: rendering {len(valid)}/{n_windows} "
+          f"selected windows (checkpoint {ckpt_path.name})")
 
     rendered = 0
-    for idx in range(cap):
+    for idx in valid:
         batch_cpu = make_window_batch(dset, idx, variant, crop_index)
         try:
             result = sample_prediction(denoiser, cfg, batch_cpu)
@@ -477,15 +558,16 @@ def run_scene_variant(
             background = np.full((h, w, 3), 255, dtype=np.uint8)
 
         ade_v, fde_v = ade_fde_best(preds, gt_abs)
+        fname_suffix = f"{video_id}_f{anchor_frame}"
         save_path = render_scene_trajectories(
             background, obs_abs, gt_abs, preds,
             agent_id=agent_id, scene_id=scene, variant_name=variant,
             save_dir=out_dir, ade=ade_v, fde=fde_v,
-            zoom_margin=float(args.zoom_margin),
+            zoom_margin=float(args.zoom_margin), fname_suffix=fname_suffix,
         )
         rendered += 1
         if rendered % 50 == 0:
-            print(f"[viz-loop] {scene}/{variant}: {rendered}/{cap} rendered")
+            print(f"[viz-loop] {scene}/{variant}: {rendered}/{len(valid)} rendered")
 
     del dset
     if crop_index is not None:
@@ -515,11 +597,16 @@ def run_pipeline(args: argparse.Namespace) -> int:
     total = 0
     for scene in scenes:
         ckpts = resolve_variant_checkpoints(args, scene)
+        if not any(ckpts[v] for v in args.variants):
+            continue
+        targets = _select_targets(scene, args)
+        if not targets:
+            continue
         for variant in args.variants:
             path = ckpts[variant]
             if path is None:
                 continue
-            total += run_scene_variant(scene, variant, path, args)
+            total += run_scene_variant(scene, variant, path, args, targets)
     print(f"[viz-loop] TOTAL: {total} figures written to {args.out_dir}")
     return total
 
@@ -539,6 +626,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--discover-only", action="store_true",
                    help="print the resolved scene/variant/checkpoint plan and exit "
                         "(no model/data loading)")
+    p.add_argument("--num-samples", type=int, default=1,
+                   help="random windows rendered per scene (default: 1)")
+    p.add_argument("--seed", type=int, default=42,
+                   help="RNG seed for deterministic random sampling (default: 42)")
+    p.add_argument("--ped-id", "--agent-id", dest="ped_id", type=int,
+                   default=None,
+                   help="only render this pedestrian (track id); overrides "
+                        "random sampling")
+    p.add_argument("--frame-id", "--window-idx", dest="frame_id", type=int,
+                   default=None,
+                   help="only render the window anchored at this frame number; "
+                        "overrides random sampling")
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     p.add_argument("--sdd-root", default=None)
     p.add_argument("--video-features-root", default=None,
