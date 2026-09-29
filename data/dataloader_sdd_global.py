@@ -454,13 +454,14 @@ class SDDGlobalDataset(Dataset):
         # fallback stays the scalar sentinel tensor([0.]).
         if self.use_video and self.video_features_root is not None:
             scene = item["scene"]
-            anchor = item["anchor_frame"]
+            video_id = item["video_id"]
             past_fids = self.windows.past_frame_ids(idx)
             try:
-                lookup = get_lookup(self.video_features_root, scene)
+                lookup = get_lookup(self.video_features_root, scene, sdd_root=self.root)
                 z = lookup.window(
                     start_frame_id=int(past_fids[0]),
                     n_frames=SDD_PAST_FRAMES,
+                    video_id=video_id,
                     stride=self.video_stride,
                     policy="nearest",
                 )  # [P, D_raw]
