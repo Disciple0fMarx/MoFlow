@@ -48,7 +48,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
+
+# Allow running as a plain script (`python tools/attrib_video_conditioning.py`)
+# from anywhere: the script's own directory is tools/, but the project imports
+# (data/, models/, utils/) live one level up at the repo root.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import torch
