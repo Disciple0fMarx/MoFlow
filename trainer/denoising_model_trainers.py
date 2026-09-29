@@ -48,6 +48,41 @@ def identity(t, *args, **kwargs):
     return t
 
 
+def build_val_loader_from_train(cfg, train_loader, val_fraction=0.1, seed=0):
+    """Hold out a deterministic subset of *train* windows as the validation split.
+
+    Historical behavior fell back to the test loader when no ``val_loader``
+    was passed: the best checkpoint was selected on the test set and then
+    reported on the same test set — a model-selection leak that inflates the
+    final ADE/FDE. Here validation is carved from the training split only, so
+    selection and reporting are disjoint, while the collate/batching pipeline
+    is identical to training.
+    """
+    from torch.utils.data import DataLoader, random_split
+
+    ds = train_loader.dataset
+    n = len(ds)
+    n_val = max(1, int(round(n * val_fraction)))
+    if n_val >= n:
+        raise ValueError(
+            f"val_fraction={val_fraction} would hold out every train window "
+            f"({n_val}/{n}); reduce it."
+        )
+    generator = torch.Generator().manual_seed(seed)
+    train_sub, val_sub = random_split(
+        ds, [n - n_val, n_val], generator=generator
+    )
+    val_loader = DataLoader(
+        val_sub,
+        batch_size=train_loader.batch_size,
+        shuffle=False,
+        num_workers=train_loader.num_workers,
+        collate_fn=train_loader.collate_fn,
+        pin_memory=train_loader.pin_memory,
+    )
+    return val_loader
+
+
 def cycle(dl):
     while True:
         for data in dl:
@@ -125,7 +160,11 @@ class Trainer(object):
         self.denoiser = denoiser
         self.train_loader = train_loader
         self.test_loader = test_loader
-        self.val_loader = default(val_loader, test_loader)
+        self.val_loader = build_val_loader_from_train(
+            cfg,
+            train_loader,
+            val_fraction=cfg.get('VAL_FRACTION', 0.1),
+        ) if val_loader is None else val_loader
         self.tb_log = tb_log
         self.logger = logger
 
@@ -174,8 +213,9 @@ class Trainer(object):
 
         self.test_loader = self.accelerator.prepare(test_loader)
 
-        val_loader = default(val_loader, test_loader)
-        self.val_loader = self.accelerator.prepare(val_loader)
+        # self.val_loader came from build_val_loader_from_train (or the caller's
+        # explicit val_loader) in __init__; never fall back to the test loader.
+        self.val_loader = self.accelerator.prepare(self.val_loader)
 
         # set counters and training states
         self.step = 0
