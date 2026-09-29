@@ -20,6 +20,7 @@ Usage on the remote lab machine:
     # Evaluation
     python fm_sdd_global.py --cfg cfg/sdd/cor_fm.yml --held_out_scene coupa --eval
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,22 +31,15 @@ import torch
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
-from data.dataloader_sdd_global import (
-    SDD_SCENES,
-    SDDGlobalDataset,
-    collate_sdd_global,
-)
-
+from data.dataloader_sdd_global import (SDD_SCENES, SDDGlobalDataset,
+                                        collate_sdd_global)
 from models.backbone_eth_ucy import ETHMotionTransformer
 from models.flow_matching import FlowMatcher
 from trainer.denoising_model_trainers import Trainer
 from utils.config import Config
 from utils.utils import back_up_code_git, log_config_to_file, set_random_seed
-from video_encoder.sdd_adapter import (
-    DEFAULT_SDD_ROOT,
-    expand_sdd_root,
-    is_kaggle,
-)
+from video_encoder.sdd_adapter import (DEFAULT_SDD_ROOT, expand_sdd_root,
+                                       is_kaggle)
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +79,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable the global video branch (baseline trajectory-only ablation).",
     )
+    p.add_argument(
+        "--video_mode",
+        default="full",
+        choices=["off", "static", "full"],
+        help=(
+            "VIDEO_MODE ablation: 'off'  → video branch fully disabled (zero "
+            "sentinel, model built without video); 'static' → ONE fixed scene "
+            "vector for every window (no per-window info); 'full' → per-window "
+            "mean-pooled video lookup (production mode)."
+        ),
+    )
 
     # ---- Standard overrides (mirror fm_eth.py) -------------------------------
     p.add_argument("--epochs", default=None, type=int)
@@ -102,10 +107,14 @@ def parse_args() -> argparse.Namespace:
 
     # ---- FM / arch / loss / optimization (subset of fm_eth.py flags) --------
     p.add_argument("--sampling_steps", default=10, type=int)
-    p.add_argument("--t_schedule", default="logit_normal", choices=["uniform", "logit_normal"])
+    p.add_argument(
+        "--t_schedule", default="logit_normal", choices=["uniform", "logit_normal"]
+    )
     p.add_argument("--logit_norm_mean", default=-0.5, type=float)
     p.add_argument("--logit_norm_std", default=1.5, type=float)
-    p.add_argument("--fm_wrapper", default="direct", choices=["direct", "velocity", "precond"])
+    p.add_argument(
+        "--fm_wrapper", default="direct", choices=["direct", "velocity", "precond"]
+    )
     p.add_argument("--fm_rew_sqrt", action="store_true")
     p.add_argument("--fm_in_scaling", action="store_true")
     p.add_argument("--perturb_ctx", default=0.0, type=float)
@@ -181,19 +190,27 @@ def init_basics(args: argparse.Namespace) -> tuple[Config, object, SummaryWriter
     # ---- SDD knobs injected into cfg ----------------------------------------
     cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT = str(expand_sdd_root(args.sdd_root))
     if is_kaggle() and args.sdd_root is None:
-        print(f"[fm_sdd_global] Kaggle detected → SDD root: {cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT}")
+        print(
+            f"[fm_sdd_global] Kaggle detected → SDD root: {cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT}"
+        )
     cfg.MODEL.CONTEXT_ENCODER.HELD_OUT_SCENE = args.held_out_scene
     if args.video_features_root is not None:
         cfg.MODEL.CONTEXT_ENCODER.VIDEO_FEATURES_ROOT = str(
             Path(args.video_features_root).expanduser()
         )
-    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = (not args.no_video) and bool(
-        getattr(cfg.MODEL.CONTEXT_ENCODER, "USE_VIDEO", False)
-    )
+    # VIDEO_MODE ablation: the mode is authoritative for the ablations.
+    # 'static'/'full' force the video branch ON (they must measure a model
+    # that actually consumes z_video); 'off' keeps it OFF architecturally.
+    cfg.VIDEO_MODE = args.video_mode
+    cfg.MODEL.CONTEXT_ENCODER.VIDEO_MODE = args.video_mode
+    if args.video_mode == "off":
+        cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = False
+    else:
+        cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = True
 
     tag += f"SDD_ho{args.held_out_scene}"
     if cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO:
-        tag += "_vid"
+        tag += f"_vm{args.video_mode}"
     else:
         tag += "_novid"
     tag = tag.replace("__", "_")
@@ -220,6 +237,7 @@ def build_data_loaders(cfg, args):
         use_video=cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO,
         video_features_root=args.video_features_root,
         video_stride=args.video_stride,
+        video_mode=args.video_mode,
     )
     train_dset = SDDGlobalDataset(training=True, split="train", **common)
     test_dset = SDDGlobalDataset(training=False, split="test", **common)
@@ -257,8 +275,7 @@ def main() -> None:
     args = parse_args()
     if not args.eval and args.held_out_scene is None:
         raise SystemExit(
-            "--held_out_scene is required for training. "
-            f"Choose one of: {SDD_SCENES}"
+            "--held_out_scene is required for training. " f"Choose one of: {SDD_SCENES}"
         )
 
     cfg, logger, tb_log = init_basics(args)
