@@ -357,23 +357,38 @@ COL_FRAME = 5
 
 @dataclass
 class SDDFrameFeatureLookup:
-    """Per-scene cached feature lookup, identical semantics to the ETH/UCY
-    ``FrameFeatureLookup`` but for SDD scene names.
+    """Video-scoped cached feature lookup for SDD.
 
     The cache layout is::
 
         <features_root>/<scene>.npy              # [N_frames, D] float32
-        <features_root>/<scene>.manifest.parquet  # columns: frame_id, row_idx, path
+        <features_root>/<scene>.manifest.parquet  # columns: scene, video_id, frame_id, row_idx
+
+    Because SDD ``frame_id`` values are 0-based *per video*, lookups are keyed
+    by ``(video_id, frame_id)`` — never by ``frame_id`` alone. A window from
+    video B must resolve its frames inside **B's own** rows; resolving against
+    a frame-only map would silently serve video A's features whenever the two
+    videos' frame-id ranges overlap.
+
+    A cache built by the *pre-fix* encoder collapsed ``drop_duplicates("frame_id")``,
+    so whole rows for later-sorted videos are missing. When ``sdd_root`` is
+    provided, :meth:`from_root` cross-checks the manifest against the per-video
+    annotation frame sets and raises if any annotated frame is missing — such a
+    cache must be re-encoded before use.
     """
 
     scene: str
-    features: np.ndarray            # [N, D]
-    frame_to_row: dict[int, int]    # frame_id -> row index
-    sorted_frame_ids: np.ndarray    # ascending
+    features: np.ndarray                          # [N, D]
+    video_frame_to_row: dict[tuple[str, int], int]  # (video_id, frame_id) -> row
+    video_sorted_ids: dict[str, np.ndarray]       # video_id -> ascending frame ids
 
     @classmethod
     def from_root(
-        cls, root: str | Path, scene: str, mmap: bool = True
+        cls,
+        root: str | Path,
+        scene: str,
+        sdd_root: str | Path | None = None,
+        mmap: bool = True,
     ) -> "SDDFrameFeatureLookup":
         root = Path(root)
         npy = root / f"{scene}.npy"
@@ -385,13 +400,50 @@ class SDDFrameFeatureLookup:
             )
         feats = np.load(npy, mmap_mode="r" if mmap else None)
         man = pd.read_parquet(manifest)
-        fmap = dict(zip(man["frame_id"].astype(int), man["row_idx"].astype(int)))
-        sorted_ids = np.sort(np.fromiter(fmap.keys(), dtype=np.int64))
-        return cls(scene=scene, features=feats, frame_to_row=fmap, sorted_frame_ids=sorted_ids)
+
+        if "video_id" not in man.columns:
+            raise ValueError(
+                f"SDD feature manifest for scene={scene!r} has no 'video_id' column "
+                f"({man.shape[0]} rows). This is a pre-scope cache — re-encode with "
+                "`python -m video_encoder encode-sdd`."
+            )
+
+        rows = [
+            (str(v), int(f), int(r))
+            for v, f, r in zip(
+                man["video_id"].astype(str),
+                man["frame_id"].astype(int),
+                man["row_idx"].astype(int),
+            )
+        ]
+        video_frame_to_row = {(v, f): r for v, f, r in rows}
+
+        # Pre-fix detection: the old encoder dropped duplicate frame ids across
+        # videos, so a whole losing video's annotated frames are absent. Compare
+        # the manifest against the annotations per (scene, video).
+        if sdd_root is not None:
+            _verify_manifest_vs_annotations(
+                Path(sdd_root), scene, rows, npy.stat().st_size, man.shape[0]
+            )
+
+        video_sorted_ids: dict[str, np.ndarray] = {}
+        for v, f, _ in rows:
+            video_sorted_ids.setdefault(v, []).append(f)  # type: ignore[union-attr]
+        video_sorted_ids = {
+            v: np.asarray(sorted(fs), dtype=np.int64) for v, fs in video_sorted_ids.items()
+        }
+        return cls(
+            scene=scene,
+            features=feats,
+            video_frame_to_row=video_frame_to_row,
+            video_sorted_ids=video_sorted_ids,
+        )
 
     # ---- single-frame access ------------------------------------------------
-    def get(self, frame_id: int, policy: SnapPolicy = "nearest") -> np.ndarray | None:
-        row = self._resolve(int(frame_id), policy)
+    def get(
+        self, frame_id: int, video_id: str, policy: SnapPolicy = "nearest"
+    ) -> np.ndarray | None:
+        row = self._resolve(video_id, int(frame_id), policy)
         if row is None:
             return None
         return np.asarray(self.features[row])
@@ -401,18 +453,21 @@ class SDDFrameFeatureLookup:
         self,
         start_frame_id: int,
         n_frames: int,
+        video_id: str,
         stride: int = 1,
         policy: SnapPolicy = "nearest",
     ) -> np.ndarray:
         """Return ``[n_frames, D]`` for ``[start, start+stride, ..., start+(n-1)*stride]``.
 
-        Unresolvable frames are zero-filled (matches the ETH/UCY helper).
+        All frames resolve inside ``video_id``'s own rows only. Unresolvable
+        frames are zero-filled (matches the ETH/UCY helper semantics for
+        missing rows).
         """
         D = int(self.features.shape[1])
         out = np.zeros((n_frames, D), dtype=np.float32)
         for i in range(n_frames):
             fid = int(start_frame_id) + i * int(stride)
-            row = self._resolve(fid, policy)
+            row = self._resolve(video_id, fid, policy)
             if row is not None:
                 out[i] = np.asarray(self.features[row])
         return out
@@ -422,19 +477,20 @@ class SDDFrameFeatureLookup:
         return int(self.features.shape[1])
 
     # ---- internal -----------------------------------------------------------
-    def _resolve(self, frame_id: int, policy: SnapPolicy) -> int | None:
-        if frame_id in self.frame_to_row:
-            return self.frame_to_row[frame_id]
-        if policy == "drop":
+    def _resolve(self, video_id: str, frame_id: int, policy: SnapPolicy) -> int | None:
+        key = (video_id, frame_id)
+        if key in self.video_frame_to_row:
+            return self.video_frame_to_row[key]
+        ids = self.video_sorted_ids.get(video_id)
+        if ids is None or ids.size == 0:
             return None
-        ids = self.sorted_frame_ids
-        if ids.size == 0:
+        if policy == "drop":
             return None
         idx = int(np.searchsorted(ids, frame_id))
         if policy == "floor":
             if idx == 0:
                 return None
-            return self.frame_to_row[int(ids[idx - 1])]
+            return self.video_frame_to_row[(video_id, int(ids[idx - 1]))]
         # nearest
         candidates: list[int] = []
         if idx > 0:
@@ -444,19 +500,88 @@ class SDDFrameFeatureLookup:
         if not candidates:
             return None
         best = min(candidates, key=lambda f: abs(f - frame_id))
-        return self.frame_to_row[best]
+        return self.video_frame_to_row[(video_id, best)]
 
 
 @lru_cache(maxsize=64)
-def _cached_lookup(features_root: str, scene: str) -> SDDFrameFeatureLookup:
+def _cached_lookup(
+    features_root: str, scene: str, sdd_root: str | None = None
+) -> SDDFrameFeatureLookup:
     """Memoize feature lookups across ``__getitem__`` calls.
 
     The cache lives for the lifetime of the DataLoader worker process.
     Memory cost: one mmap'd ``.npy`` per scene (~5–20 MB).
     """
-    return SDDFrameFeatureLookup.from_root(features_root, scene)
+    return SDDFrameFeatureLookup.from_root(features_root, scene, sdd_root=sdd_root)
 
 
-def get_lookup(features_root: str | Path, scene: str) -> SDDFrameFeatureLookup:
-    """Public, lru_cache-wrapped accessor (one mmap per process per scene)."""
-    return _cached_lookup(str(Path(features_root)), scene)
+def get_lookup(
+    features_root: str | Path,
+    scene: str,
+    sdd_root: str | Path | None = None,
+) -> SDDFrameFeatureLookup:
+    """Public, lru_cache-wrapped accessor (one mmap per process per scene).
+
+    ``sdd_root`` is optional but **strongly recommended**: when provided, the
+    per-video manifest is cross-checked against the annotation frame sets so a
+    pre-fix (frame-collapsed) cache fails loudly instead of silently serving
+    wrong-camera features.
+    """
+    return _cached_lookup(
+        str(Path(features_root)), scene, str(Path(sdd_root)) if sdd_root is not None else None
+    )
+
+
+def _verify_manifest_vs_annotations(
+    sdd_root: Path,
+    scene: str,
+    manifest_rows: list[tuple[str, int, int]],
+    npy_bytes: int,
+    n_manifest_rows: int,
+) -> None:
+    """Raise if any annotated (video, frame) row for ``scene`` is missing from the manifest.
+
+    This is the authoritative pre-fix detector: the old encoder ran
+    ``drop_duplicates("frame_id")`` across videos, deleting an entire losing
+    video's frames wherever two videos' frame-id ranges overlapped. A
+    correctly encoded cache contains **every** video's annotated frames.
+    """
+    ann_dir = scene_annotations_dir(sdd_root, scene)
+    if not ann_dir.is_dir():
+        return  # no annotations -> nothing to check (defensive)
+
+    from collections import defaultdict
+
+    annotated: dict[str, set[int]] = defaultdict(set)
+    for vdir in sorted(p for p in ann_dir.iterdir() if p.is_dir()):
+        txt = vdir / "annotations.txt"
+        if not txt.exists():
+            continue
+        arr = np.loadtxt(
+            txt,
+            usecols=(COL_FRAME,),
+        )
+        frames = np.atleast_1d(arr) if arr.size else np.empty(0)
+        annotated[vdir.name] = set(int(f) for f in np.unique(frames))
+
+    cached: dict[str, set[int]] = defaultdict(set)
+    for v, f, _ in manifest_rows:
+        cached[v].add(f)
+
+    missing_total = 0
+    per_video = []
+    for vid in sorted(annotated):
+        miss = sorted(annotated[vid] - cached.get(vid, set()))
+        if miss:
+            missing_total += len(miss)
+            per_video.append(f"{vid}:{len(miss)}")
+    if missing_total:
+        sample = ", ".join(per_video[:8])
+        raise ValueError(
+            f"SDD feature cache for scene={scene!r} is PRE-FIX / INCOMPLETE: "
+            f"{missing_total} annotated (video, frame) rows missing across {len(per_video)} "
+            f"video(s) ({sample}). Manifest has {n_manifest_rows} rows for a "
+            f"{npy_bytes}-byte feature file. The pre-fix encoder collapsed frame ids shared "
+            "across videos. RE-ENCODE with `python -m video_encoder encode-sdd` before "
+            "running video-conditioned training."
+        )
