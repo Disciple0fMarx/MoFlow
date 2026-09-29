@@ -254,6 +254,7 @@ class SDDGlobalDataset(Dataset):
         use_video: bool = True,
         video_features_root: str | Path | None = None,
         video_stride: int = 1,
+        video_mode: str = "full",
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -337,6 +338,15 @@ class SDDGlobalDataset(Dataset):
 
         # ---- Video settings -------------------------------------------------
         self.use_video = bool(use_video)
+        if video_mode not in {"off", "static", "full"}:
+            raise ValueError(
+                f"video_mode must be one of {{off, static, full}}, got {video_mode!r}. "
+                "off: video branch disabled; static: ONE fixed vector for every "
+                "window (no per-window info); full: per-window mean-pooled lookup."
+            )
+        self.video_mode = video_mode
+        if video_mode == "off":
+            self.use_video = False  # disable the branch regardless of use_video flag
         self.video_stride = int(video_stride)
         if video_features_root is None:
             video_features_root = getattr(
@@ -350,9 +360,11 @@ class SDDGlobalDataset(Dataset):
                 "[SDDGlobalDataset] WARNING: use_video=True but no video_features_root "
                 "configured; video branch will return zero placeholders."
             )
+        print(f"[SDDGlobalDataset] video_mode={self.video_mode}")
 
         self.video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, "VIDEO_DIM_RAW", 512))
         cfg.MODEL.CONTEXT_ENCODER.AGENTS = SDD_AGENTS_PER_WINDOW
+        self._static_video_vec: torch.Tensor | None = None
 
         # ---- Identity homography warning ------------------------------------
         print(
@@ -453,29 +465,76 @@ class SDDGlobalDataset(Dataset):
         # Batched contract (collate): z_video_global ∈ [B, 512]; the uncached
         # fallback stays the scalar sentinel tensor([0.]).
         if self.use_video and self.video_features_root is not None:
-            scene = item["scene"]
-            video_id = item["video_id"]
-            past_fids = self.windows.past_frame_ids(idx)
-            try:
-                lookup = get_lookup(self.video_features_root, scene, sdd_root=self.root)
-                z = lookup.window(
-                    start_frame_id=int(past_fids[0]),
-                    n_frames=SDD_PAST_FRAMES,
-                    video_id=video_id,
-                    stride=self.video_stride,
-                    policy="nearest",
-                )  # [P, D_raw]
-                z_vec = z.mean(axis=0, dtype=np.float32)  # [D_raw]
-                item["z_video_global"] = torch.from_numpy(
-                    np.ascontiguousarray(z_vec, dtype=np.float32)
+            if self.video_mode == "static":
+                # Isolation harness: serve the SAME fixed vector for every window
+                # so the model sees a constant scene prior with zero per-window
+                # information. Any effect is attributable to the video pathway
+                # being present-but-not-informative, not to per-window content.
+                item["z_video_global"] = self._static_video(
+                    scene=item["scene"], video_id=item["video_id"]
                 )
-            except FileNotFoundError:
-                # Missing cache → return a dummy scalar (the collate will skip it).
-                item["z_video_global"] = torch.zeros(1)
+            else:
+                scene = item["scene"]
+                video_id = item["video_id"]
+                past_fids = self.windows.past_frame_ids(idx)
+                try:
+                    lookup = get_lookup(self.video_features_root, scene, sdd_root=self.root)
+                    z = lookup.window(
+                        start_frame_id=int(past_fids[0]),
+                        n_frames=SDD_PAST_FRAMES,
+                        video_id=video_id,
+                        stride=self.video_stride,
+                        policy="nearest",
+                    )  # [P, D_raw]
+                    z_vec = z.mean(axis=0, dtype=np.float32)  # [D_raw]
+                    item["z_video_global"] = torch.from_numpy(
+                        np.ascontiguousarray(z_vec, dtype=np.float32)
+                    )
+                except FileNotFoundError:
+                    # Missing cache → return a dummy scalar (the collate will skip it).
+                    item["z_video_global"] = torch.zeros(1)
         else:
             item["z_video_global"] = torch.zeros(1)
 
         return item
+
+    # -----------------------------------------------------------------------
+    # Video-mode isolation helpers
+    # -----------------------------------------------------------------------
+    def _static_video(self, scene: str, video_id: str) -> torch.Tensor:
+        """Return a single fixed ``[D_raw]`` vector for the whole mode.
+
+        Lazily computed once per scene as the scene-level *mean* feature over a
+        coarse frame sample of the first reachable video, so the "static" vector
+        still lives in the same feature space as the real ones while carrying no
+        per-window information. Falls back to a zero vector if the cache is not
+        reachable, keeping the collate contract unchanged.
+        """
+        if self._static_video_vec is not None:
+            return self._static_video_vec
+        vec: torch.Tensor | None = None
+        if self.video_features_root is not None:
+            try:
+                lookup = get_lookup(self.video_features_root, scene, sdd_root=self.root)
+                ids = lookup.video_sorted_ids.get(video_id)
+                if ids is not None and ids.size:
+                    sample = ids[:: max(1, ids.size // 8)][:8]  # coarse sample
+                    z = lookup.window(
+                        start_frame_id=int(sample[0]),
+                        n_frames=len(sample),
+                        video_id=video_id,
+                        stride=max(1, int(np.diff(sample)[0])) if len(sample) > 1 else 1,
+                        policy="nearest",
+                    )
+                    vec = torch.from_numpy(
+                        np.ascontiguousarray(z.mean(axis=0), dtype=np.float32)
+                    )
+            except (FileNotFoundError, ValueError, KeyError):
+                vec = None
+        self._static_video_vec = (
+            vec if vec is not None else torch.zeros(self.video_dim_raw, dtype=torch.float32)
+        )
+        return self._static_video_vec
 
 
 # ---------------------------------------------------------------------------
