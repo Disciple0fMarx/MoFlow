@@ -21,6 +21,12 @@ content-sensitive or effectively a constant prior:
   "*this* video" (a scene constant), i.e. per-window content barely matters.
 * permuted ≫ zeroed     → the model genuinely consumes per-window content.
 
+The RNG is re-seeded to ``--seed`` immediately before *every* ``sample()`` call,
+so the three conditions draw **identical** initial noise and differ only in
+``z_video_global`` — trajectory deltas are a clean measure of video influence,
+not sampling stochasticity. (This also makes a trajectory-only ``_novid``
+checkpoint produce byte-identical predictions across arms, ``d_traj = 0``.)
+
 Metrics (per condition, aggregated over batches / agents):
 * ``ADE_min`` / ``FDE_min`` (K=20 best-of-20, in original scale),
 * ``d_traj`` = mean L2 displacement of the predicted best trajectory relative
@@ -116,9 +122,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-video-arch",
         action="store_true",
         help=(
-            "Force the model to be built WITHOUT the video branch (USE_VIDEO="
-            "False) even if the checkpoint carries video weights. Use only if "
-            "the checkpoint was trained as a trajectory-only baseline."
+            "Force a trajectory-only architecture (USE_VIDEO=False) even "
+            "when the checkpoint carries video weights. By default the "
+            "architecture is inferred from the checkpoint's own video_proj "
+            "weights, so _novid baselines load automatically."
         ),
     )
     p.add_argument(
@@ -215,16 +222,50 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # ---- model ------------------------------------------------------------
-    # Attribution is meaningless without the video branch: force USE_VIDEO on
-    # by default (override with --no-video-arch) so a video-trained checkpoint
-    # whose cfg was saved with USE_VIDEO=False still loads its video weights.
-    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = not args.no_video_arch
+    # Infer the architecture from the checkpoint's own weights, so a
+    # trajectory-only baseline (_..._novid) and a video-conditioned run both
+    # load without shape mismatches. The video branch is materialized only
+    # when the checkpoint actually carries its projection weights.
+    state = load_checkpoint_state(Path(args.ckpt), use_ema=args.use_ema)
+    has_video_proj = any(
+        isinstance(k, str) and k.startswith("model.context_encoder.video_proj.")
+        for k in state
+    )
+    if args.no_video_arch:
+        if has_video_proj:
+            print(
+                "[cvxp] WARNING: checkpoint carries video weights but "
+                "--no-video-arch forces a trajectory-only architecture; "
+                "attribution will NOT exercise the z_video_global channel."
+            )
+        use_video = False
+    else:
+        use_video = has_video_proj
+        if not use_video:
+            print(
+                "[cvxp] NOTE: checkpoint has NO video_proj weights "
+                "(trajectory-only baseline). The model cannot consume "
+                "z_video_global, so baseline == zeroed == permuted is "
+                "expected; run any _*_vm{static,full} checkpoint to "
+                "attribute the real video channel."
+            )
+    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = use_video
     model = ETHMotionTransformer(
         model_config=cfg.MODEL, logger=_NullLogger(), config=cfg
     )
     denoiser = FlowMatcher(cfg, model, logger=_NullLogger())
-    state = load_checkpoint_state(Path(args.ckpt), use_ema=args.use_ema)
-    denoiser.load_state_dict(state)
+    try:
+        denoiser.load_state_dict(state)
+    except RuntimeError as exc:
+        raise SystemExit(
+            "[cvxp] checkpoint state_dict does not match the model architecture "
+            f"built from {args.cfg} (USE_VIDEO={use_video}). "
+            "This usually means the checkpoint was trained with a different "
+            "MODEL config (e.g. D_MODEL / layer counts / video flag). "
+            "Pass --no-video-arch to force the trajectory-only architecture, "
+            "or point --cfg at the config that produced the checkpoint.\n"
+            f"  {exc}"
+        ) from exc
     denoiser.to(device)
     denoiser.eval()
     print(f"[cvxp] loaded {args.ckpt} (use_ema={args.use_ema})")
@@ -261,6 +302,13 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 z = z_real
             Xc_["z_video_global"] = z
+            # Reset the RNG to a fixed seed before every sample so the three
+            # conditions draw IDENTICAL initial noise (FlowMatcher.sample uses
+            # the global torch RNG at y_t ~ N(0,I)). The only thing that varies
+            # across arms is then z_video_global — trajectory differences become
+            # a clean measure of video influence, not sampling noise.
+            torch.manual_seed(args.seed)
+            np.random.seed(args.seed)
             with torch.no_grad():
                 pred_traj, *_ = denoiser.sample(
                     Xc_, num_trajs=cfg.denoising_head_preds, return_all_states=False
