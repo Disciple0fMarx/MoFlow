@@ -326,13 +326,16 @@ class SDDGlobalVideoEncoder:
         needed_by_video: dict[str, list[int]],
         root: Path,
         scene: str,
-    ) -> dict[int, np.ndarray]:
+    ) -> dict[tuple[str, int], np.ndarray]:
         """Stream each SDD video once and encode only its annotated frame ids.
 
-        Returns ``{frame_id: feature_vec[D]}``. Frame ids requested beyond the
-        decoded length are reported and omitted (the lookup snaps to nearest).
+        Returns ``{(video_id, frame_id): feature_vec[D]}`` keyed by the full
+        (video, frame) pair so two videos whose frame-id ranges overlap keep
+        distinct rows (they are separate cameras despite sharing 0-based ids).
+        Frame ids requested beyond the decoded length are reported and omitted
+        (the lookup snaps within the same video).
         """
-        feats_by_fid: dict[int, np.ndarray] = {}
+        feats_by_key: dict[tuple[str, int], np.ndarray] = {}
         for video_id in sorted(needed_by_video):
             wanted = set(int(f) for f in needed_by_video[video_id])
             vid_path = video_mov_path(root, scene, video_id)
@@ -349,7 +352,7 @@ class SDDGlobalVideoEncoder:
                 x = torch.stack(buf_imgs, dim=0).to(self.device, non_blocking=True)
                 y = self.model(x).detach().cpu().numpy().astype(np.float32)
                 for fid, vec in zip(buf_fids, y):
-                    feats_by_fid[fid] = vec
+                    feats_by_key[(video_id, fid)] = vec
                 buf_imgs.clear()
                 buf_fids.clear()
 
@@ -363,14 +366,14 @@ class SDDGlobalVideoEncoder:
                         flush()
             flush()
 
-            missing = wanted - feats_by_fid.keys()
+            missing = wanted - {k[1] for k in feats_by_key if k[0] == video_id}
             if missing:
                 print(
                     f"[sdd-encode] {scene}/{video_id}: {len(missing)} annotated "
                     f"frame(s) beyond decoded length {n_decoded} "
                     f"(e.g. {min(missing)}); they will nearest-snap at lookup time."
                 )
-        return feats_by_fid
+        return feats_by_key
 
     def encode_split_to_cache(
         self,
@@ -401,13 +404,16 @@ class SDDGlobalVideoEncoder:
             if not ann_dir.is_dir():
                 print(f"[sdd-encode] skip {scene}: no annotations dir {ann_dir}")
                 continue
-            # Unique frames across all (video_id, track_id) for this scene.
+            # Unique (scene, video_id, frame_id) rows. Do NOT drop duplicates
+            # on frame_id alone: SDD frame ids are 0-based per video, so two
+            # videos in the same scene legitimately share frame ids and each
+            # must keep its own rows (the old drop_duplicates("frame_id")
+            # collapsed every later-sorted video's frames to the first video).
             df = build_sdd_frame_index(sdd_root=root, scenes=[scene])
             unique = (
                 df[["scene", "video_id", "frame_id"]]
                 .drop_duplicates()
                 .sort_values(["video_id", "frame_id"])
-                .drop_duplicates("frame_id")  # a frame shared by 2 videos → first video wins
                 .reset_index(drop=True)
             )
             if unique.empty:
@@ -418,21 +424,20 @@ class SDDGlobalVideoEncoder:
                 vid: sorted(g["frame_id"].astype(int))
                 for vid, g in unique.groupby("video_id", sort=False)
             }
-            vid_of = dict(zip(unique["frame_id"].astype(int), unique["video_id"]))
 
-            feats_by_fid = self._encode_frames_stream(needed, root, scene)
-            if not feats_by_fid:
+            feats_by_key = self._encode_frames_stream(needed, root, scene)
+            if not feats_by_key:
                 print(f"[sdd-encode] {scene}: nothing decodable, skipping")
                 continue
 
-            fid_sorted = sorted(feats_by_fid)
-            features = np.stack([feats_by_fid[f] for f in fid_sorted]).astype(np.float32)
+            key_sorted = sorted(feats_by_key)  # sorts by (video_id, frame_id)
+            features = np.stack([feats_by_key[k] for k in key_sorted]).astype(np.float32)
             manifest = pd.DataFrame(
                 {
                     "scene": scene,
-                    "video_id": [vid_of[f] for f in fid_sorted],
-                    "frame_id": np.asarray(fid_sorted, dtype=np.int64),
-                    "row_idx": np.arange(len(fid_sorted), dtype=np.int64),
+                    "video_id": [k[0] for k in key_sorted],
+                    "frame_id": np.asarray([k[1] for k in key_sorted], dtype=np.int64),
+                    "row_idx": np.arange(len(key_sorted), dtype=np.int64),
                 }
             )
 
