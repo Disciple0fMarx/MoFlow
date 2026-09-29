@@ -43,6 +43,7 @@ def test_run_attribution_end_to_end(tmp_path):
     from models.flow_matching import FlowMatcher
 
     cfg = Config("cfg/sdd/cor_fm.yml", "cvxp-test")
+    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = True  # match a video-trained checkpoint
     model = ETHMotionTransformer(model_config=cfg.MODEL, logger=_Log(), config=cfg)
     den = FlowMatcher(cfg, model, logger=_Log())
     ckpt = tmp_path / "ck.pt"
@@ -115,6 +116,7 @@ def test_sentinel_underflow_skipped(tmp_path):
     from models.flow_matching import FlowMatcher
 
     cfg = Config("cfg/sdd/cor_fm.yml", "cvxp-test")
+    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = True  # match a video-trained checkpoint
     model = ETHMotionTransformer(model_config=cfg.MODEL, logger=_Log(), config=cfg)
     den = FlowMatcher(cfg, model, logger=_Log())
     ckpt = tmp_path / "ck.pt"

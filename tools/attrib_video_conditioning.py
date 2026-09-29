@@ -105,6 +105,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--use-ema", action="store_true", help="Load EMA weights.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
+        "--no-video-arch",
+        action="store_true",
+        help=(
+            "Force the model to be built WITHOUT the video branch (USE_VIDEO="
+            "False) even if the checkpoint carries video weights. Use only if "
+            "the checkpoint was trained as a trajectory-only baseline."
+        ),
+    )
+    p.add_argument(
         "--no-shuffle-permute",
         action="store_true",
         help="Permute via shift instead of rng shuffle (deterministic).",
@@ -198,6 +207,10 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # ---- model ------------------------------------------------------------
+    # Attribution is meaningless without the video branch: force USE_VIDEO on
+    # by default (override with --no-video-arch) so a video-trained checkpoint
+    # whose cfg was saved with USE_VIDEO=False still loads its video weights.
+    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = not args.no_video_arch
     model = ETHMotionTransformer(
         model_config=cfg.MODEL, logger=_NullLogger(), config=cfg
     )
