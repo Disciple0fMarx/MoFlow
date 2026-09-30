@@ -29,6 +29,7 @@ Hardcoded paths: resolved via :func:`video_encoder.sdd_adapter.expand_sdd_root`
 auto-detected when ``/kaggle`` exists). Override per-run with ``--sdd_root``
 / ``cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT``.
 """
+
 from __future__ import annotations
 
 import math
@@ -42,7 +43,6 @@ from einops import rearrange
 from torch.utils.data import Dataset
 
 from utils.normalization import normalize_min_max
-
 from video_encoder.sdd_adapter import (
     COL_FRAME,
     COL_TRACK_ID,
@@ -55,6 +55,7 @@ from video_encoder.sdd_adapter import (
     annotation_path,
     expand_sdd_root,
     get_lookup,
+    temporal_smooth,
 )
 
 # ---------------------------------------------------------------------------
@@ -63,12 +64,13 @@ from video_encoder.sdd_adapter import (
 SDD_PAST_FRAMES = 8
 SDD_FUTURE_FRAMES = 12
 SDD_SEQ_LEN = SDD_PAST_FRAMES + SDD_FUTURE_FRAMES
-SDD_AGENTS_PER_WINDOW = 1   # SDD windows track one pedestrian at a time
+SDD_AGENTS_PER_WINDOW = 1  # SDD windows track one pedestrian at a time
 
 
 # ---------------------------------------------------------------------------
 # Window index — single contiguous int32 array, no per-window Python objects
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SDDWindowIndex:
@@ -90,8 +92,8 @@ class SDDWindowIndex:
     """
 
     rows: np.ndarray
-    scenes: list[str]          # index → scene name
-    videos: list[str]          # index → video_id, scoped per scene
+    scenes: list[str]  # index → scene name
+    videos: list[str]  # index → video_id, scoped per scene
 
     def __len__(self) -> int:
         return int(self.rows.shape[0])
@@ -100,7 +102,9 @@ class SDDWindowIndex:
         return self.scenes[int(self.rows["scene_idx"][i])]
 
     def video_id(self, i: int) -> str:
-        return self.videos[int(self.rows["scene_idx"][i])][int(self.rows["video_idx"][i])]
+        return self.videos[int(self.rows["scene_idx"][i])][
+            int(self.rows["video_idx"][i])
+        ]
 
     def anchor_frame(self, i: int) -> int:
         return int(self.rows["anchor_frame"][i])
@@ -241,6 +245,7 @@ def build_window_index(
 # Dataset
 # ---------------------------------------------------------------------------
 
+
 class SDDGlobalDataset(Dataset):
     """SDD dataset with Leave-One-Scene-Out support and lazy video features."""
 
@@ -269,9 +274,7 @@ class SDDGlobalDataset(Dataset):
                 "cfg.MODEL.CONTEXT_ENCODER.HELD_OUT_SCENE."
             )
         if held_out_scene not in SDD_SCENES:
-            raise ValueError(
-                f"held_out_scene={held_out_scene!r} not in {SDD_SCENES}"
-            )
+            raise ValueError(f"held_out_scene={held_out_scene!r} not in {SDD_SCENES}")
 
         # LOSO: train = all scenes except held_out; test = held_out only.
         if split is None:
@@ -304,8 +307,10 @@ class SDDGlobalDataset(Dataset):
 
         # Normalization stats: computed once on the union of training windows
         # (the held-out scene is excluded from the stats to avoid leakage).
-        if training and (not hasattr(cfg, "past_traj_min") or cfg.past_traj_min is None):
-            past_rel = self._xy["past_rel"]    # [N, P, 2]
+        if training and (
+            not hasattr(cfg, "past_traj_min") or cfg.past_traj_min is None
+        ):
+            past_rel = self._xy["past_rel"]  # [N, P, 2]
             fut_rel = self._xy["fut_rel"]
             cfg.past_traj_max = float(past_rel.max())
             cfg.past_traj_min = float(past_rel.min())
@@ -318,9 +323,9 @@ class SDDGlobalDataset(Dataset):
         self.fut_traj_max = getattr(cfg, "fut_traj_max", 1.0)
 
         # Build normalized tensor caches.
-        self.past_traj_original_scale = self._xy["past_full"]   # [N, 1, P, 6]
-        self.fut_traj_original_scale = self._xy["fut_rel"]     # [N, 1, F, 2]
-        self.fut_traj_vel = self._xy["fut_vel"]                # [N, 1, F, 2]
+        self.past_traj_original_scale = self._xy["past_full"]  # [N, 1, P, 6]
+        self.fut_traj_original_scale = self._xy["fut_rel"]  # [N, 1, F, 2]
+        self.fut_traj_vel = self._xy["fut_vel"]  # [N, 1, F, 2]
         self.past_traj = normalize_min_max(
             self.past_traj_original_scale,
             self.past_traj_min,
@@ -362,7 +367,12 @@ class SDDGlobalDataset(Dataset):
             )
         print(f"[SDDGlobalDataset] video_mode={self.video_mode}")
 
-        self.video_dim_raw = int(getattr(cfg.MODEL.CONTEXT_ENCODER, "VIDEO_DIM_RAW", 512))
+        self.video_dim_raw = int(
+            getattr(cfg.MODEL.CONTEXT_ENCODER, "VIDEO_DIM_RAW", 512)
+        )
+        self.video_smooth_sigma = float(
+            getattr(cfg.MODEL.CONTEXT_ENCODER, "VIDEO_SMOOTH_SIGMA", 0.0)
+        )
         cfg.MODEL.CONTEXT_ENCODER.AGENTS = SDD_AGENTS_PER_WINDOW
         self._static_video_vec: torch.Tensor | None = None
 
@@ -400,7 +410,9 @@ class SDDGlobalDataset(Dataset):
             track_data = cache.get(key)
             if track_data is None:
                 track_frames, track_xy = _load_track_centers(self.root, scene, video_id)
-                track_data = {tid: (track_frames[tid], track_xy[tid]) for tid in track_xy}
+                track_data = {
+                    tid: (track_frames[tid], track_xy[tid]) for tid in track_xy
+                }
                 cache[key] = track_data
 
             tid = int(self.windows.rows["track_id"][i])
@@ -413,7 +425,10 @@ class SDDGlobalDataset(Dataset):
             base = anchor - first_frame
             p_slice = xy[base - SDD_PAST_FRAMES + 1 : base + 1]
             f_slice = xy[base + 1 : base + 1 + SDD_FUTURE_FRAMES]
-            if p_slice.shape[0] != SDD_PAST_FRAMES or f_slice.shape[0] != SDD_FUTURE_FRAMES:
+            if (
+                p_slice.shape[0] != SDD_PAST_FRAMES
+                or f_slice.shape[0] != SDD_FUTURE_FRAMES
+            ):
                 continue
             past_abs[i, 0] = p_slice
             init = past_abs[i, 0, -1]
@@ -423,7 +438,10 @@ class SDDGlobalDataset(Dataset):
 
         # Past velocity: [N, 1, P, 2], last frame = 0
         past_vel = np.concatenate(
-            [past_rel[:, :, 1:] - past_rel[:, :, :-1], np.zeros_like(past_rel[:, :, -1:])],
+            [
+                past_rel[:, :, 1:] - past_rel[:, :, :-1],
+                np.zeros_like(past_rel[:, :, -1:]),
+            ],
             axis=2,
         )
         # Past full feature: concat [abs | rel | vel] along last axis → [N, 1, P, 6]
@@ -450,8 +468,8 @@ class SDDGlobalDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         item = {
             "index": torch.tensor([idx], dtype=torch.int32),
-            "past_traj": self.past_traj[idx],                # [1, P, 6] normalized
-            "fut_traj": self.fut_traj[idx],                  # [1, F, 2] normalized
+            "past_traj": self.past_traj[idx],  # [1, P, 6] normalized
+            "fut_traj": self.fut_traj[idx],  # [1, F, 2] normalized
             "past_traj_original_scale": self.past_traj_original_scale[idx],
             "fut_traj_original_scale": self.fut_traj_original_scale[idx],
             "fut_traj_vel": self.fut_traj_vel[idx],
@@ -478,7 +496,9 @@ class SDDGlobalDataset(Dataset):
                 video_id = item["video_id"]
                 past_fids = self.windows.past_frame_ids(idx)
                 try:
-                    lookup = get_lookup(self.video_features_root, scene, sdd_root=self.root)
+                    lookup = get_lookup(
+                        self.video_features_root, scene, sdd_root=self.root
+                    )
                     z = lookup.window(
                         start_frame_id=int(past_fids[0]),
                         n_frames=SDD_PAST_FRAMES,
@@ -486,6 +506,7 @@ class SDDGlobalDataset(Dataset):
                         stride=self.video_stride,
                         policy="nearest",
                     )  # [P, D_raw]
+                    z = temporal_smooth(z, sigma=self.video_smooth_sigma)
                     z_vec = z.mean(axis=0, dtype=np.float32)  # [D_raw]
                     item["z_video_global"] = torch.from_numpy(
                         np.ascontiguousarray(z_vec, dtype=np.float32)
@@ -523,7 +544,9 @@ class SDDGlobalDataset(Dataset):
                         start_frame_id=int(sample[0]),
                         n_frames=len(sample),
                         video_id=video_id,
-                        stride=max(1, int(np.diff(sample)[0])) if len(sample) > 1 else 1,
+                        stride=(
+                            max(1, int(np.diff(sample)[0])) if len(sample) > 1 else 1
+                        ),
                         policy="nearest",
                     )
                     vec = torch.from_numpy(
@@ -532,7 +555,9 @@ class SDDGlobalDataset(Dataset):
             except (FileNotFoundError, ValueError, KeyError):
                 vec = None
         self._static_video_vec = (
-            vec if vec is not None else torch.zeros(self.video_dim_raw, dtype=torch.float32)
+            vec
+            if vec is not None
+            else torch.zeros(self.video_dim_raw, dtype=torch.float32)
         )
         return self._static_video_vec
 
@@ -546,6 +571,7 @@ class SDDGlobalDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Collate function (memory-safe)
 # ---------------------------------------------------------------------------
+
 
 def collate_sdd_global(batch: list[dict]) -> dict:
     """Collate with strict shape checks.
@@ -569,7 +595,7 @@ def collate_sdd_global(batch: list[dict]) -> dict:
 
     # ---- Video features ---------------------------------------------------
     videos = [b["z_video_global"] for b in batch]
-    if videos[0].dim() == 1 and videos[0].numel() > 1:      # [D_raw] per sample
+    if videos[0].dim() == 1 and videos[0].numel() > 1:  # [D_raw] per sample
         out["z_video_global"] = torch.stack(videos, dim=0)  # [B, D_raw]
     else:
         out["z_video_global"] = None

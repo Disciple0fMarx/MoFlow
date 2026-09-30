@@ -31,15 +31,13 @@ import torch
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
-from data.dataloader_sdd_global import (SDD_SCENES, SDDGlobalDataset,
-                                        collate_sdd_global)
+from data.dataloader_sdd_global import SDD_SCENES, SDDGlobalDataset, collate_sdd_global
 from models.backbone_eth_ucy import ETHMotionTransformer
 from models.flow_matching import FlowMatcher
 from trainer.denoising_model_trainers import Trainer
 from utils.config import Config
 from utils.utils import back_up_code_git, log_config_to_file, set_random_seed
-from video_encoder.sdd_adapter import (DEFAULT_SDD_ROOT, expand_sdd_root,
-                                       is_kaggle)
+from video_encoder.sdd_adapter import DEFAULT_SDD_ROOT, expand_sdd_root, is_kaggle
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,6 +86,17 @@ def parse_args() -> argparse.Namespace:
             "sentinel, model built without video); 'static' → ONE fixed scene "
             "vector for every window (no per-window info); 'full' → per-window "
             "mean-pooled video lookup (production mode)."
+        ),
+    )
+    p.add_argument(
+        "--video_smooth_sigma",
+        default=None,
+        type=float,
+        help=(
+            "Gaussian temporal smoothing width (in frames) applied to the "
+            "per-frame ResNet features before the window mean-pool. 0 or "
+            "omitted → no smoothing. Tune via MODEL.CONTEXT_ENCODER."
+            "VIDEO_SMOOTH_SIGMA instead when running without this flag."
         ),
     )
 
@@ -207,6 +216,8 @@ def init_basics(args: argparse.Namespace) -> tuple[Config, object, SummaryWriter
         cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = False
     else:
         cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = True
+    if args.video_smooth_sigma is not None:
+        cfg.MODEL.CONTEXT_ENCODER.VIDEO_SMOOTH_SIGMA = args.video_smooth_sigma
 
     tag += f"SDD_ho{args.held_out_scene}"
     if cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO:

@@ -23,8 +23,10 @@ Raw-video resolution (:func:`find_video_path`) combines a fixed layout grid
 directory scan**, so annotation/video folder-name mismatches (``video0`` vs
 ``0`` vs ``video_0``, zero-padding, casing) do not black-out crops.
 """
+
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -52,9 +54,7 @@ SDD_SCENES: tuple[str, ...] = (
 # Environment matrix (defaults are the Remote Lab Machine values)
 # ---------------------------------------------------------------------------
 LAB_SDD_ROOT = Path("/home/efrei_stage/Desktop/Datasets/SDD")
-KAGGLE_SDD_ROOT = Path(
-    "/kaggle/input/datasets/aryashah2k/stanford-drone-dataset"
-)
+KAGGLE_SDD_ROOT = Path("/kaggle/input/datasets/aryashah2k/stanford-drone-dataset")
 
 #: Signature-level default: the Remote Lab Machine root.
 DEFAULT_SDD_ROOT = LAB_SDD_ROOT
@@ -175,7 +175,8 @@ def _existing_video_files_in_dir(video_dir: Path) -> list[Path]:
             outs.append(p)
     for pattern in ("*.mov", "*.MOV", "*.mp4", "*.MP4", "*.avi", "*.AVI"):
         outs.extend(
-            p for p in video_dir.glob(pattern)
+            p
+            for p in video_dir.glob(pattern)
             if p.is_file() and p.stat().st_size > 0 and p not in outs
         )
     return outs
@@ -213,7 +214,9 @@ def _resolve_video_candidates(sdd_root: Path, scene: str, video_id: str) -> list
         # 1. Fixed grid: <scene>/<video_id>/video<ext> and <scene>/video<video_id>/video<ext>
         for vdir_name in (video_id, f"{VIDEO_FILE_STEM}{video_id}"):
             for ext in VIDEO_EXT_CANDIDATES:
-                candidates.append((vsc / vdir_name / f"{VIDEO_FILE_STEM}{ext}").resolve())
+                candidates.append(
+                    (vsc / vdir_name / f"{VIDEO_FILE_STEM}{ext}").resolve()
+                )
         # 2. Live listing: exact-name or numeric-fuzzy-matched subdir -> its files
         matched = _video_dir_by_listing(vsc, video_id)
         if matched is not None:
@@ -378,9 +381,9 @@ class SDDFrameFeatureLookup:
     """
 
     scene: str
-    features: np.ndarray                          # [N, D]
+    features: np.ndarray  # [N, D]
     video_frame_to_row: dict[tuple[str, int], int]  # (video_id, frame_id) -> row
-    video_sorted_ids: dict[str, np.ndarray]       # video_id -> ascending frame ids
+    video_sorted_ids: dict[str, np.ndarray]  # video_id -> ascending frame ids
 
     @classmethod
     def from_root(
@@ -430,7 +433,8 @@ class SDDFrameFeatureLookup:
         for v, f, _ in rows:
             video_sorted_ids.setdefault(v, []).append(f)  # type: ignore[union-attr]
         video_sorted_ids = {
-            v: np.asarray(sorted(fs), dtype=np.int64) for v, fs in video_sorted_ids.items()
+            v: np.asarray(sorted(fs), dtype=np.int64)
+            for v, fs in video_sorted_ids.items()
         }
         return cls(
             scene=scene,
@@ -528,8 +532,40 @@ def get_lookup(
     wrong-camera features.
     """
     return _cached_lookup(
-        str(Path(features_root)), scene, str(Path(sdd_root)) if sdd_root is not None else None
+        str(Path(features_root)),
+        scene,
+        str(Path(sdd_root)) if sdd_root is not None else None,
     )
+
+
+def temporal_smooth(features: np.ndarray, sigma: float = 0.0) -> np.ndarray:
+    """Gaussian temporal smoothing along the time axis of ``[T, D]`` features.
+
+    ResNet-18 per-frame features are noisy; a light Gaussian blur over the
+    observation window decorrelates that noise before the dataloader mean-pools
+    ``[T, D] -> [D]`` (see ``data/dataloader_sdd_global.py``). ``sigma`` is in
+    **frames** (e.g. ``1.0`` blurs ±3 frames at ``3σ``).
+
+    * ``sigma <= 0``  → identity (returned as-is, no copy).
+    * Kernel radius is ``ceil(3σ)``; edges are padded by reflection so the
+      window's first/last frames are not zero-damped.
+    * Output dtype == input dtype; shape is preserved ``[T, D]``.
+    """
+    if sigma is None or sigma <= 0 or features.shape[0] <= 1:
+        return features
+    if features.ndim != 2:
+        raise ValueError(f"temporal_smooth expects [T, D], got shape {features.shape}")
+
+    radius = int(math.ceil(3.0 * sigma))
+    t = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (t / sigma) ** 2)
+    kernel /= kernel.sum()
+
+    padded = np.pad(features, ((radius, radius), (0, 0)), mode="reflect")
+    out = np.empty_like(features, dtype=np.float64)
+    for d in range(features.shape[1]):
+        out[:, d] = np.convolve(padded[:, d], kernel, mode="valid")
+    return out.astype(features.dtype, copy=False)
 
 
 def _verify_manifest_vs_annotations(
