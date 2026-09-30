@@ -673,6 +673,9 @@ def get_batch_for_scene(scene: str, args: argparse.Namespace) -> dict:
 
     Uses the native ``SDDGlobalDataset`` test split (LOSO held-out scene),
     ``batch_size=1``, ``shuffle=False`` → deterministic window selection.
+    ``args.window_index`` (0-based, default 0) selects which test-split window
+    to render — used by the gain-ranked visualization (Q5/Q7) to fetch the
+    specific high/low-gain windows rather than always the first one.
     The batch is fetched once with the video branch enabled and shared
     verbatim by BOTH checkpoints; the baseline simply ignores
     ``z_video_global`` because it was trained with ``USE_VIDEO=False``.
@@ -696,7 +699,15 @@ def get_batch_for_scene(scene: str, args: argparse.Namespace) -> dict:
         num_workers=0,
         collate_fn=collate_sdd_global,
     )
-    batch = next(iter(loader))
+    try:
+        from itertools import islice
+
+        batch = next(islice(iter(loader), getattr(args, "window_index", 0), None))
+    except StopIteration:
+        raise SystemExit(
+            f"[viz] window index {getattr(args, 'window_index', 0)} beyond "
+            f"{len(dset)} test windows of scene '{scene}'."
+        )
     del dset, loader, cfg  # release the window index immediately
     gc.collect()
     return batch
@@ -865,6 +876,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="contextual margin in pixels added around the union "
                         "bounding box of all plotted trajectories when a "
                         "video frame background is shown (default: 150)")
+    p.add_argument("--window-index", type=int, default=0,
+                   help="0-based index of the test-split window to render "
+                        "(default: 0). Use with the per-window gain CSV to "
+                        "render specific high/low-gain windows.")
     p.add_argument("--demo", action="store_true",
                    help="render a synthetic styling demo (no checkpoints needed)")
     return p.parse_args(argv)

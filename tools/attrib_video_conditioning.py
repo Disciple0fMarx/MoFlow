@@ -107,7 +107,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--sdd-root", default=None)
     p.add_argument("--video-features-root", default=None)
     p.add_argument("--held-out-scene", required=True)
+    p.add_argument(
+        "--norm-scene",
+        default=None,
+        help=(
+            "Scene whose LOSO train-split normalization the checkpoint expects. "
+            "Defaults to --held-out-scene. For cross-scene transferability "
+            "(evaluate a model trained holding out A on scene B) pass "
+            "--norm-scene A --held-out-scene B so inputs are normalized with the "
+            "model's OWN train statistics, never the target scene's."
+        ),
+    )
+    p.add_argument(
+        "--conditions",
+        nargs="+",
+        choices=list(CONDITIONS),
+        default=list(CONDITIONS),
+        help="Subset of analytics to run: baseline zeroed permuted (default: all).",
+    )
     p.add_argument("--split", choices=["test", "train"], default="test")
+    p.add_argument(
+        "--per-window",
+        default=None,
+        metavar="CSV",
+        help=(
+            "Also dump per-window (per-agent) ADE_min/FDE_min for every "
+            "requested condition plus ``gain`` columns, used to rank windows "
+            "by video contribution (Q5/Q7 geometry analysis)."
+        ),
+    )
     p.add_argument(
         "--n-batches",
         type=int,
@@ -193,11 +221,19 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--sdd-root is required (raw annotations tree).")
     from tools.visualize_trajectory_comparison import _ensure_norm_stats
 
-    past_min, past_max, fut_min, fut_max = _ensure_norm_stats(args.held_out_scene, args)
+    norm_scene = args.norm_scene or args.held_out_scene
+    past_min, past_max, fut_min, fut_max = _ensure_norm_stats(norm_scene, args)
     cfg.past_traj_min, cfg.past_traj_max = past_min, past_max
     cfg.fut_traj_min, cfg.fut_traj_max = fut_min, fut_max
 
     # ---- dataset (video-scoped lookup; re-encoded caches required) --------
+    # Test split always targets --held-out-scene; --norm-scene only dictates
+    # which scene's train-split statistics normalize the inputs (decoupled for
+    # the cross-scene transferability matrix).
+    print(
+        f"[cvxp] norm-scene={norm_scene} (stats ho{norm_scene}) "
+        f"data-split={args.split} held_out={args.held_out_scene}"
+    )
     dset = SDDGlobalDataset(
         cfg,
         training=False,
@@ -271,6 +307,11 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[cvxp] loaded {args.ckpt} (use_ema={args.use_ema})")
 
     # ---- accumulators -----------------------------------------------------
+    # ``baseline`` is always computed internally (the d_* attribution columns
+    # for zeroed/permuted need it); ``run_conditions`` is what the user asked
+    # to report.
+    run_conditions: list[str] = list(args.conditions)
+    sample_conditions = list(dict.fromkeys([*run_conditions, "baseline"]))
     agg: dict[str, dict[str, float]] = {
         c: {
             "ade_min": 0.0,
@@ -279,10 +320,12 @@ def main(argv: list[str] | None = None) -> None:
             "d_traj_sum": 0.0,
             "d_ade_sum": 0.0,
         }
-        for c in CONDITIONS
+        for c in sample_conditions
     }
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    window_rows: dict[tuple, dict[str, object]] = {}
+    window_counter = 0
 
     batches = 0
     for b in loader:
@@ -293,7 +336,7 @@ def main(argv: list[str] | None = None) -> None:
         X = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in b.items()}
 
         preds: dict[str, np.ndarray | None] = {}
-        for cond in CONDITIONS:
+        for cond in sample_conditions:
             Xc_ = dict(X)
             if cond == "zeroed":
                 z = torch.zeros_like(z_real)
@@ -325,7 +368,7 @@ def main(argv: list[str] | None = None) -> None:
         # ground truth [B, A, F, 2] -> [B*A, F, 2] original scale
         fut_gt = rearrange(b["fut_traj_original_scale"], "b a f d -> (b a) f d").numpy()
 
-        for cond in CONDITIONS:
+        for cond in sample_conditions:
             pt = preds[cond]  # [M, K, F, 2]
             ade = (
                 np.linalg.norm(pt - fut_gt[:, None], axis=-1).mean(axis=-1).min(axis=-1)
@@ -336,10 +379,39 @@ def main(argv: list[str] | None = None) -> None:
             agg[cond]["ade_min"] += float(ade.sum())
             agg[cond]["fde_min"] += float(fde.sum())
             agg[cond]["n_agents"] += int(fut_gt.shape[0])
+            if args.per_window:
+                scene_names = list(b["scene"])
+                video_ids = list(b["video_id"])
+                anchor = b["anchor_frame"]
+                n_agents_per_window = int(b["fut_traj_original_scale"].shape[1])
+                for w in range(int(b["batch_size"])):
+                    for a in range(n_agents_per_window):
+                        m = w * n_agents_per_window + a
+                        key = (
+                            scene_names[w],
+                            video_ids[w],
+                            int(anchor[w]),
+                            a,
+                        )
+                        wr = window_rows.get(key)
+                        if wr is None:
+                            wr = {
+                                "scene": scene_names[w],
+                                "video_id": video_ids[w],
+                                "anchor_frame": int(anchor[w]),
+                                "agent_in_window": a,
+                                "window_index": window_counter + w,
+                            }
+                            window_rows[key] = wr
+                        wr[f"ade_min_{cond}"] = float(ade[m])
+                        wr[f"fde_min_{cond}"] = float(fde[m])
+                window_counter += int(b["batch_size"])
 
         # attribution relative to baseline
         base = preds["baseline"]  # [M, K, F, 2]
         for cond in ("zeroed", "permuted"):
+            if cond not in preds:
+                continue
             pt = preds[cond]
             # per-agent min-ADE trajectory divergence from baseline
             b_ade = (
@@ -377,13 +449,14 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- aggregate + persist ---------------------------------------------
     rows = []
-    for cond in CONDITIONS:
+    for cond in run_conditions:
         a = agg[cond]
         n = max(1, a["n_agents"])
         row = {
             "condition": cond,
             "split": args.split,
             "held_out_scene": args.held_out_scene,
+            "norm_scene": norm_scene,
             "n_agents": a["n_agents"],
             "ade_min": a["ade_min"] / n,
             "fde_min": a["fde_min"] / n,
@@ -411,12 +484,24 @@ def main(argv: list[str] | None = None) -> None:
         w.writeheader()
         w.writerows(rows)
     # per-condition prediction stacks for downstream statistical testing
-    for cond in CONDITIONS:
-        if batches:
+    for cond in run_conditions:
+        if batches and preds.get(cond) is not None:
             np.save(out_path.with_name(f"{out_path.stem}_{cond}.npy"), preds[cond])
     with open(out_path.with_suffix(".json"), "w") as f:
         json.dump(rows, f, indent=2)
     print(f"[cvxp] wrote {out_path}.csv/.json (+ _<condition>.npy stacks)")
+
+    # ---- per-window dump (window-level attribution evidence) -------------
+    if args.per_window and window_rows:
+        pw_path = Path(args.per_window)
+        pw_path.parent.mkdir(parents=True, exist_ok=True)
+        window_list = list(window_rows.values())
+        pw_fieldnames = sorted({k for r in window_list for k in r}, key=str.lower)
+        with open(pw_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=pw_fieldnames)
+            w.writeheader()
+            w.writerows(window_list)
+        print(f"[cvxp] wrote {len(window_list)} per-window rows -> {pw_path}")
 
 
 if __name__ == "__main__":

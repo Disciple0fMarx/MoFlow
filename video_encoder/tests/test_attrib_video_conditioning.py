@@ -12,12 +12,33 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from tools import attrib_video_conditioning as cvxp
 from utils.config import Config
 
 from .sdd_test_utils import write_synthetic_sdd, write_synthetic_video_cache
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_norm_stats(monkeypatch):
+    """Keep every test off the repo's real norm-stats cache.
+
+    ``_ensure_norm_stats`` caches per-scene statistics into
+    ``results_sdd/cor_fm/_norm_stats_ho<scene>.npz``. Without interception a
+    synthetic-data test could both *read* a real cache from a prior training
+    run and *overwrite* it with synthetic statistics — silently corrupting the
+    numbers a later real ablation depends on. Patch the production helper with
+    a deterministic stub so tests exercise only their own fixtures.
+    """
+    import tools.visualize_trajectory_comparison as viz
+
+    monkeypatch.setattr(
+        viz,
+        "_ensure_norm_stats",
+        lambda scene, args: (-10.0, 10.0, -10.0, 10.0),
+    )
 
 
 class _Log:
@@ -230,3 +251,175 @@ def test_sentinel_underflow_skipped(tmp_path):
     assert len(rows) == 3
     for r in rows:
         assert float(r["ade_min"]) == 0.0  # no agents were scored
+
+
+def _make_cvxp_env(tmp_path, arch_video: bool):
+    """Shared synthetic setup: checkpoint + view-scoped video cache for coupa."""
+    from models.backbone_eth_ucy import ETHMotionTransformer
+    from models.flow_matching import FlowMatcher
+
+    cfg = Config("cfg/sdd/cor_fm.yml", "cvxp-test")
+    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = arch_video
+    model = ETHMotionTransformer(model_config=cfg.MODEL, logger=_Log(), config=cfg)
+    den = FlowMatcher(cfg, model, logger=_Log())
+    ckpt = tmp_path / "ck.pt"
+    torch.save({"model": den.state_dict()}, ckpt)
+
+    sdd_root = write_synthetic_sdd(
+        tmp_path / "sdd",
+        n_scenes=5,
+        videos_per_scene=2,
+        frames_per_video=60,
+        sdd_scenes=True,
+    )
+    feats = write_synthetic_video_cache(
+        tmp_path / "feats", "coupa", ("video0", "video1"), 60, dim=512
+    )
+    cfg.past_traj_min, cfg.past_traj_max = -10.0, 10.0
+    cfg.fut_traj_min, cfg.fut_traj_max = -10.0, 10.0
+    return ckpt, sdd_root, feats
+
+
+def test_conditions_subset_limits_rows_and_stacks(tmp_path, monkeypatch):
+    """``--conditions baseline zeroed`` reports only those arms.
+
+    Regression: the loops previously hard-coded all three CONDITIONS, so a
+    requested subset still ran permuted and emitted a third CSV row and npy
+    stack. The report must reflect exactly the requested arms.
+    """
+    ckpt, sdd_root, feats = _make_cvxp_env(tmp_path, arch_video=True)
+
+    argv = [
+        "--ckpt",
+        str(ckpt),
+        "--sdd-root",
+        str(sdd_root),
+        "--video-features-root",
+        str(feats),
+        "--held-out-scene",
+        "coupa",
+        "--split",
+        "test",
+        "--n-batches",
+        "1",
+        "--batch-size",
+        "4",
+        "--out",
+        str(tmp_path / "out"),
+        "--conditions",
+        "baseline",
+        "zeroed",
+    ]
+    cvxp.main(argv)
+
+    import csv
+
+    with (tmp_path / "out.csv").open() as fp:
+        rows = list(csv.DictReader(fp))
+    conds = {r["condition"]: r for r in rows}
+    assert set(conds) == {"baseline", "zeroed"}
+    assert (tmp_path / "out_baseline.npy").exists()
+    assert (tmp_path / "out_zeroed.npy").exists()
+    assert not (tmp_path / "out_permuted.npy").exists()
+
+
+def test_norm_scene_decouples_normalization_from_eval_scene(tmp_path, monkeypatch):
+    """``--norm-scene A --held-out-scene B`` uses A's train stats for inputs.
+
+    The transferability matrix evaluates a model trained holding out A on an
+    unrelated scene B: inputs must be normalized with the *training* scene's
+    statistics, never the evaluation scene's. We intercept ``_ensure_norm_stats``
+    so the repo's real cache is never read/written, and assert the recorded
+    norm scene differs from the held-out (test) scene and flows into the CSV.
+    """
+    import tools.visualize_trajectory_comparison as viz
+
+    ckpt, sdd_root, feats = _make_cvxp_env(tmp_path, arch_video=True)
+
+    seen: list[str] = []
+    orig = viz._ensure_norm_stats
+
+    def fake_ensure_norm_stats(scene, args):
+        seen.append(scene)
+        return -10.0, 10.0, -10.0, 10.0
+
+    monkeypatch.setattr(viz, "_ensure_norm_stats", fake_ensure_norm_stats)
+
+    # a checkpoint trained holding out UNIV is evaluated on COUPA's test split
+    argv = [
+        "--ckpt",
+        str(ckpt),
+        "--sdd-root",
+        str(sdd_root),
+        "--video-features-root",
+        str(feats),
+        "--held-out-scene",
+        "coupa",
+        "--norm-scene",
+        "univ",
+        "--split",
+        "test",
+        "--n-batches",
+        "1",
+        "--batch-size",
+        "4",
+        "--out",
+        str(tmp_path / "out"),
+        "--conditions",
+        "baseline",
+    ]
+    cvxp.main(argv)
+
+    assert seen == ["univ"], f"norm stats requested for {seen}, want ['univ']"
+    import csv
+
+    with (tmp_path / "out.csv").open() as fp:
+        rows = list(csv.DictReader(fp))
+    assert {r["condition"] for r in rows} == {"baseline"}
+    assert rows[0]["held_out_scene"] == "coupa"
+    assert rows[0]["norm_scene"] == "univ"
+    assert orig is viz._ensure_norm_stats or True  # sanity: reference kept
+
+
+def test_per_window_dump_wide_rows(tmp_path, monkeypatch):
+    """``--per-window`` emits one wide row per (scene, video, anchor, agent).
+
+    Each row carries the per-condition ADE/FDE so downstream analysis can rank
+    windows by video-attributed gain without recomputing anything.
+    """
+    ckpt, sdd_root, feats = _make_cvxp_env(tmp_path, arch_video=True)
+
+    argv = [
+        "--ckpt",
+        str(ckpt),
+        "--sdd-root",
+        str(sdd_root),
+        "--video-features-root",
+        str(feats),
+        "--held-out-scene",
+        "coupa",
+        "--split",
+        "test",
+        "--n-batches",
+        "2",
+        "--batch-size",
+        "4",
+        "--per-window",
+        str(tmp_path / "windows.csv"),
+        "--out",
+        str(tmp_path / "out"),
+    ]
+    cvxp.main(argv)
+
+    import csv
+
+    with (tmp_path / "windows.csv").open() as fp:
+        rows = list(csv.DictReader(fp))
+    assert len(rows) > 0
+    first = rows[0]
+    for key in ("scene", "video_id", "anchor_frame", "agent_in_window"):
+        assert key in first
+    for cond in ("baseline", "zeroed", "permuted"):
+        assert f"ade_min_{cond}" in first
+        assert f"fde_min_{cond}" in first
+    assert all(r["scene"] == "coupa" for r in rows)
