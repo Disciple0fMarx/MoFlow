@@ -109,9 +109,14 @@ rows.append(header)
 for scene in scenes:
     for mode in modes:
         run_dir = os.path.join(root_dir, f"_SDD_ho{scene}_{suffix[mode]}")
-        csv_path = os.path.join(run_dir, "eval_test_metrics.csv")
-        if not os.path.exists(csv_path):
-            print(f"[q6] MISSING eval csv: {csv_path}", file=sys.stderr)
+        csv_path = next(
+            (os.path.join(run_dir, *parts)
+             for parts in (("eval_test_metrics.csv",), ("log", "eval_test_metrics.csv"))
+             if os.path.exists(os.path.join(run_dir, *parts))),
+            None,
+        )
+        if csv_path is None:
+            print(f"[q6] MISSING eval csv: {run_dir}", file=sys.stderr)
             rows.append([scene, mode] + ["NA"] * 8)
             continue
         with open(csv_path, newline="") as f:
