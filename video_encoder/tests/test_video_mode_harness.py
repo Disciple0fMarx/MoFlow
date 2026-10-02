@@ -183,3 +183,44 @@ def test_video_mode_off_ignores_missing_cache() -> None:
         )
         for i in range(4):
             assert ds[i]["z_video_global"].dim() == 1
+
+
+def _args_cls(**kw):
+    import argparse
+
+    ns = argparse.Namespace(per_window=None)
+    for k, v in kw.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def test_per_window_guard_allows_when_rows_recorded() -> None:
+    # Q5/Q7 happy path: rows present <=> guard passes silently.
+    from tools.attrib_video_conditioning import _assert_per_window_records
+
+    _assert_per_window_records(_args_cls(per_window="w.csv"), 3, 0, {(0,): {"a": 1}})
+
+
+def test_per_window_guard_fails_loudly_on_all_batches_skipped() -> None:
+    # The lab failure mode: every batch had the missing-cache sentinel
+    # (z_video_global=None) so the per-window file was silently never written
+    # and script 04's aggregation crashed on the missing file. Now the tool
+    # must refuse to write a misleading aggregate and explain the cause.
+    from tools.attrib_video_conditioning import _assert_per_window_records
+
+    with pytest.raises(SystemExit, match="missing-cache sentinel"):
+        _assert_per_window_records(_args_cls(per_window="w.csv"), 0, 7, {})
+
+
+def test_per_window_guard_fails_loudly_on_empty_loader() -> None:
+    from tools.attrib_video_conditioning import _assert_per_window_records
+
+    with pytest.raises(SystemExit, match="empty loader"):
+        _assert_per_window_records(_args_cls(per_window="w.csv"), 0, 0, {})
+
+
+def test_per_window_guard_allows_when_not_requested() -> None:
+    # Plain attribution runs (Q1/Q2) pass --per-window unset.
+    from tools.attrib_video_conditioning import _assert_per_window_records
+
+    _assert_per_window_records(_args_cls(per_window=None), 0, 7, {})

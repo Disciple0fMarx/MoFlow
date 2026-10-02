@@ -99,7 +99,13 @@ rows = []
 for scene in scenes:
     p = os.path.join(outdir, f"{scene}_windows{outsuf}.csv")
     if not os.path.exists(p):
-        print(f"[q4] MISSING windows csv: {p}", file=sys.stderr)
+        print(
+            f"[q4] MISSING windows csv: {p} — the attribution tool either "
+            "failed its --per-window guarantee (check its '[cvxp] batches "
+            "processed=/skipped=' and FATAL lines in run.log: the usual cause "
+            "is a missing video feature cache for the filtered scene/video, "
+            "making every batch a skipped sentinel) or the scene has no "
+            "windows under this --video-id.", file=sys.stderr)
         continue
     with open(p, newline="") as f:
         for r in csv.DictReader(f):

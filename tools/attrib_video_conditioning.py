@@ -192,6 +192,41 @@ def _permuted(real: torch.Tensor, use_rng_shuffle: bool = True) -> torch.Tensor:
     return real[idx]
 
 
+def _assert_per_window_records(
+    args: argparse.Namespace,
+    batches: int,
+    skipped_batches: int,
+    window_rows: dict[tuple, dict[str, object]],
+) -> None:
+    """Guarantee the per-window evidence file will be written when requested.
+
+    If ``--per-window`` was asked for but no per-window rows were recorded,
+    raise -- with the *concrete* cause -- instead of writing only the
+    aggregate (which silently breaks script 04's aggregation downstream).
+    """
+    if not args.per_window or window_rows:
+        return
+    if skipped_batches and batches == 0:
+        reason = (
+            f"all {skipped_batches} batch(es) were skipped because "
+            "z_video_global was the missing-cache sentinel"
+        )
+    elif batches == 0:
+        reason = "the dataset produced no batches (empty loader)"
+    else:
+        reason = (
+            f"{batches} batch(es) ran but the per-window block never "
+            "recorded rows — please report this bug"
+        )
+    raise SystemExit(
+        "[cvxp] FATAL: --per-window requested but nothing could be "
+        f"recorded ({reason}). Aggregate output would be misleading, so "
+        "no files were written. Verify the video feature cache for the "
+        "filtered scene/video exists under --video-features-root and that "
+        "the dataset is non-empty (see '[cvxp] dataset=... windows=N')."
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     torch.manual_seed(args.seed)
@@ -257,7 +292,10 @@ def main(argv: list[str] | None = None) -> None:
         dset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        # num_workers=0 keeps the per-worker feature mmap unique to the main
+        # process (same rationale as fm_sdd_global.py); multi-worker doubles
+        # the mmap'd feature buffers in RAM for no measurable throughput here.
+        num_workers=0,
         collate_fn=collate_sdd_global,
         pin_memory=True,
     )
@@ -337,8 +375,10 @@ def main(argv: list[str] | None = None) -> None:
     window_counter = 0
 
     batches = 0
+    skipped_batches = 0
     for b in loader:
         if b.get("z_video_global") is None:
+            skipped_batches += 1
             print("[cvxp] batch has no z_video_global (sentinel) — skipping")
             continue
         z_real = b["z_video_global"].to(device)  # [B, D_raw]
@@ -455,6 +495,17 @@ def main(argv: list[str] | None = None) -> None:
             break
         if batches and batches % 5 == 0:
             print(f"[cvxp] processed {batches} batches")
+    print(
+        f"[cvxp] batches processed={batches} skipped={skipped_batches} "
+        f"per-window rows={len(window_rows)}"
+    )
+
+    # --/-- per-window isolation guarantee ---------------------------------
+    # The per-window CSV is the Q5/Q7 evidence file. If --per-window was
+    # requested but NOTHING could be recorded, writing only the aggregate
+    # would silently produce a "missing windows file" downstream (script 04
+    # aggregation). Fail loudly with the actual cause instead.
+    _assert_per_window_records(args, batches, skipped_batches, window_rows)
 
     # ---- aggregate + persist ---------------------------------------------
     rows = []
@@ -501,7 +552,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[cvxp] wrote {out_path}.csv/.json (+ _<condition>.npy stacks)")
 
     # ---- per-window dump (window-level attribution evidence) -------------
-    if args.per_window and window_rows:
+    # window_rows is guaranteed non-empty here (checked above).
+    if args.per_window:
         pw_path = Path(args.per_window)
         pw_path.parent.mkdir(parents=True, exist_ok=True)
         window_list = list(window_rows.values())
