@@ -163,10 +163,19 @@ def _load_track_centers(
 def build_window_index(
     sdd_root: str | Path | None,
     scenes: Sequence[str],
+    video_id_filter: Sequence[str] | None = None,
 ) -> SDDWindowIndex:
     """Walk every (scene, video_id, track_id) and emit sliding-window rows.
 
     No precomputed pickle; one pass over the raw text annotations.
+
+    ``video_id_filter`` optionally restricts the index to a subset of video
+    folder names (e.g. ``("video0",)``). A scene whose video folders contain
+    none of the requested ids simply contributes no windows. This powers the
+    single-video ablation (`--video-id`) while leaving the geographic LOSO
+    protocol intact — the filter is applied AFTER scene selection, so train
+    and test splits still obey LOSO, just on a video subset of each chosen
+    scene.
     """
     root = expand_sdd_root(sdd_root)
     rows_list: list[np.ndarray] = []
@@ -183,6 +192,19 @@ def build_window_index(
         scene_idx = len(scenes_used)
         scenes_used.append(scene)
         video_ids = sorted(p.name for p in ann_dir.iterdir() if p.is_dir())
+        if video_id_filter is not None:
+            keep = [v for v in set(video_id_filter)]
+            video_ids = [v for v in video_ids if v in keep]
+        if not video_ids:
+            print(
+                f"[sdd-index] scene {scene}: no videos under filter "
+                f"{list(video_id_filter) if video_id_filter else '-'} — skipped"
+            )
+            # keep videos_per_scene aligned with scenes_used: an empty dict
+            # preserves the scene_idx -> video_map indexing invariant even
+            # though this scene contributes no windows.
+            videos_per_scene.append({})
+            continue
         videos_per_scene.append({vid: i for i, vid in enumerate(video_ids)})
 
         for video_id in video_ids:
@@ -260,6 +282,7 @@ class SDDGlobalDataset(Dataset):
         video_features_root: str | Path | None = None,
         video_stride: int = 1,
         video_mode: str = "full",
+        video_ids: Sequence[str] | None = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -291,7 +314,10 @@ class SDDGlobalDataset(Dataset):
             f"→ using {len(scenes)} scene(s): {scenes}"
         )
 
-        self.windows = build_window_index(self.root, scenes)
+        self.video_ids = list(video_ids) if video_ids is not None else None
+        self.windows = build_window_index(
+            self.root, scenes, video_id_filter=self.video_ids
+        )
         print(
             f"[SDDGlobalDataset] indexed {len(self.windows):,} trajectory windows "
             f"across {len(scenes)} scene(s)."

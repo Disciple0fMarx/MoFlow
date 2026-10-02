@@ -127,6 +127,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--split", choices=["test", "train"], default="test")
     p.add_argument(
+        "--video-id",
+        default=None,
+        help=(
+            "Restrict the (LOSO-selected) windows to a single video folder "
+            "name (e.g. 'video0'). Single-video ablation; default: all videos."
+        ),
+    )
+    p.add_argument(
         "--per-window",
         default=None,
         metavar="CSV",
@@ -243,6 +251,7 @@ def main(argv: list[str] | None = None) -> None:
         use_video=True,
         video_features_root=args.video_features_root,
         video_mode="full",
+        video_ids=[args.video_id] if getattr(args, "video_id", None) else None,
     )
     loader = DataLoader(
         dset,

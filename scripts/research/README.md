@@ -36,6 +36,15 @@ restrict the loop to one held-out scene.
   torch RNG is re-seeded immediately before *every* `sample()` call, so
   baseline/zeroed/permuted arms draw **identical** initial noise and differ
   only in `z_video_global`.
+- **Strict train/val/test isolation (Q3/Q1).** The dataset has **no
+  intra-scene temporal split**. Splits are decided purely by scene geography:
+  - *train* = windows of the 7 non-held-out scenes,
+  - *val* = a deterministic holdout carved **from the training windows only**
+    (`VAL_FRACTION: 0.1`, `VAL_SEED: 0`, see `cfg/sdd/cor_fm.yml` and
+    `build_val_loader_from_train`),
+  - *test* = **all** windows of the single held-out scene.
+  `checkpoint_best.pt` is selected on the validation split; the held-out test
+  scene is never touched during training — no model-selection leak on test.
 - **Norm-stats decoupling (Q2).** When evaluating a checkpoint trained with
   held-out scene A on an unrelated scene B, inputs are normalized with **A's**
   train-split statistics (`--norm-scene A --held-out-scene B`), never B's —
@@ -43,6 +52,34 @@ restrict the loop to one held-out scene.
 - **LOSO correctness (Q3).** Each run directory is named
   `_SDD_ho<scene>_<variant>` and only the held-out scene's windows form the
   test split; norm stats are always derived from the *training* split.
+
+## Defining a "Scene": Geographic Location vs Video ID
+
+In the SDD pipeline a **scene is a geographic location** — one fixed camera /
+environment such as `deathCircle` or `coupa`. Each scene directory
+(`annotations/<scene>/`) contains several **video IDs** (`video0`, `video1`,
+…), i.e. different raw clips recorded at that same location with the same
+birds-eye infrastructure.
+
+- **Geographic LOSO (the defended protocol).** holding out a *scene* means
+  holding out **every video of that location**. Evaluation of the `full`
+  model on a seen-location-video subset would leak location identity.
+- **Single-video ablation (`--video-id`).** For the supervisor's curiosity
+  about loose scene granularity we support restricting the (already
+  LOSO-selected) windows to one video folder name per scene, e.g.
+  `--video-id video0`. The filter is applied **after** scene selection, so
+  strict geographic LOSO still governs *which* windows are pooled for train
+  vs test; we simply evaluate/train on that scene's matching video(s). This
+  never approximates an intra-location leak the way a naive "hold out one
+  video" split would.
+
+Every entry-point script accepts `--video-id <name>`; in `00_common.sh`
+`VIDEO_ID` is exported and recorded in `PROVENANCE.md`. The norm-stats cache
+key includes the video name so a filtered run never reuses unfiltered
+statistics. To keep evidence artifacts distinct, single-video runs append
+`_vid<name>` to run dirs (`results_sdd/.../_SDD_ho<scene>_<variant>_vid<id>`)
+and to every report file (`q1/<scene>_attrib_vid<id>.csv`, etc.) — a filtered
+run never overwrites the geographic-LOSO results.
 
 ## Report schema
 
@@ -76,6 +113,10 @@ scripts/research/03_transfer_matrix.sh --n-batches 0   # full 8×8
 # Q5/Q7 — per-window gains + gain-ranked renders (+ roundabout pass):
 scripts/research/04_gain_geometry.sh --n-batches 5 --top-k 3
 scripts/research/04_gain_geometry.sh --scene deathCircle
+
+# Single-video ablation (supervisor's Q3 curiosity) — anywhere, e.g.:
+scripts/research/02_zvid_attribution.sh --scene coupa --video-id video0
+scripts/research/01_video_mode_ablation.sh --scene coupa --video-id video0 --train-only
 
 # Dry-run any script to print the exact commands without executing:
 RESEARCH_DRY_RUN=1 scripts/research/02_zvid_attribution.sh

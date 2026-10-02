@@ -73,6 +73,17 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--video_stride", default=1, type=int)
     p.add_argument(
+        "--video_id",
+        default=None,
+        type=str,
+        help=(
+            "Restrict the (already LOSO-selected) windows to a single video "
+            "folder name (e.g. 'video0'). Single-video ablation: keeps the "
+            "geographic LOSO scene split, but evaluates/ trains only on that "
+            "scene's video(s) matching the name. Default: all videos."
+        ),
+    )
+    p.add_argument(
         "--no_video",
         action="store_true",
         help="Disable the global video branch (baseline trajectory-only ablation).",
@@ -224,6 +235,8 @@ def init_basics(args: argparse.Namespace) -> tuple[Config, object, SummaryWriter
         tag += f"_vm{args.video_mode}"
     else:
         tag += "_novid"
+    if getattr(args, "video_id", None):
+        tag += f"_vid{args.video_id}"
     tag = tag.replace("__", "_")
 
     cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -241,6 +254,7 @@ def init_basics(args: argparse.Namespace) -> tuple[Config, object, SummaryWriter
 
 
 def build_data_loaders(cfg, args):
+    video_ids = [args.video_id] if getattr(args, "video_id", None) else None
     common = dict(
         cfg=cfg,
         sdd_root=args.sdd_root,
@@ -249,6 +263,7 @@ def build_data_loaders(cfg, args):
         video_features_root=args.video_features_root,
         video_stride=args.video_stride,
         video_mode=args.video_mode,
+        video_ids=video_ids,
     )
     train_dset = SDDGlobalDataset(training=True, split="train", **common)
     test_dset = SDDGlobalDataset(training=False, split="test", **common)

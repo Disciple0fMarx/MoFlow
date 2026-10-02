@@ -5,6 +5,7 @@ The three modes:
     static -> ONE fixed [D_raw] vector for every window of the run
     full   -> per-window mean-pooled lookup (differs across windows' videos)
 """
+
 from __future__ import annotations
 
 import tempfile
@@ -14,10 +15,8 @@ import pytest
 import torch
 
 from data.dataloader_sdd_global import SDDGlobalDataset
-from video_encoder.tests.sdd_test_utils import (
-    write_synthetic_sdd,
-    write_synthetic_video_cache,
-)
+from video_encoder.tests.sdd_test_utils import (write_synthetic_sdd,
+                                                write_synthetic_video_cache)
 
 
 class _Cfg:
@@ -89,6 +88,81 @@ def test_video_mode_invalid_raises() -> None:
     with tempfile.TemporaryDirectory() as td:
         with pytest.raises(ValueError):
             _build(td, "wat")
+
+
+def test_video_id_filter_restricts_and_keeps_index_alignment() -> None:
+    # Single-video ablation: --video-id video0 must (a) keep only video0
+    # windows of the (LOSO-selected) scene, and (b) preserve the
+    # scene_idx/video_idx -> name mapping after filtering (the empty-dict
+    # alignment invariant in build_window_index).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        write_synthetic_sdd(
+            root, n_scenes=5, videos_per_scene=2, frames_per_video=60, sdd_scenes=True
+        )
+        write_synthetic_video_cache(
+            root / "feats", "coupa", ("video0", "video1"), frames_per_video=60
+        )
+        cfg = _Cfg()
+        cfg.past_traj_min = cfg.past_traj_max = -100.0
+        cfg.fut_traj_min = cfg.fut_traj_max = -100.0
+        ds = SDDGlobalDataset(
+            cfg,
+            training=False,
+            sdd_root=root,
+            held_out_scene="coupa",
+            split="test",
+            use_video=True,
+            video_features_root=root / "feats",
+            video_mode="full",
+            video_ids=["video0"],
+        )
+        assert len(ds.windows) > 0
+        for i in range(len(ds)):
+            it = ds[i]
+            assert it["scene"] == "coupa"
+            assert it["video_id"] == "video0"
+            assert ds.windows.video_id(i) == "video0"
+
+
+def test_video_id_filter_other_video_kills_half_the_windows() -> None:
+    # video1 filter on the same scene: every surviving window is video1 —
+    # proves the filter selects per-video, not merely shrinks the pool.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        write_synthetic_sdd(
+            root, n_scenes=5, videos_per_scene=2, frames_per_video=60, sdd_scenes=True
+        )
+        write_synthetic_video_cache(
+            root / "feats", "coupa", ("video0", "video1"), frames_per_video=60
+        )
+        cfg = _Cfg()
+        cfg.past_traj_min = cfg.past_traj_max = -100.0
+        cfg.fut_traj_min = cfg.fut_traj_max = -100.0
+        full = SDDGlobalDataset(
+            cfg,
+            training=False,
+            sdd_root=root,
+            held_out_scene="coupa",
+            split="test",
+            use_video=True,
+            video_features_root=root / "feats",
+            video_mode="full",
+        )
+        filtered = SDDGlobalDataset(
+            cfg,
+            training=False,
+            sdd_root=root,
+            held_out_scene="coupa",
+            split="test",
+            use_video=True,
+            video_features_root=root / "feats",
+            video_mode="full",
+            video_ids=["video1"],
+        )
+        assert len(filtered) < len(full)
+        for i in range(len(filtered)):
+            assert filtered[i]["video_id"] == "video1"
 
 
 def test_video_mode_off_ignores_missing_cache() -> None:

@@ -55,6 +55,28 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 SEED="${SEED:-42}"
 # Sampling schedule shared by every train/eval so results are comparable.
 SAMPLING_STEPS="${SAMPLING_STEPS:-10}"
+# Single-video ablation: restrict every LOSO-selected split to this video
+# folder name (e.g. 'video0'). Empty = all videos of each scene. Geographic
+# LOSO still holds — the filter is applied AFTER scene selection.
+VIDEO_ID="${VIDEO_ID:-}"
+# Rebuild the --video-id CLI args from the current VIDEO_ID. Must be called
+# AFTER a research script parses its own args (it sources 00_common first).
+# usage: build_video_args; ARGS+=( "${video_args[@]}" )
+build_video_args() {
+    video_args=()
+    if [[ -n "${VIDEO_ID}" ]]; then
+        video_args=(--video-id "$VIDEO_ID")
+    fi
+}
+build_video_args  # initial state before scripts override VIDEO_ID
+
+# usage: vid_out_suffix  -> echoes "_vid<name>" (or "" when unfiltered) so a
+# single-video run never overwrites the full-scene geographic-LOSO artifacts.
+vid_out_suffix() {
+    if [[ -n "${VIDEO_ID}" ]]; then
+        echo "_vid${VIDEO_ID}"
+    fi
+}
 
 export CUDA_VISIBLE_DEVICES
 
@@ -142,5 +164,6 @@ write_provenance() {
         echo "- SDD_ROOT:  ${SDD_ROOT}"
         echo "- FEATURES_ROOT: ${FEATURES_ROOT}"
         echo "- RESULTS_ROOT: ${RESULTS_ROOT}"
+        echo "- VIDEO_ID:  ${VIDEO_ID:-all}"
     } > "$outdir/PROVENANCE.md"
 }

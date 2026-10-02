@@ -43,10 +43,13 @@ while [[ $# -gt 0 ]]; do
         --train) TRAIN_SCENE="$2"; shift 2 ;;
         --n-batches) N_BATCHES="$2"; shift 2 ;;
         --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+        --video-id) VIDEO_ID="$2"; shift 2 ;;
         --dry-run) RESEARCH_DRY_RUN=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 3 ;;
     esac
 done
+build_video_args
+OUTSUF="$(vid_out_suffix)"
 
 OUTDIR="${RESEARCH_ROOT}/q2"
 mkdir -p "$OUTDIR"
@@ -81,8 +84,9 @@ for train_scene in ${ROW_SCENES}; do
                 --split test
                 --conditions baseline
                 --batch-size "$BATCH_SIZE"
-                --out "$OUTDIR/${train_scene}__eval_${eval_scene}__${variant}")
+                --out "$OUTDIR/${train_scene}__eval_${eval_scene}__${variant}${OUTSUF}")
             [[ -n "${N_BATCHES}" && "${N_BATCHES}" != "0" ]] && ARGS+=(--n-batches "$N_BATCHES")
+            ARGS+=( "${video_args[@]}" )
             run_py "transfer:${train_scene}->${eval_scene}:${variant}" "$LOG" "${ARGS[@]}"
         done
     done
@@ -91,15 +95,16 @@ done
 log_to "$LOG" INFO "aggregating cells -> q2_transfer_ade.csv / q2_transfer_gain.csv"
 if [[ "${RESEARCH_DRY_RUN:-0}" != "1" ]]; then
     COL_SCENES="$COL_SCENES" ROW_SCENES="$ROW_SCENES" \
-        OUTDIR="$OUTDIR" RESEARCH_ROOT="$RESEARCH_ROOT" \
+        OUTDIR="$OUTDIR" RESEARCH_ROOT="$RESEARCH_ROOT" OUTSUF="$OUTSUF" \
         "$PYTHON_BIN" - <<PYEOF
 import csv, os, sys
 outdir = os.environ["OUTDIR"]
 rows = os.environ["ROW_SCENES"].split()
 cols = os.environ["COL_SCENES"].split()
+outsuf = os.environ.get("OUTSUF", "")
 
 def cell(train, eval, variant):
-    p = os.path.join(outdir, f"{train}__eval_{eval}__{variant}.csv")
+    p = os.path.join(outdir, f"{train}__eval_{eval}__{variant}{outsuf}.csv")
     if not os.path.exists(p):
         return None
     with open(p, newline="") as f:

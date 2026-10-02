@@ -430,8 +430,11 @@ def _ensure_norm_stats(scene: str, args: argparse.Namespace) -> tuple[float, flo
     (``SDDGlobalDataset(training=True)``), are deterministic across runs, and
     are cached to ``RESULTS_DIR/_norm_stats_ho<scene>.npz`` so repeated
     invocations skip the (relatively expensive) train-split index scan.
+    When a ``--video-id`` filter is active the key carries the video name so
+    filtered and unfiltered statistics never collide in the shared cache.
     """
-    cache = RESULTS_DIR / f"_norm_stats_ho{scene}.npz"
+    vid_suffix = getattr(args, "video_id", None) or ""
+    cache = RESULTS_DIR / f"_norm_stats_ho{scene}{'_'+vid_suffix if vid_suffix else ''}.npz"
     if cache.exists():
         data = np.load(cache)
         return (
@@ -450,6 +453,7 @@ def _ensure_norm_stats(scene: str, args: argparse.Namespace) -> tuple[float, flo
         held_out_scene=scene,
         split="train",
         use_video=False,  # stats are video-independent
+        video_ids=[args.video_id] if getattr(args, "video_id", None) else None,
     )
     stats = (
         float(dset.past_traj_min),
@@ -691,6 +695,7 @@ def get_batch_for_scene(scene: str, args: argparse.Namespace) -> dict:
         split="test",
         use_video=True,
         video_features_root=args.video_features_root,
+        video_ids=[args.video_id] if getattr(args, "video_id", None) else None,
     )
     loader = DataLoader(
         dset,
@@ -864,6 +869,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     p.add_argument("--sdd-root", default=None)
     p.add_argument("--video_features_root", dest="video_features_root", default=None)
+    p.add_argument("--video-id", default=None,
+                   help="Restrict LOSO-selected windows to a single video "
+                        "folder name (e.g. 'video0'). Must match the window "
+                        "space of the per-window gain CSV when rendering "
+                        "ranked windows.")
     p.add_argument("--sampling_steps", type=int, default=10)
     p.add_argument("--use-ema", action="store_true",
                    help="prefer the EMA weights over the raw model weights")

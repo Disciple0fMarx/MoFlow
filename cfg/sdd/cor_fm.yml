@@ -10,6 +10,14 @@ agents                       : 1
 
 checkpt_freq                 : 10
 
+# -------------------- Validation (model selection) -------------------------
+# checkpoint_best is selected on a VALIDATION split carved from the TRAINING
+# scenes only (see build_val_loader_from_train); the held-out test scene is
+# strictly blind. Deterministic: val_fraction + seed are fixed per experiment
+# family so checkpoint selection is reproducible for Q1.
+VAL_FRACTION                 : 0.1
+VAL_SEED                     : 0
+
 # -------------------- Flow matching config -----------------------------
 denoising_method             : 'fm'
 sampling_steps               : 10

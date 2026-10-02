@@ -164,6 +164,7 @@ class Trainer(object):
             cfg,
             train_loader,
             val_fraction=cfg.get('VAL_FRACTION', 0.1),
+            seed=cfg.get('VAL_SEED', 0),
         ) if val_loader is None else val_loader
         self.tb_log = tb_log
         self.logger = logger

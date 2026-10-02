@@ -40,10 +40,13 @@ while [[ $# -gt 0 ]]; do
         --batch-size) BATCH_SIZE="$2"; shift 2 ;;
         --conditions) shift; CONDITIONS=(); while [[ $# -gt 0 && "$1" != --* ]]; do CONDITIONS+=("$1"); shift; done ;;
         --use-ema) USE_EMA="--use-ema"; shift ;;
+        --video-id) VIDEO_ID="$2"; shift 2 ;;
         --dry-run) RESEARCH_DRY_RUN=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 3 ;;
     esac
 done
+build_video_args
+OUTSUF="$(vid_out_suffix)"
 
 OUTDIR="${RESEARCH_ROOT}/q1"
 mkdir -p "$OUTDIR"
@@ -67,9 +70,10 @@ for scene in $(loso_scenes "$LABEL" "$SCENE"); do
         --split test
         --batch-size "$BATCH_SIZE"
         --conditions "${CONDITIONS[@]}"
-        --out "$OUTDIR/${scene}_attrib")
+        --out "$OUTDIR/${scene}_attrib${OUTSUF}")
     [[ -n "${N_BATCHES}" && "${N_BATCHES}" != "0" ]] && ARGS+=(--n-batches "$N_BATCHES")
     [[ -n "${USE_EMA}" ]] && ARGS+=("$USE_EMA")
+    ARGS+=( "${video_args[@]}" )
     run_py "attrib:${scene}" "$LOG" "${ARGS[@]}"
 done
 

@@ -42,10 +42,12 @@ while [[ $# -gt 0 ]]; do
         --train-only) TRAIN_ONLY=1; shift ;;
         --eval-only) EVAL_ONLY=1; shift ;;
         --modes) MODES="$2"; shift 2 ;;
+        --video-id) VIDEO_ID="$2"; shift 2 ;;
         --dry-run) RESEARCH_DRY_RUN=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 3 ;;
     esac
 done
+build_video_args
 if ((TRAIN_ONLY && EVAL_ONLY)); then
     echo "[${LABEL}] ERROR: --train-only and --eval-only are mutually exclusive." >&2
     exit 3
@@ -72,7 +74,8 @@ for scene in $(loso_scenes "$LABEL" "$SCENE"); do
                 --video_mode "$mode" \
                 --video_features_root "$FEATURES_ROOT" \
                 --fix_random_seed --seed "$SEED" \
-                --sampling_steps "$SAMPLING_STEPS"
+                --sampling_steps "$SAMPLING_STEPS" \
+                "${video_args[@]}"
         fi
         if ((TRAIN_ONLY != 1)); then
             run_py "eval:${scene}/${mode}" "$LOG" \
@@ -84,7 +87,8 @@ for scene in $(loso_scenes "$LABEL" "$SCENE"); do
                 --video_features_root "$FEATURES_ROOT" \
                 --fix_random_seed --seed "$SEED" \
                 --sampling_steps "$SAMPLING_STEPS" \
-                --eval
+                --eval \
+                "${video_args[@]}"
         fi
     done
 done
@@ -94,11 +98,13 @@ SCENE_LIST="$(loso_scenes "$LABEL" "$SCENE")"
 if [[ "${RESEARCH_DRY_RUN:-0}" != "1" ]]; then
     SCENE_LIST="$SCENE_LIST" MODES="$MODES" \
         RESULTS_ROOT="$RESULTS_ROOT" RESEARCH_ROOT="$RESEARCH_ROOT" \
+        OUTSUF="$(vid_out_suffix)" \
         "$PYTHON_BIN" - <<PYEOF
 import csv, os, sys
 root_dir = os.environ["RESULTS_ROOT"]
 scenes = os.environ["SCENE_LIST"].split()
 modes = os.environ["MODES"].split()
+outsuf = os.environ.get("OUTSUF", "")
 suffix = {"off": "novid", "static": "vmstatic", "full": "vmfull"}
 rows, header = [], ["scene", "video_mode"]
 # columns: ADE_min / FDE_min at the 4 horizons the trainer reports (1.2..4.8s)
@@ -108,7 +114,7 @@ for metric in ("ADE_min", "FDE_min"):
 rows.append(header)
 for scene in scenes:
     for mode in modes:
-        run_dir = os.path.join(root_dir, f"_SDD_ho{scene}_{suffix[mode]}")
+        run_dir = os.path.join(root_dir, f"_SDD_ho{scene}_{suffix[mode]}{outsuf}")
         csv_path = next(
             (os.path.join(run_dir, *parts)
              for parts in (("eval_test_metrics.csv",), ("log", "eval_test_metrics.csv"))
@@ -132,7 +138,7 @@ for scene in scenes:
                 val = row.get(key)
                 out.append(f"{float(val)/num_trajs:.4f}" if val else "NA")
         rows.append(out)
-with open(os.path.join(os.environ["RESEARCH_ROOT"], "q6", "q6_video_mode_ade.csv"), "w", newline="") as f:
+with open(os.path.join(os.environ["RESEARCH_ROOT"], "q6", f"q6_video_mode_ade{outsuf}.csv"), "w", newline="") as f:
     csv.writer(f).writerows(rows)
 print("[q6] wrote q6_video_mode_ade.csv")
 PYEOF
