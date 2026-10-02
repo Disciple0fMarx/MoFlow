@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--video_stride", default=1, type=int)
     p.add_argument(
-        "--video_id",
+        "--video-id",
         default=None,
         type=str,
         help=(
