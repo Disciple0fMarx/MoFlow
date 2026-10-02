@@ -37,8 +37,9 @@ fi
 # ---------------------------------------------------------------------------
 # Lab machine SDD annotations (annotations/<scene>/<video_id>/annotations.txt).
 SDD_ROOT="${SDD_ROOT:-/home/efrei_stage/Desktop/Datasets/SDD}"
-# Video feature caches (<scene>.npy + <scene>.manifest.parquet).
-FEATURES_ROOT="${FEATURES_ROOT:-/home/efrei_stage/Desktop/Datasets/SDD/features/resnet18}"
+# Writable project-local video feature cache (<scene>.npy + <scene>.manifest.parquet).
+# NOT the read-only $SDD_ROOT/features/resnet18 — that dir must never be read.
+FEATURES_ROOT="${FEATURES_ROOT:-/home/efrei_stage/MoFlow/features/resnet18}"
 # Where fm_sdd_global.py writes run dirs (_SDD_ho<scene>_vm{static,full} / _novid).
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_sdd/cor_fm}"
 # Where this suite writes its aggregated reports / renderings.

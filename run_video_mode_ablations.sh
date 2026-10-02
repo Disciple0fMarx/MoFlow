@@ -25,7 +25,9 @@
 set -euo pipefail
 
 HELD_OUT_SCENE="${HELD_OUT_SCENE:-coupa}"
-FEATURES_ROOT="${FEATURES_ROOT:-/home/efrei_stage/Desktop/Datasets/SDD/features/resnet18}"
+# Writable project-local feature cache; never read from the read-only
+# $SDD_ROOT/features/resnet18.
+FEATURES_ROOT="${FEATURES_ROOT:-/home/efrei_stage/MoFlow/features/resnet18}"
 SEED="${SEED:-42}"
 GPU_DEVICE="${GPU_DEVICE:-0}"
 RESET_RUNS="${RESET_RUNS:-0}"
