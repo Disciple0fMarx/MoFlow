@@ -38,8 +38,10 @@ fi
 # Lab machine SDD annotations (annotations/<scene>/<video_id>/annotations.txt).
 SDD_ROOT="${SDD_ROOT:-/home/efrei_stage/Desktop/Datasets/SDD}"
 # Writable project-local video feature cache (<scene>.npy + <scene>.manifest.parquet).
+# Resolved relative to the repo root so it is correct on any checkout
+# (lab: /home/efrei_stage/Desktop/MoFlow/features/resnet18).
 # NOT the read-only $SDD_ROOT/features/resnet18 — that dir must never be read.
-FEATURES_ROOT="${FEATURES_ROOT:-/home/efrei_stage/MoFlow/features/resnet18}"
+FEATURES_ROOT="${FEATURES_ROOT:-${REPO_ROOT}/features/resnet18}"
 # Where fm_sdd_global.py writes run dirs (_SDD_ho<scene>_vm{static,full} / _novid).
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_sdd/cor_fm}"
 # Where this suite writes its aggregated reports / renderings.
@@ -126,6 +128,52 @@ require_ckpt() {
         echo "  → have you run the training step for this scene first?" >&2
         exit 4
     fi
+}
+
+# usage: ensure_features <scene>   -> validates the scene's feature cache.
+# FEATURES_ROOT must contain <scene>.npy + <scene>.manifest.parquet. When
+# missing and AUTO_ENCODE_FEATURES != 0 (default), the cache is (re)built in
+# place via `python -m video_encoder encode-sdd` — a one-time cost per scene.
+# Set AUTO_ENCODE_FEATURES=0 to validate-only and fail fast instead.
+ensure_features() {
+    local scene="$1"
+    local npy="${FEATURES_ROOT}/${scene}.npy"
+    local man="${FEATURES_ROOT}/${scene}.manifest.parquet"
+    mkdir -p "$FEATURES_ROOT"
+    if [[ -f "$npy" && -f "$man" ]]; then
+        return 0
+    fi
+    if [[ "${RESEARCH_DRY_RUN:-0}" == "1" ]]; then
+        echo "[ensure_features] (dry-run) cache missing for ${scene}: would encode -> ${FEATURES_ROOT}"
+        return 0
+    fi
+    echo "[ensure_features] feature cache missing for scene=${scene}"
+    echo "  expected: ${npy}"
+    echo "            ${man}"
+    if [[ "${AUTO_ENCODE_FEATURES:-1}" != "1" ]]; then
+        echo "[ensure_features] set AUTO_ENCODE_FEATURES=1 or encode manually:" >&2
+        echo "    (cd \"${REPO_ROOT}\" && \"${PYTHON_BIN}\" -m video_encoder encode-sdd --sdd-root \"${SDD_ROOT}\" --out \"${FEATURES_ROOT}\" --scenes \"${scene}\")" >&2
+        exit 7
+    fi
+    echo "[ensure_features] auto-encoding ${scene} (one-time; may take a few minutes) ..."
+    if ! (cd "$REPO_ROOT" && "$PYTHON_BIN" -m video_encoder encode-sdd --sdd-root "$SDD_ROOT" --out "$FEATURES_ROOT" --scenes "$scene"); then
+        echo "[ensure_features] ERROR: encode failed for ${scene}. Check the videos under ${SDD_ROOT}/videos/${scene}/ and retry." >&2
+        exit 7
+    fi
+    if [[ ! -f "$npy" || ! -f "$man" ]]; then
+        echo "[ensure_features] ERROR: encode reported success but the cache files are still missing:" >&2
+        echo "  ${npy} / ${man}" >&2
+        exit 7
+    fi
+    echo "[ensure_features] OK: ${scene} feature cache ready"
+}
+
+# usage: ensure_feature_list <scene> [scene...]  -> ensure_features for each
+ensure_feature_list() {
+    local s
+    for s in "$@"; do
+        [[ -n "$s" ]] && ensure_features "$s"
+    done
 }
 
 # usage: run_py <label> <logfile> -- args...   -> runs the project python

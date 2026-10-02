@@ -127,3 +127,12 @@ RESEARCH_DRY_RUN=1 scripts/research/02_zvid_attribution.sh
 The default `SDD_ROOT`, `FEATURES_ROOT`, and `CUDA_VISIBLE_DEVICES=0` match the
 lab box (single RTX 4080). Override with env vars, e.g.
 `SDD_ROOT=/data/SDD FEATURES_ROOT=/data/feats scripts/research/01_…sh`.
+
+`FEATURES_ROOT` resolves to `<repo-root>/features/resnet18` (repo-root-relative,
+so correct for any checkout; on the lab that is
+`/home/efrei_stage/Desktop/MoFlow/features/resnet18`). Each script runs
+`ensure_features <scene>` before attributing/training a scene: if
+`<scene>.npy` / `<scene>.manifest.parquet` are absent it auto-runs
+`python -m video_encoder encode-sdd` to build the cache in place (a one-time
+cost per scene). Set `AUTO_ENCODE_FEATURES=0` to validate-only and fail fast
+instead. The read-only `$SDD_ROOT/features/resnet18` is never read.

@@ -60,6 +60,14 @@ LOG="${OUTDIR}/run.log"
 write_provenance "$OUTDIR" "scripts/research/01_video_mode_ablation.sh"
 log_to "$LOG" INFO "Q6 starting. scenes=($(loso_scenes "$LABEL" "$SCENE")) modes=(${MODES}) train_only=${TRAIN_ONLY} eval_only=${EVAL_ONLY}"
 
+# Feature caches are needed for the eval scene(s); training additionally needs
+# the other 7 scenes' caches. ensure_feature_list auto-encodes any that are missing.
+if ((EVAL_ONLY)); then
+    ensure_feature_list "$(loso_scenes "$LABEL" "$SCENE")"
+else
+    ensure_feature_list "${SDD_SCENES[@]}"
+fi
+
 CFG="cfg/sdd/cor_fm.yml"
 
 for scene in $(loso_scenes "$LABEL" "$SCENE"); do

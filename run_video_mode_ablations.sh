@@ -25,9 +25,10 @@
 set -euo pipefail
 
 HELD_OUT_SCENE="${HELD_OUT_SCENE:-coupa}"
-# Writable project-local feature cache; never read from the read-only
-# $SDD_ROOT/features/resnet18.
-FEATURES_ROOT="${FEATURES_ROOT:-/home/efrei_stage/MoFlow/features/resnet18}"
+# Writable project-local feature cache; resolved relative to this repo so it
+# is correct on any checkout (lab: <repo>/features/resnet18). Never read from
+# the read-only $SDD_ROOT/features/resnet18.
+FEATURES_ROOT="${FEATURES_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/features/resnet18}"
 SEED="${SEED:-42}"
 GPU_DEVICE="${GPU_DEVICE:-0}"
 RESET_RUNS="${RESET_RUNS:-0}"

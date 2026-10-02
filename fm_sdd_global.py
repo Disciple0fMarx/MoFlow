@@ -15,7 +15,7 @@ Usage on the remote lab machine:
     python fm_sdd_global.py \\
         --cfg cfg/sdd/cor_fm.yml \\
         --held_out_scene coupa \\
-        --video_features_root /home/efrei_stage/MoFlow/features/resnet18
+        --video_features_root /home/efrei_stage/Desktop/MoFlow/features/resnet18
 
     # Evaluation
     python fm_sdd_global.py --cfg cfg/sdd/cor_fm.yml --held_out_scene coupa --eval

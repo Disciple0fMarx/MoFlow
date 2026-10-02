@@ -59,6 +59,7 @@ CFG="cfg/sdd/cor_fm.yml"
 for scene in $(loso_scenes "$LABEL" "$SCENE"); do
     CKPT="${RESULTS_ROOT}/_SDD_ho${scene}_vmfull/models/checkpoint_best.pt"
     require_ckpt "$CKPT" "$LABEL"
+    ensure_features "$scene"
     log_to "$LOG" INFO "[${scene}] attribution on ${CKPT}"
 
     ARGS=(tools/attrib_video_conditioning.py

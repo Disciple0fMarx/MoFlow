@@ -59,6 +59,7 @@ write_provenance "$OUTDIR" "scripts/research/03_transfer_matrix.sh"
 
 COL_SCENES="$(loso_scenes "$LABEL" "$SCENE")"
 ROW_SCENES="$(loso_scenes "$LABEL" "$TRAIN_SCENE")"
+ensure_feature_list ${COL_SCENES}
 log_to "$LOG" INFO "Q2 starting. rows(train)=(${ROW_SCENES}) cols(eval)=(${COL_SCENES}) n_batches=${N_BATCHES:-all}"
 
 CFG="cfg/sdd/cor_fm.yml"

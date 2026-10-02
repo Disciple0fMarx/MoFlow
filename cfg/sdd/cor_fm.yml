@@ -51,9 +51,11 @@ MODEL:
         VIDEO_DIM_RAW: 512        # Raw video feature dimension (ResNet-18)
         VIDEO_DIM: 32             # Projected video dimension
         # Cached ResNet-18 per-scene features (<scene>.npy + .manifest.parquet).
-        # Writable project-local root; the read-only
-        # $SDD_ROOT/features/resnet18 must never be used for feature loading.
-        VIDEO_FEATURES_ROOT: "/home/efrei_stage/MoFlow/features/resnet18"
+        # Writable project-local root on the lab (repo is under Desktop):
+        # /home/efrei_stage/Desktop/MoFlow/features/resnet18
+        # The read-only $SDD_ROOT/features/resnet18 must never be used for
+        # feature loading. Research scripts override this with FEATURES_ROOT.
+        VIDEO_FEATURES_ROOT: "/home/efrei_stage/Desktop/MoFlow/features/resnet18"
         AGENT_CROP_SIZE: [64, 64] # [height, width] for crops
         RESNET_FREEZE_BLOCKS: 2   # Frozen ResNet blocks
         SPATIAL_DROPOUT_RATE: 0.5 # Dropout after backbone
