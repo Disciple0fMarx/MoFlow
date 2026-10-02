@@ -201,10 +201,12 @@ def test_novid_checkpoint_auto_infers_arch(tmp_path):
 
 
 def test_sentinel_underflow_skipped(tmp_path):
-    """No features root → scalar 0. sentinel → every batch skipped silently.
+    """No features root → scalar 0. sentinel → every batch skipped.
 
-    The tool must still exit cleanly and write empty aggregate rows rather
-    than crashing on a missing ``z_video_global``.
+    The tool must REFUSE to write an all-zero aggregate (the old behavior: a
+    clean exit + 3 zero rows that read like attribution evidence). It now
+    raises SystemExit with the missing-cache-sentinel diagnosis so the
+    operator re-encodes the scene instead of trusting empty numbers.
     """
     from models.backbone_eth_ucy import ETHMotionTransformer
     from models.flow_matching import FlowMatcher
@@ -242,15 +244,9 @@ def test_sentinel_underflow_skipped(tmp_path):
         "--out",
         str(tmp_path / "out"),
     ]
-    cvxp.main(argv)  # must not raise
-
-    import csv
-
-    with (tmp_path / "out.csv").open() as fp:
-        rows = list(csv.DictReader(fp))
-    assert len(rows) == 3
-    for r in rows:
-        assert float(r["ade_min"]) == 0.0  # no agents were scored
+    with pytest.raises(SystemExit, match="missing-cache sentinel"):
+        cvxp.main(argv)
+    assert not (tmp_path / "out.csv").exists()  # nothing misleading written
 
 
 def _make_cvxp_env(tmp_path, arch_video: bool):

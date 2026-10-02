@@ -401,6 +401,7 @@ class SDDGlobalDataset(Dataset):
         )
         cfg.MODEL.CONTEXT_ENCODER.AGENTS = SDD_AGENTS_PER_WINDOW
         self._static_video_vec: torch.Tensor | None = None
+        self._warned_missing_cache: set[str] = set()
 
         # ---- Identity homography warning ------------------------------------
         print(
@@ -539,8 +540,11 @@ class SDDGlobalDataset(Dataset):
                     )
                 except FileNotFoundError:
                     # Missing cache → return a dummy scalar (the collate will skip it).
+                    self._warn_missing_cache(scene, video_id)
                     item["z_video_global"] = torch.zeros(1)
         else:
+            if self.use_video and self.video_mode == "full":
+                self._warn_missing_cache(item["scene"], item["video_id"])
             item["z_video_global"] = torch.zeros(1)
 
         return item
@@ -548,6 +552,39 @@ class SDDGlobalDataset(Dataset):
     # -----------------------------------------------------------------------
     # Video-mode isolation helpers
     # -----------------------------------------------------------------------
+    def _warn_missing_cache(self, scene: str, video_id: str) -> None:
+        """Emit a ONE-TIME, on-the-record warning naming the exact cache files.
+
+        The zero sentinel is a *silent* data-loss trap: attribution tools skip
+        whole batches and Q5/Q7 evidence silently vanishes unless the operator
+        can see that the dataloader could not find the ResNet-18 scene features
+        (and WHICH files it looked for). Printed once per scene per process.
+        """
+        if self.video_mode != "full" or scene in self._warned_missing_cache:
+            return
+        self._warned_missing_cache.add(scene)
+        root = self.video_features_root
+        if root is None:
+            print(
+                f"[sdd] WARNING: video_mode=full but video_features_root is "
+                "NOT configured for scene=" f"{scene!r} — serving zero "
+                "sentinels (the video channel gets NO signal). Pass "
+                "--video-features-root or set "
+                "MODEL.CONTEXT_ENCODER.VIDEO_FEATURES_ROOT before running "
+                "video-conditioned attribution/training."
+            )
+            return
+        name = f"{scene}.npy"
+        man = f"{scene}.manifest.parquet"
+        print(
+            f"[sdd] WARNING: video feature cache missing for scene={scene!r} "
+            f"(video_mode=full). Expected {root / name} and {root / man} under "
+            f"video_features_root={root}. Serving zero sentinels for these "
+            "windows — the video channel gets NO signal. Re-encode the scene "
+            "with `python -m video_encoder encode-sdd --sdd-root <root> "
+            "--out-dir <features-root>` before running video-conditioned "
+            "attribution/training."
+        )
     def _static_video(self, scene: str, video_id: str) -> torch.Tensor:
         """Return a single fixed ``[D_raw]`` vector for the whole mode.
 

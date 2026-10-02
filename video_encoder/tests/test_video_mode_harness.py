@@ -224,3 +224,66 @@ def test_per_window_guard_allows_when_not_requested() -> None:
     from tools.attrib_video_conditioning import _assert_per_window_records
 
     _assert_per_window_records(_args_cls(per_window=None), 0, 7, {})
+
+
+def _agg(**kw):
+    d = {"n_agents": 0.0, "ade_min": 0.0, "fde_min": 0.0}
+    d.update(kw)
+    return d
+
+
+def test_attribution_guard_allows_when_batches_contributed() -> None:
+    # Q1/Q2 happy path: real batches -> aggregate is written.
+    from tools.attrib_video_conditioning import _assert_attribution_contributed
+
+    _assert_attribution_contributed(
+        3, 0, {"baseline": _agg(n_agents=120.0), "zeroed": _agg(n_agents=120.0)}, ["baseline", "zeroed"]
+    )
+
+
+def test_attribution_guard_fails_when_every_batch_was_missing_cache() -> None:
+    # This is the real lab failure Q1/Q2 hid: every batch skipped, so the tool
+    # would have written an all-zero n_agents=0 aggregate that looks like
+    # evidence. Now it FATALs and points at the '[sdd] WARNING: video feature
+    # cache missing' line.
+    from tools.attrib_video_conditioning import _assert_attribution_contributed
+
+    agg = {"baseline": _agg(), "zeroed": _agg()}
+    with pytest.raises(SystemExit, match="missing-cache sentinel"):
+        _assert_attribution_contributed(0, 11, agg, ["baseline", "zeroed"])
+
+
+def test_dataset_warns_and_sentinels_when_scene_cache_missing(capsys) -> None:
+    # video_mode=full with a non-existent features root must (a) return the
+    # zero sentinel and (b) print a one-time warning naming the exact missing
+    # files, so the operator can see the cache is absent instead of a silent
+    # all-zero attribution.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        write_synthetic_sdd(
+            root, n_scenes=5, videos_per_scene=2, frames_per_video=60, sdd_scenes=True
+        )
+        cfg = _Cfg()
+        cfg.past_traj_min = cfg.past_traj_max = -100.0
+        cfg.fut_traj_min = cfg.fut_traj_max = -100.0
+        cfg.video_stride = 1
+        cfg.video_smooth_sigma = 0.0
+        ds = SDDGlobalDataset(
+            cfg,
+            training=False,
+            sdd_root=root,
+            held_out_scene="deathCircle",
+            split="test",
+            use_video=True,
+            video_features_root=root / "feats" / "missing",
+            video_mode="full",
+        )
+        z = ds[0]["z_video_global"]
+        assert z.dim() == 1 and z.numel() == 1
+        assert ds[0]["scene"] == "deathCircle"
+        out = capsys.readouterr().out
+        assert "video feature cache missing for scene='deathCircle'" in out
+        assert "deathCircle.manifest.parquet" in out
+        # one-time: a second sample does not spam the warning
+        _ = ds[1]
+        assert out.count("video feature cache missing") == 1

@@ -192,6 +192,39 @@ def _permuted(real: torch.Tensor, use_rng_shuffle: bool = True) -> torch.Tensor:
     return real[idx]
 
 
+def _assert_attribution_contributed(
+    batches: int,
+    skipped_batches: int,
+    agg: dict[str, dict[str, float]],
+    run_conditions: list[str],
+) -> None:
+    """Refuse to write a degenerate (all-zero, zero-agent) aggregate.
+
+    Without this, a totally skipped loader (missing video feature cache →
+    every batch's z_video_global is the sentinel) silently yields n_agents=0
+    CSVs that LOOK like attribution evidence. Only the tool knows whether any
+    batch actually contributed, so fail loudly in every attribution mode.
+    """
+    total_agents = int(sum(agg[c]["n_agents"] for c in run_conditions))
+    if total_agents > 0:
+        return
+    if skipped_batches and batches == 0:
+        reason = (
+            f"all {skipped_batches} batch(es) were skipped because "
+            "z_video_global was the missing-cache sentinel"
+        )
+    elif batches == 0:
+        reason = "the dataset produced no batches (empty loader)"
+    else:
+        reason = f"{batches} batch(es) ran but contributed zero agents"
+    raise SystemExit(
+        "[cvxp] FATAL: no attribution could be recorded ("
+        f"{reason}). The aggregate would be all zeros — nothing was written. "
+        "The dataloader prints a '[sdd] WARNING: video feature cache missing"
+        " for scene=...' line naming the exact files to re-encode."
+    )
+
+
 def _assert_per_window_records(
     args: argparse.Namespace,
     batches: int,
@@ -506,6 +539,9 @@ def main(argv: list[str] | None = None) -> None:
     # would silently produce a "missing windows file" downstream (script 04
     # aggregation). Fail loudly with the actual cause instead.
     _assert_per_window_records(args, batches, skipped_batches, window_rows)
+    _assert_attribution_contributed(
+        batches, skipped_batches, agg, run_conditions
+    )
 
     # ---- aggregate + persist ---------------------------------------------
     rows = []
