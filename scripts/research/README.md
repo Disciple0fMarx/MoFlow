@@ -136,3 +136,10 @@ so correct for any checkout; on the lab that is
 `python -m video_encoder encode-sdd` to build the cache in place (a one-time
 cost per scene). Set `AUTO_ENCODE_FEATURES=0` to validate-only and fail fast
 instead. The read-only `$SDD_ROOT/features/resnet18` is never read.
+
+The PRE-FIX caches (produced before the single-video fix in
+`SDDFrameFeatureLookup`) collapsed frame ids shared across videos and are
+DETECTED as incomplete. They must be regenerated with
+`scripts/research/00_reencode_features.sh` (all 8 scenes, one encode
+subprocess per scene, continues on error, provenance/log under
+`report/research/features/`). Run it overnight before restarting the suite.
