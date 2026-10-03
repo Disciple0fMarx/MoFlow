@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import gc
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -117,6 +118,12 @@ from video_encoder.sdd_adapter import (  # noqa: E402
 CFG_PATH = REPO_ROOT / "cfg" / "sdd" / "cor_fm.yml"
 RESULTS_DIR = REPO_ROOT / "results_sdd" / "cor_fm"
 DEFAULT_OUT_DIR = REPO_ROOT / "visualizations"
+# Decoded background frames are cached HERE, inside the workspace — never in
+# the raw dataset root, which is a strict READ-ONLY mount (a write attempt
+# raises PermissionError). Override with MF_FRAME_CACHE_DIR.
+FRAME_CACHE_DIR = Path(
+    os.environ.get("MF_FRAME_CACHE_DIR", REPO_ROOT / ".cache" / "frames")
+)
 
 # Bundled samples: low-alpha lines exposing the multimodal distribution;
 # best hypotheses: thick highlight lines, one colour per model.
@@ -545,7 +552,12 @@ def _decode_video_frame(video_path: Path, frame_idx: int) -> np.ndarray:
 def _materialize_frame_cache(
     frames_dir: Path, frame_idx: int, img_rgb: np.ndarray
 ) -> Path | None:
-    """Persist a video-decoded frame so later runs hit the fast file path."""
+    """Persist a video-decoded frame so later runs hit the fast file path.
+
+    ``frames_dir`` MUST live inside the workspace (see ``FRAME_CACHE_DIR``):
+    the raw dataset root is a strict READ-ONLY mount, so writing there raises
+    PermissionError.
+    """
     try:
         from PIL import Image
 
@@ -554,7 +566,7 @@ def _materialize_frame_cache(
         if not out.exists():
             Image.fromarray(img_rgb).save(out, quality=92)
         return out
-    except Exception as exc:  # read-only roots etc. -> skip caching
+    except Exception as exc:  # never fatal — rendering proceeds without cache
         _console(f"could not cache frame ({exc})")
         return None
 
@@ -583,8 +595,11 @@ def load_anchor_frame(
          frames/frame{anchor:06d}.{jpg,png}`` (+1 variant tolerates 0-based
          annotation ids against 1-based extraction);
       3. static ``referenceframe.jpg`` (official SDD layout);
-      4. direct cv2 decode from the raw video — the decoded frame is cached
-         to disk as a JPEG so subsequent runs take path (2).
+      4. a previously decoded frame in the WORKSPACE cache
+         (``FRAME_CACHE_DIR/<scene>/<vid>/``, i.e. ``<repo>/.cache/frames``);
+      5. direct cv2 decode from the raw video — the decoded frame is cached
+         into the workspace (never into the read-only dataset root) so
+         subsequent runs take path (4).
 
     Returns ``(image, extent=(0, W, H, 0), source_tag)`` or ``None``
     (loudly reported — a missing background is never silent).
@@ -609,6 +624,12 @@ def load_anchor_frame(
     candidates.append(
         ("reference-videos", root / "videos" / scene / video_id / "referenceframe.jpg")
     )
+    # Workspace-local cache of frames this tool decoded itself (written only
+    # after every dataset-side candidate missed).
+    cache_dir = FRAME_CACHE_DIR / scene / video_id
+    for suffix in (a, a + 1):
+        tag = "frame-cache" if suffix == a else "frame-cache+1"
+        candidates.append((tag, cache_dir / f"frame{suffix:06d}.jpg"))
 
     for source, cand in candidates:
         if cand.exists():
@@ -634,11 +655,12 @@ def load_anchor_frame(
         )
         return None
 
-    _materialize_frame_cache(root / "videos" / scene / video_id / "frames", a, img)
+    cached = _materialize_frame_cache(cache_dir, a, img)
     h, w = img.shape[:2]
     _console(
         f"[{scene}/{video_id}] background 'video-decode' @frame {a}: "
-        f"{video} ({w}x{h}px) — cached for future runs"
+        f"{video} ({w}x{h}px)"
+        + (f" — cached at {cached}" if cached is not None else " — (cache write skipped)")
     )
     return img, (0.0, float(w), float(h), 0.0), "video-decode"
 
