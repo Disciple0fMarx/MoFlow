@@ -109,6 +109,7 @@ from data.dataloader_sdd_global import (  # noqa: E402
 from models.backbone_eth_ucy import ETHMotionTransformer  # noqa: E402
 from models.flow_matching import FlowMatcher  # noqa: E402
 from utils.config import Config  # noqa: E402
+from utils.memory import MAX_NUM_WORKERS, resolve_num_workers  # noqa: E402
 from utils.normalization import unnormalize_min_max  # noqa: E402
 from video_encoder.sdd_adapter import (  # noqa: E402
     expand_sdd_root,
@@ -723,7 +724,9 @@ def get_batch_for_scene(scene: str, args: argparse.Namespace) -> dict:
         dset,
         batch_size=1,
         shuffle=False,
-        num_workers=0,
+        # clamped (utils.memory.resolve_num_workers): a worker forks its own
+        # copy of the window index and feature mapping, so fan-out multiplies RAM
+        num_workers=resolve_num_workers(getattr(args, "num_workers", None)),
         collate_fn=collate_sdd_global,
     )
     try:
@@ -904,6 +907,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "automatic anchor-frame lookup)")
     p.add_argument("--no-background", action="store_true",
                    help="skip frame lookup and plot on white")
+    p.add_argument("--num-workers", type=int, default=None,
+                   help="DataLoader workers, clamped to [0, %d] (default 0: the "
+                        "window index and feature mapping are not duplicated "
+                        "per worker)" % MAX_NUM_WORKERS)
     p.add_argument("--zoom-margin", type=float, default=150.0,
                    help="contextual margin in pixels added around the union "
                         "bounding box of all plotted trajectories when a "

@@ -381,9 +381,14 @@ class SDDFrameFeatureLookup:
     """
 
     scene: str
-    features: np.ndarray  # [N, D]
-    video_frame_to_row: dict[tuple[str, int], int]  # (video_id, frame_id) -> row
+    features: np.ndarray  # [N, D] — mmap'd when mmap=True, so RSS stays flat
     video_sorted_ids: dict[str, np.ndarray]  # video_id -> ascending frame ids
+    # video_id -> feature row indices ALIGNED with video_sorted_ids. These two
+    # parallel int64 arrays replace the previous dict[(video_id, frame_id)] ->
+    # row mapping: a Python dict of N tuple keys costs ~100 B/entry and was the
+    # single largest RAM consumer of the lookup (built once per scene per
+    # process, then retained by the lru_cache).
+    video_sorted_rows: dict[str, np.ndarray]
 
     @classmethod
     def from_root(
@@ -411,36 +416,43 @@ class SDDFrameFeatureLookup:
                 "`python -m video_encoder encode-sdd`."
             )
 
-        rows = [
-            (str(v), int(f), int(r))
-            for v, f, r in zip(
-                man["video_id"].astype(str),
-                man["frame_id"].astype(int),
-                man["row_idx"].astype(int),
-            )
-        ]
-        video_frame_to_row = {(v, f): r for v, f, r in rows}
+        # Build the per-video index vectorized: two int64 arrays per video
+        # instead of a Python dict of tuples. Nothing list-shaped proportional
+        # to the number of frames is ever materialized.
+        vids = man["video_id"].astype(str).to_numpy()
+        fids = man["frame_id"].astype(np.int64).to_numpy()
+        ridx = man["row_idx"].astype(np.int64).to_numpy()
+        n_manifest_rows = int(man.shape[0])
+        del man  # the DataFrame is not needed after the index is built
+
+        video_sorted_ids: dict[str, np.ndarray] = {}
+        video_sorted_rows: dict[str, np.ndarray] = {}
+        for v in np.unique(vids):
+            sel = vids == v
+            f = fids[sel]
+            r = ridx[sel]
+            order = np.argsort(f, kind="stable")
+            video_sorted_ids[str(v)] = f[order]
+            video_sorted_rows[str(v)] = r[order]
+        del vids, fids, ridx
 
         # Pre-fix detection: the old encoder dropped duplicate frame ids across
         # videos, so a whole losing video's annotated frames are absent. Compare
         # the manifest against the annotations per (scene, video).
         if sdd_root is not None:
             _verify_manifest_vs_annotations(
-                Path(sdd_root), scene, rows, npy.stat().st_size, man.shape[0]
+                Path(sdd_root),
+                scene,
+                video_sorted_ids,
+                npy.stat().st_size,
+                n_manifest_rows,
             )
 
-        video_sorted_ids: dict[str, np.ndarray] = {}
-        for v, f, _ in rows:
-            video_sorted_ids.setdefault(v, []).append(f)  # type: ignore[union-attr]
-        video_sorted_ids = {
-            v: np.asarray(sorted(fs), dtype=np.int64)
-            for v, fs in video_sorted_ids.items()
-        }
         return cls(
             scene=scene,
             features=feats,
-            video_frame_to_row=video_frame_to_row,
             video_sorted_ids=video_sorted_ids,
+            video_sorted_rows=video_sorted_rows,
         )
 
     # ---- single-frame access ------------------------------------------------
@@ -482,29 +494,46 @@ class SDDFrameFeatureLookup:
 
     # ---- internal -----------------------------------------------------------
     def _resolve(self, video_id: str, frame_id: int, policy: SnapPolicy) -> int | None:
-        key = (video_id, frame_id)
-        if key in self.video_frame_to_row:
-            return self.video_frame_to_row[key]
+        """Resolve ``frame_id`` inside ``video_id``'s own rows only.
+
+        ``side="right" - 1`` lands on the exact frame when present (and on the
+        LAST duplicate, matching the dict-based behaviour this replaced); when
+        absent, ``pos`` is the floor candidate.
+        """
         ids = self.video_sorted_ids.get(video_id)
         if ids is None or ids.size == 0:
             return None
+        rows = self.video_sorted_rows[video_id]
+        pos = int(np.searchsorted(ids, frame_id, side="right")) - 1
+        if pos >= 0 and int(ids[pos]) == frame_id:
+            return int(rows[pos])
         if policy == "drop":
             return None
-        idx = int(np.searchsorted(ids, frame_id))
         if policy == "floor":
-            if idx == 0:
-                return None
-            return self.video_frame_to_row[(video_id, int(ids[idx - 1]))]
-        # nearest
-        candidates: list[int] = []
-        if idx > 0:
-            candidates.append(int(ids[idx - 1]))
-        if idx < ids.size:
-            candidates.append(int(ids[idx]))
-        if not candidates:
-            return None
-        best = min(candidates, key=lambda f: abs(f - frame_id))
-        return self.video_frame_to_row[(video_id, best)]
+            return int(rows[pos]) if pos >= 0 else None
+        # nearest: floor candidate (pos) vs the next frame (pos + 1); ties keep
+        # the floor, as the previous implementation did.
+        best = pos
+        if best < 0 or (
+            pos + 1 < ids.size
+            and abs(int(ids[pos + 1]) - frame_id) < abs(int(ids[best]) - frame_id)
+        ):
+            best = pos + 1
+        return int(rows[best]) if best >= 0 else None
+
+    @property
+    def video_frame_to_row(self) -> dict[tuple[str, int], int]:
+        """Materialize ``(video_id, frame_id) -> row`` (debug/tests only).
+
+        Kept for backwards compatibility. Building this dict costs ~100 B per
+        frame, so hot loops must use :meth:`get` / :meth:`window` instead.
+        """
+        out: dict[tuple[str, int], int] = {}
+        for vid, ids in self.video_sorted_ids.items():
+            rows = self.video_sorted_rows[vid]
+            for f, r in zip(ids.tolist(), rows.tolist()):
+                out[(vid, f)] = r
+        return out
 
 
 @lru_cache(maxsize=64)
@@ -517,6 +546,17 @@ def _cached_lookup(
     Memory cost: one mmap'd ``.npy`` per scene (~5–20 MB).
     """
     return SDDFrameFeatureLookup.from_root(features_root, scene, sdd_root=sdd_root)
+
+
+def release_lookup_cache() -> None:
+    """Drop every memoized :class:`SDDFrameFeatureLookup` in this process.
+
+    Each cached lookup pins one mmap'd ``.npy`` plus its per-video index. A
+    long-running process that walks several scenes (or a sweep cell that finishes
+    a scene) should call this between scenes so the previous scene's mapping is
+    unmapped immediately instead of waiting for the process to exit.
+    """
+    _cached_lookup.cache_clear()
 
 
 def get_lookup(
@@ -571,7 +611,7 @@ def temporal_smooth(features: np.ndarray, sigma: float = 0.0) -> np.ndarray:
 def _verify_manifest_vs_annotations(
     sdd_root: Path,
     scene: str,
-    manifest_rows: list[tuple[str, int, int]],
+    cached_ids: dict[str, np.ndarray],
     npy_bytes: int,
     n_manifest_rows: int,
 ) -> None:
@@ -581,14 +621,17 @@ def _verify_manifest_vs_annotations(
     ``drop_duplicates("frame_id")`` across videos, deleting an entire losing
     video's frames wherever two videos' frame-id ranges overlapped. A
     correctly encoded cache contains **every** video's annotated frames.
+
+    ``cached_ids`` is the per-video ascending frame-id array already built by
+    :meth:`SDDFrameFeatureLookup.from_root`, so this check no longer allocates a
+    second Python ``dict[str, set[int]]`` copy of the whole manifest.
     """
     ann_dir = scene_annotations_dir(sdd_root, scene)
     if not ann_dir.is_dir():
         return  # no annotations -> nothing to check (defensive)
 
-    from collections import defaultdict
-
-    annotated: dict[str, set[int]] = defaultdict(set)
+    missing_total = 0
+    per_video = []
     for vdir in sorted(p for p in ann_dir.iterdir() if p.is_dir()):
         txt = vdir / "annotations.txt"
         if not txt.exists():
@@ -597,20 +640,20 @@ def _verify_manifest_vs_annotations(
             txt,
             usecols=(COL_FRAME,),
         )
-        frames = np.atleast_1d(arr) if arr.size else np.empty(0)
-        annotated[vdir.name] = set(int(f) for f in np.unique(frames))
-
-    cached: dict[str, set[int]] = defaultdict(set)
-    for v, f, _ in manifest_rows:
-        cached[v].add(f)
-
-    missing_total = 0
-    per_video = []
-    for vid in sorted(annotated):
-        miss = sorted(annotated[vid] - cached.get(vid, set()))
-        if miss:
-            missing_total += len(miss)
-            per_video.append(f"{vid}:{len(miss)}")
+        annotated = np.atleast_1d(arr).astype(np.int64, copy=False)
+        if annotated.size == 0:
+            continue
+        annotated = np.unique(annotated)
+        have = cached_ids.get(vdir.name)
+        if have is None or have.size == 0:
+            n_missing = int(annotated.size)
+        else:
+            n_missing = int(
+                annotated.size - np.isin(annotated, have, assume_unique=True).sum()
+            )
+        if n_missing:
+            missing_total += n_missing
+            per_video.append(f"{vdir.name}:{n_missing}")
     if missing_total:
         sample = ", ".join(per_video[:8])
         raise ValueError(

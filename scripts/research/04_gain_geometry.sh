@@ -36,7 +36,7 @@ source "${DIR}/00_common.sh"
 LABEL="q4-gain-geometry"
 SCENE=""
 N_BATCHES=""
-BATCH_SIZE=64
+BATCH_SIZE="${BATCH_SIZE:-64}"   # env-tunable memory knob (see 00_common.sh)
 TOP_K=3
 RENDER=1
 

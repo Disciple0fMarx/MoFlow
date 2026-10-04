@@ -31,13 +31,16 @@ import torch
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
-from data.dataloader_sdd_global import SDD_SCENES, SDDGlobalDataset, collate_sdd_global
+from data.dataloader_sdd_global import (SDD_SCENES, SDDGlobalDataset,
+                                        collate_sdd_global)
 from models.backbone_eth_ucy import ETHMotionTransformer
 from models.flow_matching import FlowMatcher
 from trainer.denoising_model_trainers import Trainer
 from utils.config import Config
+from utils.memory import MAX_NUM_WORKERS, free_memory, resolve_num_workers
 from utils.utils import back_up_code_git, log_config_to_file, set_random_seed
-from video_encoder.sdd_adapter import DEFAULT_SDD_ROOT, expand_sdd_root, is_kaggle
+from video_encoder.sdd_adapter import (DEFAULT_SDD_ROOT, expand_sdd_root,
+                                       is_kaggle)
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +117,35 @@ def parse_args() -> argparse.Namespace:
     # ---- Standard overrides (mirror fm_eth.py) -------------------------------
     p.add_argument("--epochs", default=None, type=int)
     p.add_argument("--batch_size", default=None, type=int)
+    p.add_argument(
+        "--eval_batch_size",
+        default=None,
+        type=int,
+        help=(
+            "Evaluation batch size. Defaults to --batch_size (it used to be "
+            "forced to 2x, which doubled peak VRAM for no accuracy gain)."
+        ),
+    )
+    p.add_argument(
+        "--num_workers",
+        default=None,
+        type=int,
+        help=(
+            "DataLoader workers, clamped to [0, %d]. Default 0: each worker "
+            "forks a copy of the window index and feature mapping, so worker "
+            "count multiplies RAM. The SDD bottleneck is the GPU forward pass."
+        )
+        % MAX_NUM_WORKERS,
+    )
+    p.add_argument(
+        "--pin_memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Pin host memory for faster H2D copies. Pinned pages cannot be "
+            "swapped; pass --no-pin_memory when the host is memory-constrained."
+        ),
+    )
     p.add_argument("--n_train", default=None, type=int)
     p.add_argument("--n_test", default=None, type=int)
     p.add_argument("--data_norm", default="min_max", choices=["min_max", "original"])
@@ -203,7 +235,15 @@ def init_basics(args: argparse.Namespace) -> tuple[Config, object, SummaryWriter
         cfg.OPTIMIZATION.NUM_EPOCHS = args.epochs
     if args.batch_size is not None:
         cfg.train_batch_size = args.batch_size
-        cfg.test_batch_size = args.batch_size * 2
+        # Evaluation used to be forced to 2x the training batch with no way to
+        # override it. That silently doubled peak VRAM (K hypotheses per window,
+        # 10 sampling steps) and was a real OOM source; --eval_batch_size now
+        # wins, and the fallback no longer inflates the batch.
+        cfg.test_batch_size = (
+            args.eval_batch_size
+            if args.eval_batch_size is not None
+            else args.batch_size
+        )
     cfg.checkpt_freq = args.checkpt_freq
     cfg.max_num_ckpts = args.max_num_ckpts
 
@@ -268,25 +308,27 @@ def build_data_loaders(cfg, args):
     train_dset = SDDGlobalDataset(training=True, split="train", **common)
     test_dset = SDDGlobalDataset(training=False, split="test", **common)
 
-    # Note: num_workers=0 keeps the per-worker feature mmap unique to the
-    # main process — multi-worker would duplicate the (already mmap'd) .npy
-    # buffers in RAM.  Acceptable tradeoff for SDD where annotation parsing
-    # is cheap and the bottleneck is GPU forward pass, not data loading.
+    # num_workers is clamped (see utils.memory.resolve_num_workers): a forked
+    # worker carries its own copy of the window index AND its own feature
+    # mapping, so worker count multiplies RAM. 0 keeps the feature mmap unique
+    # to the main process. pin_memory is exposed because pinned pages are
+    # unswappable and were part of a host-freeze signature.
+    pin = bool(args.pin_memory)
     train_loader = DataLoader(
         train_dset,
         batch_size=cfg.train_batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=resolve_num_workers(args.num_workers),
         collate_fn=collate_sdd_global,
-        pin_memory=True,
+        pin_memory=pin,
     )
     test_loader = DataLoader(
         test_dset,
         batch_size=cfg.test_batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=resolve_num_workers(args.num_workers),
         collate_fn=collate_sdd_global,
-        pin_memory=True,
+        pin_memory=pin,
     )
     return train_loader, test_loader
 
@@ -323,6 +365,10 @@ def main() -> None:
         trainer.test(mode="best", eval_on_train=args.eval_on_train)
     else:
         trainer.train()
+    # Training evaluates on 8 scenes' worth of windows per epoch; release the
+    # cached CUDA blocks and any residual cycles so the process exits without
+    # holding VRAM/RAM (matters when several runs share one GPU).
+    free_memory()
 
 
 if __name__ == "__main__":

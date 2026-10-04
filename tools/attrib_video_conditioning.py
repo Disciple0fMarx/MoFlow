@@ -56,6 +56,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from typing import Sequence
 
 # Allow running as a plain script (`python tools/attrib_video_conditioning.py`)
 # from anywhere: the script's own directory is tools/, but the project imports
@@ -81,7 +82,10 @@ from models.backbone_eth_ucy import ETHMotionTransformer
 from models.flow_matching import FlowMatcher
 from tools.visualize_trajectory_comparison import load_checkpoint_state
 from utils.config import Config
+from utils.memory import (MAX_NUM_WORKERS, free_memory, resolve_num_workers,
+                          run_with_oom_split)
 from utils.normalization import unnormalize_min_max
+from video_encoder.sdd_adapter import release_lookup_cache
 
 CONDITIONS: tuple[str, ...] = ("baseline", "zeroed", "permuted")
 
@@ -151,6 +155,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Max batches to process (None = all).",
     )
     p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help=(
+            "DataLoader workers. Clamped to [0, %d]; 0 (default) loads in the "
+            "main process so the feature mmap and window index are not "
+            "duplicated per worker. Raise only if profiling shows a stall."
+        )
+        % MAX_NUM_WORKERS,
+    )
+    p.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Pin host memory for faster H2D copies. Pinned pages are "
+            "unswappable, so on a memory-tight host pass --no-pin-memory to "
+            "avoid starving the page cache (a cause of hard freezes)."
+        ),
+    )
+    p.add_argument(
+        "--gc-every",
+        type=int,
+        default=25,
+        help="Free memory every N evaluation batches (0 disables).",
+    )
+    p.add_argument(
+        "--min-batch-size",
+        type=int,
+        default=1,
+        help="Lower bound when an OOM forces a batch to be split in halves.",
+    )
+    p.add_argument(
+        "--no-auto-batch-split",
+        action="store_true",
+        help=(
+            "Fail on CUDA OOM instead of retrying the batch in halves. The "
+            "default keeps a long sweep alive when one batch does not fit."
+        ),
+    )
     p.add_argument("--out", default="report/cvxp_attrib", help="Output stem.")
     p.add_argument("--use-ema", action="store_true", help="Load EMA weights.")
     p.add_argument("--seed", type=int, default=0)
@@ -171,6 +216,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = p.parse_args(argv)
     return args
+
+
+def _slice_batch(batch: dict, row_idx: Sequence[int]) -> dict:
+    """Row-subset a collated batch, preserving the collate contract.
+
+    Used by the OOM-halving path: entries whose leading dimension equals the
+    batch size are indexed along dim 0 (tensors, and the per-window lists of
+    ``scene`` / ``video_id``), everything else is carried over unchanged and
+    ``batch_size`` is rewritten to the sub-batch length.
+    """
+    rows = list(row_idx)
+    bs = int(batch.get("batch_size", 0) or 0)
+    contiguous = bool(rows) and rows == list(range(rows[0], rows[0] + len(rows)))
+    lo, hi = (rows[0], rows[-1] + 1) if contiguous else (0, 0)
+    out: dict = {}
+    for key, val in batch.items():
+        if key == "batch_size":
+            out[key] = len(rows)
+        elif torch.is_tensor(val) and bs and val.ndim >= 1 and val.shape[0] == bs:
+            out[key] = val[lo:hi] if contiguous else val[torch.as_tensor(rows)]
+        elif isinstance(val, list) and bs and len(val) == bs:
+            out[key] = val[lo:hi] if contiguous else [val[i] for i in rows]
+        else:
+            out[key] = val
+    return out
 
 
 def _permuted(real: torch.Tensor, use_rng_shuffle: bool = True) -> torch.Tensor:
@@ -326,11 +396,12 @@ def main(argv: list[str] | None = None) -> None:
         batch_size=args.batch_size,
         shuffle=False,
         # num_workers=0 keeps the per-worker feature mmap unique to the main
-        # process (same rationale as fm_sdd_global.py); multi-worker doubles
-        # the mmap'd feature buffers in RAM for no measurable throughput here.
-        num_workers=0,
+        # process (same rationale as fm_sdd_global.py); multi-worker duplicates
+        # the dataset index AND the feature mapping per worker, multiplying RAM.
+        # Overridable but hard-clamped to [0, MAX_NUM_WORKERS].
+        num_workers=resolve_num_workers(getattr(args, "num_workers", None)),
         collate_fn=collate_sdd_global,
-        pin_memory=True,
+        pin_memory=bool(getattr(args, "pin_memory", True)),
     )
     print(
         f"[cvxp] dataset={args.split} held_out={args.held_out_scene} "
@@ -409,43 +480,69 @@ def main(argv: list[str] | None = None) -> None:
 
     batches = 0
     skipped_batches = 0
+    last_preds: dict[str, np.ndarray] = {}
     for b in loader:
         if b.get("z_video_global") is None:
             skipped_batches += 1
             print("[cvxp] batch has no z_video_global (sentinel) — skipping")
             continue
-        z_real = b["z_video_global"].to(device)  # [B, D_raw]
-        X = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in b.items()}
+        # NOTE: no full-batch .to(device) copy here — _sample_rows moves only the
+        # sub-chunk it needs, so the OOM-halving path never materialises a device
+        # copy of the batch that is about to be split.
+        bs = int(b.get("batch_size", 0) or 0)
+        rows = list(range(bs))
 
-        preds: dict[str, np.ndarray | None] = {}
-        for cond in sample_conditions:
-            Xc_ = dict(X)
-            if cond == "zeroed":
-                z = torch.zeros_like(z_real)
-            elif cond == "permuted":
-                z = _permuted(z_real, use_rng_shuffle=not args.no_shuffle_permute)
-            else:
-                z = z_real
-            Xc_["z_video_global"] = z
-            # Reset the RNG to a fixed seed before every sample so the three
-            # conditions draw IDENTICAL initial noise (FlowMatcher.sample uses
-            # the global torch RNG at y_t ~ N(0,I)). The only thing that varies
-            # across arms is then z_video_global — trajectory differences become
-            # a clean measure of video influence, not sampling noise.
-            torch.manual_seed(args.seed)
-            np.random.seed(args.seed)
+        def _sample_rows(row_idx: Sequence[int]) -> dict[str, np.ndarray]:
+            chunk = _slice_batch(b, row_idx)
+            X = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in chunk.items()}
+            z_chunk = X["z_video_global"]
+            out: dict[str, np.ndarray] = {}
+            # no_grad spans sampling AND post-processing: nothing produced here
+            # may keep an autograd graph alive (a leak across 128 sweep cells).
             with torch.no_grad():
-                pred_traj, *_ = denoiser.sample(
-                    Xc_, num_trajs=cfg.denoising_head_preds, return_all_states=False
-                )
-            # [B, K, A, F*D] -> [B*A, K, F, 2] in original scale (min_max)
-            pred_traj = rearrange(
-                pred_traj, "b k a (f d) -> (b a) k f d", f=cfg.future_frames
-            )[..., :2]
-            pred_traj = unnormalize_min_max(
-                pred_traj, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1
+                for cond in sample_conditions:
+                    Xc_ = dict(X)
+                    if cond == "zeroed":
+                        z = torch.zeros_like(z_chunk)
+                    elif cond == "permuted":
+                        z = _permuted(
+                            z_chunk, use_rng_shuffle=not args.no_shuffle_permute
+                        )
+                    else:
+                        z = z_chunk
+                    Xc_["z_video_global"] = z
+                    # Reset the RNG to a fixed seed before every sample so the three
+                    # conditions draw IDENTICAL initial noise (FlowMatcher.sample uses
+                    # the global torch RNG at y_t ~ N(0,I)). The only thing that varies
+                    # across arms is then z_video_global — trajectory differences become
+                    # a clean measure of video influence, not sampling noise.
+                    torch.manual_seed(args.seed)
+                    np.random.seed(args.seed)
+                    pred_traj, *_ = denoiser.sample(
+                        Xc_, num_trajs=cfg.denoising_head_preds, return_all_states=False
+                    )
+                    # [B, K, A, F*D] -> [B*A, K, F, 2] in original scale (min_max)
+                    pred_traj = rearrange(
+                        pred_traj, "b k a (f d) -> (b a) k f d", f=cfg.future_frames
+                    )[..., :2]
+                    pred_traj = unnormalize_min_max(
+                        pred_traj, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1
+                    )
+                    out[cond] = pred_traj.detach().cpu().numpy()
+                    del pred_traj, Xc_
+            del X, chunk
+            return out
+
+        if args.no_auto_batch_split:
+            preds = _sample_rows(rows)
+        else:
+            # An oversized batch halves itself instead of aborting the sweep.
+            preds = run_with_oom_split(
+                _sample_rows,
+                rows,
+                min_chunk=max(1, int(getattr(args, "min_batch_size", 1) or 1)),
+                label="sample",
             )
-            preds[cond] = pred_traj.detach().cpu().numpy()
 
         # ground truth [B, A, F, 2] -> [B*A, F, 2] original scale
         fut_gt = rearrange(b["fut_traj_original_scale"], "b a f d -> (b a) f d").numpy()
@@ -524,14 +621,30 @@ def main(argv: list[str] | None = None) -> None:
             )
 
         batches += 1
+        # ``last_preds`` survives the loop: the .npy stacks exported below are
+        # the final batch's predictions (existing contract). Dropping the
+        # per-batch reference immediately keeps only one batch alive instead of
+        # accumulating every batch's arrays.
+        last_preds = preds
+        del preds, fut_gt, b
         if args.n_batches is not None and batches >= args.n_batches:
             break
-        if batches and batches % 5 == 0:
+        # Explicit reclaim: CUDA caching blocks and cyclic references otherwise
+        # survive for the whole cell, which is what turned a 128-cell sweep into
+        # a host OOM freeze.
+        gc_every = int(getattr(args, "gc_every", 0) or 0)
+        if gc_every and batches % gc_every == 0:
+            free_memory()
+        if batches % 5 == 0:
             print(f"[cvxp] processed {batches} batches")
     print(
         f"[cvxp] batches processed={batches} skipped={skipped_batches} "
         f"per-window rows={len(window_rows)}"
     )
+    # Unmap every scene's feature cache and drop CUDA blocks before the caller
+    # reuses this process (or exits) — keeps peak RSS bounded per cell.
+    release_lookup_cache()
+    free_memory()
 
     # --/-- per-window isolation guarantee ---------------------------------
     # The per-window CSV is the Q5/Q7 evidence file. If --per-window was
@@ -539,9 +652,7 @@ def main(argv: list[str] | None = None) -> None:
     # would silently produce a "missing windows file" downstream (script 04
     # aggregation). Fail loudly with the actual cause instead.
     _assert_per_window_records(args, batches, skipped_batches, window_rows)
-    _assert_attribution_contributed(
-        batches, skipped_batches, agg, run_conditions
-    )
+    _assert_attribution_contributed(batches, skipped_batches, agg, run_conditions)
 
     # ---- aggregate + persist ---------------------------------------------
     rows = []
@@ -581,8 +692,9 @@ def main(argv: list[str] | None = None) -> None:
         w.writerows(rows)
     # per-condition prediction stacks for downstream statistical testing
     for cond in run_conditions:
-        if batches and preds.get(cond) is not None:
-            np.save(out_path.with_name(f"{out_path.stem}_{cond}.npy"), preds[cond])
+        if batches and last_preds.get(cond) is not None:
+            np.save(out_path.with_name(f"{out_path.stem}_{cond}.npy"), last_preds[cond])
+    last_preds = {}
     with open(out_path.with_suffix(".json"), "w") as f:
         json.dump(rows, f, indent=2)
     print(f"[cvxp] wrote {out_path}.csv/.json (+ _<condition>.npy stacks)")

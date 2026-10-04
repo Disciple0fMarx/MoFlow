@@ -29,7 +29,7 @@ source "${DIR}/00_common.sh"
 LABEL="q1-zvid-attribution"
 SCENE=""
 N_BATCHES=""
-BATCH_SIZE=64
+BATCH_SIZE="${BATCH_SIZE:-64}"   # env-tunable memory knob (see 00_common.sh)
 CONDITIONS=(baseline zeroed permuted)
 USE_EMA=""
 

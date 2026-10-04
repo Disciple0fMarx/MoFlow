@@ -35,7 +35,7 @@ LABEL="q2-transfer"
 SCENE=""
 TRAIN_SCENE=""
 N_BATCHES="3"    # quick by default: 3 batches per cell completes fast
-BATCH_SIZE=64
+BATCH_SIZE="${BATCH_SIZE:-64}"   # env-tunable memory knob (see 00_common.sh)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

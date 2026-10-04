@@ -84,6 +84,22 @@ vid_out_suffix() {
 export CUDA_VISIBLE_DEVICES
 
 # ---------------------------------------------------------------------------
+# Memory / allocator environment
+# ---------------------------------------------------------------------------
+# expandable_segments lets the CUDA caching allocator grow virtual pages without
+# pinning physical ones, which sharply reduces fragmentation-driven OOM across
+# many short-lived processes (the 8x8 sweep runs 128 of them).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# glibc creates up to 8*ncores malloc arenas per process; each holds freed
+# blocks hostage. Capping to 2 keeps RSS close to the live set.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+# Long sweeps: keep going when one cell dies of OOM (logged + skipped) instead of
+# aborting 127 healthy cells. Set CONTINUE_ON_OOM=0 for strict fail-fast.
+CONTINUE_ON_OOM="${CONTINUE_ON_OOM:-1}"
+# Eval batch size for the attribution tools (the memory knob for Q1/Q2/Q4).
+BATCH_SIZE="${BATCH_SIZE:-64}"
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -177,6 +193,9 @@ ensure_feature_list() {
 }
 
 # usage: run_py <label> <logfile> -- args...   -> runs the project python
+# With CONTINUE_ON_OOM=1 (default) a cell that dies of an out-of-memory error is
+# logged and SKIPPED instead of aborting the whole sweep; any other failure is
+# still fatal. Every attempt's output is appended to the log for auditing.
 run_py() {
     local label="$1" logfile="$2"
     shift 2
@@ -186,11 +205,29 @@ run_py() {
         log_to "$logfile" INFO "[${label}] (dry-run — command not executed)"
         return 0
     fi
-    if ! (cd "$REPO_ROOT" && "$PYTHON_BIN" "$@"); then
-        log_to "$logfile" ERROR "[${label}] command failed (rc=$?)"
-        exit 5
+    local out rc=0 mark
+    mark="$(wc -l < "$logfile")"
+    set +e
+    (cd "$REPO_ROOT" && "$PYTHON_BIN" "$@") 2>&1 | tee -a "$logfile"
+    rc="${PIPESTATUS[0]}"
+    set -e
+    if ((rc == 0)); then
+        log_to "$logfile" INFO "[${label}] OK"
+        return 0
     fi
-    log_to "$logfile" INFO "[${label}] OK"
+    # Only this run's output is inspected for an OOM signature (the log may
+    # already contain older text). rc=137 is 128+SIGKILL and rc=9 is SIGKILL:
+    # the host OOM killer fires exactly like that and leaves NO traceback, so the
+    # exit status has to be part of the test.
+    if ((CONTINUE_ON_OOM == 1)) \
+        && { ((rc == 137 || rc == 9)) \
+            || tail -n "+$((mark + 1))" "$logfile" \
+                | grep -qiE "out of memory|cuda oom|oom-kill|cannot allocate|killed"; }; then
+        log_to "$logfile" ERROR "[${label}] SKIPPED (rc=${rc}): out-of-memory / killed — continuing (CONTINUE_ON_OOM=1). Re-run this cell alone with a smaller --batch-size."
+        return 0
+    fi
+    log_to "$logfile" ERROR "[${label}] command failed (rc=${rc})"
+    exit 5
 }
 
 # Write a provenance file describing how a report was produced (audit trail).

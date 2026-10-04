@@ -30,6 +30,7 @@ from ema_pytorch import EMA
 from tqdm.auto import tqdm
 
 from utils.utils import set_random_seed
+from utils.memory import free_memory
 from utils.normalization import unnormalize_min_max, unnormalize_sqrt
 
 
@@ -459,6 +460,10 @@ class Trainer(object):
             fut_traj_gt, _, _ = self.eval_dataloader(training_err_check=True)
         else:
             fut_traj_gt, _, _ = self.eval_dataloader(testing_mode=True)
+        # Explicit reclaim at the eval boundary: this pass touches every test
+        # window, and CUDA caching blocks plus cyclic references otherwise
+        # survive into the next epoch / next run and accumulate.
+        free_memory()
         self.logger.info(f'testing complete with the {mode} ckpt')
 
 
