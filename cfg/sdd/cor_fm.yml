@@ -81,7 +81,14 @@ k_preds                      : 20
 
 # ------------------------------- Optimizer Parameters ---------------------------------
 train_batch_size             : 128
-test_batch_size              : 1024
+# Evaluation samples denoising_head_preds (20) hypotheses per window for
+# sampling_steps (10) forward passes, so its activation footprint is ~2 orders
+# of magnitude above training. The old 1024 was 8x the train batch and was the
+# peak-VRAM OOM source: the trainer's eval loop CATCHES per-batch OOM and skips
+# the batch, so an oversized eval "succeeds" while quietly dropping windows
+# (metrics then carry partial=1). 256 keeps a 2x margin over training and
+# finishes the full test split without skipped batches.
+test_batch_size              : 256
 
 OPTIMIZATION:
     NUM_EPOCHS: 150

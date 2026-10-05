@@ -35,6 +35,12 @@ SCENE=""
 TRAIN_ONLY=0
 EVAL_ONLY=0
 MODES="off static full"
+# Memory knobs, forwarded to fm_sdd_global.py for both the train and eval
+# subprocesses. Empty = use cfg/sdd/cor_fm.yml (train 128 / test 256).
+TRAIN_BS=""
+EVAL_BS=""
+NUM_WORKERS=""
+PIN_MEM=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,10 +49,20 @@ while [[ $# -gt 0 ]]; do
         --eval-only) EVAL_ONLY=1; shift ;;
         --modes) MODES="$2"; shift 2 ;;
         --video-id) VIDEO_ID="$2"; shift 2 ;;
+        --batch-size) TRAIN_BS="$2"; EVAL_BS="$2"; shift 2 ;;
+        --eval-batch-size) EVAL_BS="$2"; shift 2 ;;
+        --num-workers) NUM_WORKERS="$2"; shift 2 ;;
+        --no-pin-memory) PIN_MEM="--no-pin_memory"; shift ;;
         --dry-run) RESEARCH_DRY_RUN=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 3 ;;
     esac
 done
+
+mem_args=()
+[[ -n "$TRAIN_BS" ]] && mem_args+=(--batch_size "$TRAIN_BS")
+[[ -n "$EVAL_BS" ]] && mem_args+=(--eval_batch_size "$EVAL_BS")
+[[ -n "$NUM_WORKERS" ]] && mem_args+=(--num_workers "$NUM_WORKERS")
+[[ -n "$PIN_MEM" ]] && mem_args+=("$PIN_MEM")
 build_video_args
 if ((TRAIN_ONLY && EVAL_ONLY)); then
     echo "[${LABEL}] ERROR: --train-only and --eval-only are mutually exclusive." >&2
@@ -83,7 +99,7 @@ for scene in $(loso_scenes "$LABEL" "$SCENE"); do
                 --video_features_root "$FEATURES_ROOT" \
                 --fix_random_seed --seed "$SEED" \
                 --sampling_steps "$SAMPLING_STEPS" \
-                "${video_args[@]}"
+                "${mem_args[@]}" "${video_args[@]}"
         fi
         if ((TRAIN_ONLY != 1)); then
             run_py "eval:${scene}/${mode}" "$LOG" \
@@ -96,7 +112,7 @@ for scene in $(loso_scenes "$LABEL" "$SCENE"); do
                 --fix_random_seed --seed "$SEED" \
                 --sampling_steps "$SAMPLING_STEPS" \
                 --eval \
-                "${video_args[@]}"
+                "${mem_args[@]}" "${video_args[@]}"
         fi
     done
 done
