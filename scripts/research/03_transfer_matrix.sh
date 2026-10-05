@@ -114,15 +114,20 @@ def cell(train, eval, variant):
                 return float(r["ade_min"])
     return None
 
+# The aggregate matrices must carry OUTSUF too: the per-cell CSVs are suffixed,
+# but these two were not, so a --video-id run silently overwrote the
+# geographic-LOSO 8x8 matrices the supervisor's Q2 answer depends on.
+outsuf = os.environ.get("OUTSUF", "")
+
 # ADE matrix (ade_min of 'full' checkpoint)
-with open(os.path.join(os.environ["RESEARCH_ROOT"], "q2", "q2_transfer_ade.csv"), "w", newline="") as f:
+with open(os.path.join(os.environ["RESEARCH_ROOT"], "q2", f"q2_transfer_ade{outsuf}.csv"), "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["train_held_out"] + cols)
     for t in rows:
         w.writerow([t] + ["" if cell(t, c, "full") is None else f"{cell(t, c, 'full'):.4f}" for c in cols])
 
 # GAIN matrix: ADE(novid) - ADE(full)  -> positive = video helps
-with open(os.path.join(os.environ["RESEARCH_ROOT"], "q2", "q2_transfer_gain.csv"), "w", newline="") as f:
+with open(os.path.join(os.environ["RESEARCH_ROOT"], "q2", f"q2_transfer_gain{outsuf}.csv"), "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["train_held_out"] + cols)
     for t in rows:
@@ -132,7 +137,7 @@ with open(os.path.join(os.environ["RESEARCH_ROOT"], "q2", "q2_transfer_gain.csv"
             b = cell(t, c, "full")
             gains.append("" if (a is None or b is None) else f"{a - b:+.4f}")
         w.writerow([t] + gains)
-print("[q2] wrote q2_transfer_ade.csv and q2_transfer_gain.csv")
+print(f"[q2] wrote q2_transfer_ade{outsuf}.csv and q2_transfer_gain{outsuf}.csv")
 PYEOF
 fi
 log_to "$LOG" INFO "Q2 complete. reports in ${OUTDIR}"

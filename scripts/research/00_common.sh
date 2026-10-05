@@ -234,6 +234,11 @@ run_py() {
 write_provenance() {
     local outdir="$1" script="$2"
     mkdir -p "$outdir"
+    # Two angles (geographic + --video-id) write into the SAME report dir, so a
+    # single PROVENANCE.md would be overwritten by the second run and the VIDEO_ID
+    # line would no longer describe the sibling CSVs sitting next to it. Keep one
+    # file per angle; the unsuffixed name is still written for single-angle runs.
+    local prov="${outdir}/PROVENANCE${VIDEO_ID:+_${VIDEO_ID}}.md"
     local git_sha="unknown"
     if (command -v git >/dev/null && cd "$REPO_ROOT" && git rev-parse --short HEAD) >/dev/null 2>&1; then
         git_sha="$(cd "$REPO_ROOT" && git rev-parse --short HEAD)"
@@ -251,5 +256,8 @@ write_provenance() {
         echo "- FEATURES_ROOT: ${FEATURES_ROOT}"
         echo "- RESULTS_ROOT: ${RESULTS_ROOT}"
         echo "- VIDEO_ID:  ${VIDEO_ID:-all}"
-    } > "$outdir/PROVENANCE.md"
+    } > "$prov"
+    if [[ -n "$VIDEO_ID" ]]; then
+        cp -f "$prov" "${outdir}/PROVENANCE.md"
+    fi
 }

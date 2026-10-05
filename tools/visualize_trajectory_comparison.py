@@ -866,7 +866,12 @@ def run_scene(scene: str, args: argparse.Namespace) -> Path | None:
     else:
         units = "m"
 
-    save_path = out_dir / f"{scene}_trajectory_comparison.png"
+    # The window index MUST be in the filename: 04_gain_geometry.sh renders the
+    # top-K AND bottom-K gain windows of a scene into the same --out-dir, so a
+    # scene-only name made every render overwrite the previous one and only the
+    # last window survived as "evidence".
+    win_idx = int(getattr(args, "window_index", 0) or 0)
+    save_path = out_dir / f"{scene}_w{win_idx:04d}_trajectory_comparison.png"
     plot_trajectory_comparison(
         obs,
         gt,
