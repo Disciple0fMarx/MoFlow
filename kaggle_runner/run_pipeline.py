@@ -44,7 +44,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 REPO_URL = os.environ.get("MF_REPO_URL", "https://github.com/Disciple0fMarx/MoFlow.git")
 REPO_BRANCH = os.environ.get("MF_REPO_BRANCH", "feature/sdd-phase1-refactor")
-KAGGLE_SDD_ROOT = Path("/kaggle/input/stanford-drone-dataset")
+KAGGLE_INPUT = Path("/kaggle/input")
 KAGGLE_WORK = Path("/kaggle/working")
 REPO_DIR = KAGGLE_WORK / "MoFlow"
 
@@ -71,22 +71,72 @@ def die(msg: str) -> None:
 # ---------------------------------------------------------------------------
 # Environment bootstrap
 # ---------------------------------------------------------------------------
-def check_env() -> None:
-    if not Path("/kaggle").exists():
-        die("Not running inside a Kaggle kernel (/kaggle missing).")
-    if not KAGGLE_SDD_ROOT.is_dir():
-        die(f"Dataset not mounted at {KAGGLE_SDD_ROOT}. Check kernel-metadata.json dataset_sources.")
-    ann = KAGGLE_SDD_ROOT / "annotations"
-    vid = KAGGLE_SDD_ROOT / "videos"
-    if not ann.is_dir() or not vid.is_dir():
-        die(f"Expected {KAGGLE_SDD_ROOT}/{{annotations,videos}}: got ann={ann.is_dir()} vid={vid.is_dir()}")
+def discover_sdd_root() -> Path:
+    """Locate the mounted SDD dataset under /kaggle/input.
+
+    Kaggle mounts a ``dataset_sources`` entry at a path whose spelling depends
+    on the dataset/version; the bare-slug form (``/kaggle/input/<slug>``) is
+    common but several mirrors appear under ``/kaggle/input/datasets/<owner>/<slug>``.
+    We therefore scan /kaggle/input for a directory containing an ``annotations/``
+    dir AND a ``videos/`` dir AND an ``annotations/<scene>/<video>/annotations.txt``
+    sample — the definitive SDD layout signature. Explicit overrides via
+    ``MF_SDD_ROOT`` still win.
+    """
+    explicit = os.environ.get("MF_SDD_ROOT")
+    if explicit:
+        p = Path(explicit)
+        if (p / "annotations").is_dir() and (p / "videos").is_dir():
+            return p
+        raise RuntimeError(f"MF_SDD_ROOT set but missing annotations/videos: {p}")
+
+    if not KAGGLE_INPUT.exists():
+        raise RuntimeError("/kaggle/input not found — not running in Kaggle")
+
+    # (a) the bare slug the metadata _should_ produce
+    for cand in (KAGGLE_INPUT / "stanford-drone-dataset",
+                 KAGGLE_INPUT / "brendanalvey/stanford-drone-dataset",
+                 KAGGLE_INPUT / "datasets/stanford-drone-dataset",
+                 KAGGLE_INPUT / "datasets/brendanalvey/stanford-drone-dataset"):
+        if (cand / "annotations").is_dir() and (cand / "videos").is_dir():
+            return cand
+
+    # (b) fallback: any subdir (2 levels deep) that carries the layout signature
+    for level in (KAGGLE_INPUT.iterdir(), KAGGLE_INPUT.glob("*/")):
+        for d in sorted(level if isinstance(level, list) else level):
+            if not d.is_dir():
+                continue
+            if (d / "annotations").is_dir() and (d / "videos").is_dir():
+                return d
+            for sub in sorted(d.iterdir()):
+                if (sub / "annotations").is_dir() and (sub / "videos").is_dir():
+                    return sub
+        break
+    raise RuntimeError(
+        f"No SDD dataset layout (annotations/ + videos/) found under {KAGGLE_INPUT}. "
+        "Check kernel-metadata.json dataset_sources."
+    )
+
+
+def check_env() -> Path:
+    try:
+        sdd_root = discover_sdd_root()
+    except RuntimeError as exc:
+        die(str(exc))
+    log(f"SDD dataset resolved to {sdd_root}")
+    ann = sdd_root / "annotations"
+    vid = sdd_root / "videos"
     scenes = sorted(p.name for p in vid.iterdir() if p.is_dir())
     log(f"Dataset OK: {len(scenes)} scenes under {vid}: {scenes}")
+    sample = next((p for p in ann.rglob("annotations.txt")), None)
+    if sample is None:
+        die("No annotations.txt found under the dataset — wrong mount?")
+    log(f"Annotation sample: {sample}")
     if not shutil.which("nvidia-smi"):
         log("WARNING: nvidia-smi not found — GPU may be unavailable.", "WARN")
     else:
         subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"],
                        check=False)
+    return sdd_root
 
 
 def install_deps() -> None:
@@ -130,10 +180,10 @@ def clone_repo() -> None:
 # ---------------------------------------------------------------------------
 # Pipeline drivers
 # ---------------------------------------------------------------------------
-def build_env() -> dict:
+def build_env(sdd_root: Path) -> dict:
     env = dict(os.environ)
     env.update({
-        "SDD_ROOT": str(KAGGLE_SDD_ROOT),
+        "SDD_ROOT": str(sdd_root),
         "PYTHON_BIN": sys.executable,
         "CUDA_VISIBLE_DEVICES": "0",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -183,10 +233,10 @@ def main() -> None:
     log(f"PIPELINE_SCOPE={PIPELINE_SCOPE} SCENE={SCENE or 'all'} "
         f"VIDEO_ID={VIDEO_ID or '(angle default)'} N_BATCHES={N_BATCHES} "
         f"BATCH_SIZE={BATCH_SIZE} TOP_K={TOP_K}")
-    check_env()
+    sdd_root = check_env()
     clone_repo()
     install_deps()
-    env = build_env()
+    env = build_env(sdd_root)
 
     if PIPELINE_SCOPE in ("full", "encode", "angle1", "angle2"):
         run_script("00_reencode_features.sh", "--scene " + SCENE if SCENE else "", env)
