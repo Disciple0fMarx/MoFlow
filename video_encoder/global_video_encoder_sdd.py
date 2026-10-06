@@ -58,6 +58,7 @@ from .sdd_adapter import (
     COL_YMIN,
     DEFAULT_SDD_ROOT,
     expand_sdd_root,
+    find_video_path,
     video_mov_path,
 )
 
@@ -338,8 +339,15 @@ class SDDGlobalVideoEncoder:
         feats_by_key: dict[tuple[str, int], np.ndarray] = {}
         for video_id in sorted(needed_by_video):
             wanted = set(int(f) for f in needed_by_video[video_id])
-            vid_path = video_mov_path(root, scene, video_id)
-            if not vid_path.exists():
+            # Resolve VIA find_video_path, NOT the fixed video_mov_path: Kaggle
+            # mirrors mount under *different* layouts (videos/ vs video/,
+            # .mov vs .mp4). find_video_path scans layouts AND extensions, so a
+            # "/kaggle"-rooted dataset like brendanalvey/stanford-drone-dataset
+            # (videos/<scene>/<id>/video.mov) resolves here too.
+            vid_path = find_video_path(root, scene, video_id) or video_mov_path(
+                root, scene, video_id
+            )
+            if vid_path is None or not vid_path.exists():
                 print(f"[sdd-encode] {scene}/{video_id}: missing video {vid_path}, skipping")
                 continue
 
