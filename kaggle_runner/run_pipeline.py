@@ -58,9 +58,36 @@ SEED = os.environ.get("SEED", "42")
 SAMPLING_STEPS = os.environ.get("SAMPLING_STEPS", "10")
 
 
+# ---------------------------------------------------------------------------
+# Logging (console + durable file so a SIGKILL still leaves a transcript)
+# ---------------------------------------------------------------------------
+LOG_FILE = Path(os.environ.get(
+    "MF_LOG_FILE", str(KAGGLE_WORK / "pipeline.log")))
+_log_fh = None
+
+
+def _ensure_log_fh():
+    global _log_fh
+    if _log_fh is None:
+        try:
+            KAGGLE_WORK.mkdir(parents=True, exist_ok=True)
+            _log_fh = open(LOG_FILE, "a")
+        except Exception:
+            _log_fh = None
+
+
 def log(msg: str, level: str = "INFO") -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"[{ts}] {level} {msg}", flush=True)
+    line = f"[{ts}] {level} {msg}"
+    print(line, flush=True)
+    _ensure_log_fh()
+    if _log_fh is not None:
+        try:
+            _log_fh.write(line + "\n")
+            _log_fh.flush()
+            os.fsync(_log_fh.fileno())
+        except Exception:
+            pass
 
 
 def die(msg: str) -> None:
@@ -140,26 +167,28 @@ def check_env() -> Path:
 
 
 def install_deps() -> None:
-    """Install the project deps the Kaggle image lacks, WITHOUT pinning.
+    """Install the project deps the Kaggle image lacks, WITHOUT pinning/upgrade.
 
     The image (py3.13) already ships modern torch, numpy, matplotlib, scipy,
     PyYAML, tqdm, pandas — pinning those to the lab's versions (numpy==2.2.4,
-    matplotlib==3.8.3) creates pip resolution conflicts with the image's torch.
-    Only install the pure-python deps requirements.txt declares that the image
-    may not have, letting pip pick compatible versions.
+    matplotlib==3.8.3) creates pip resolution conflicts with the image's torch,
+    and ``--upgrade`` risks churning the image's pinned stack mid-session.
+    We install only the pure-python deps requirements.txt declares that the
+    image may not have, letting pip keep satisfying versions already present.
     """
     log("Installing Python deps (keeping image torch/numpy/matplotlib)...")
     project_only = [
         "accelerate", "easydict", "einops", "ema_pytorch", "GitPython",
         "tensorboardX",
     ]
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
-           "--upgrade", *project_only]
+    cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+           "--no-input", "--no-warn-script-location", *project_only]
     log("pip install: " + " ".join(cmd))
     subprocess.run(cmd, check=True)
     # Media + IO extras the image may not have.
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+        [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+         "--no-input", "--no-warn-script-location",
          "decord", "opencv-python-headless", "pyarrow", "pillow"],
         check=True,
     )
@@ -257,4 +286,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    log("Script started.", "BOOT")
+    try:
+        main()
+    except BaseException as exc:  # noqa: BLE001
+        log(f"FATAL {type(exc).__name__}: {exc}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        try:
+            (KAGGLE_WORK / "FATAL.txt").write_text(
+                traceback.format_exc() + f"\n{type(exc).__name__}: {exc}\n")
+        except Exception:
+            pass
+        sys.exit(1)
+    else:
+        log("main() returned cleanly.")
