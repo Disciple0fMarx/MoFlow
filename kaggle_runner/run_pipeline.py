@@ -140,17 +140,21 @@ def check_env() -> Path:
 
 
 def install_deps() -> None:
-    """Install project deps WITHOUT forcing the Kaggle image's torch version."""
-    log("Installing Python deps (keeping image torch)...")
-    reqs = REPO_DIR / "requirements.txt"
-    filtered = (
-        line.strip()
-        for line in reqs.read_text().splitlines()
-        if line.strip() and not line.strip().startswith("#")
-        and not line.strip().lower().startswith("torch")
-    )
-    pinned = [line for line in filtered if "==" in line]
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", *pinned]
+    """Install the project deps the Kaggle image lacks, WITHOUT pinning.
+
+    The image (py3.13) already ships modern torch, numpy, matplotlib, scipy,
+    PyYAML, tqdm, pandas — pinning those to the lab's versions (numpy==2.2.4,
+    matplotlib==3.8.3) creates pip resolution conflicts with the image's torch.
+    Only install the pure-python deps requirements.txt declares that the image
+    may not have, letting pip pick compatible versions.
+    """
+    log("Installing Python deps (keeping image torch/numpy/matplotlib)...")
+    project_only = [
+        "accelerate", "easydict", "einops", "ema_pytorch", "GitPython",
+        "tensorboardX",
+    ]
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+           "--upgrade", *project_only]
     log("pip install: " + " ".join(cmd))
     subprocess.run(cmd, check=True)
     # Media + IO extras the image may not have.
