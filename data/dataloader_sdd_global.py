@@ -25,8 +25,9 @@ Coordinate handling:
   so the user is aware that predicted coords will be in pixel space.
 
 Hardcoded paths: resolved via :func:`video_encoder.sdd_adapter.expand_sdd_root`
-(Lab default ``/home/efrei_stage/Desktop/Datasets/SDD``; Kaggle mount
-auto-detected when ``/kaggle`` exists). Override per-run with ``--sdd_root``
+(Lab default ``/home/efrei_stage/Desktop/Datasets/SDD``; Kaggle mirror
+``/kaggle/input/stanford-drone-dataset``, same layout as the lab, auto-detected
+when ``/kaggle`` exists). Override per-run with ``--sdd_root``
 / ``cfg.MODEL.CONTEXT_ENCODER.SDD_ROOT``.
 """
 

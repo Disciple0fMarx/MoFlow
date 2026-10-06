@@ -1,27 +1,23 @@
 """SDD-specific adapter for the global video encoder (note §5.2).
 
-Dual-infrastructure environment matrix:
+The **single canonical layout** is shared by the Remote Lab Machine and the
+Kaggle mirror ``brendanalvey/stanford-drone-dataset`` (whose structure matches
+the lab exactly, so NO Kaggle-specific folder restructuring is required)::
 
-A. **Remote Lab Machine** (default / production — full multi-epoch training)::
-
-    /home/efrei_stage/Desktop/Datasets/SDD/
+    <sdd_root>/
         annotations/<scene>/<videoX>/annotations.txt  # TrackID,xmin,...,frame,...
         videos/<scene>/<videoX>/video.mov             # subdir ``videos/``, ext .mov
 
-B. **Kaggle** (compute proxy — VRAM profiling with dummy caches)::
-
-    /kaggle/input/datasets/aryashah2k/stanford-drone-dataset/
-        annotations/<scene>/<videoX>/annotations.txt
-        video/<scene>/<videoX>/video.mp4              # subdir ``video/``, ext .mp4
-
 Resolution order: explicit argument > Kaggle auto-detection > Lab default.
 All CLI parsers and function signatures default to the **Lab machine values**;
-Kaggle is handled via :func:`is_kaggle` auto-detection or explicit overrides.
+Kaggle is handled via :func:`is_kaggle` auto-detection or explicit overrides
+(the runner passes ``--sdd-root /kaggle/input/stanford-drone-dataset``).
 
 Raw-video resolution (:func:`find_video_path`) combines a fixed layout grid
 (``videos/`` vs ``video/``, ``.mov/.MOV/.mp4/.MP4/.avi/.AVI``) with a **live
 directory scan**, so annotation/video folder-name mismatches (``video0`` vs
-``0`` vs ``video_0``, zero-padding, casing) do not black-out crops.
+``0`` vs ``video_0``, zero-padding, casing) do not black-out crops. All
+variants resolve to the same native ``videos/…/video.mov`` layout when present.
 """
 
 from __future__ import annotations
@@ -54,7 +50,8 @@ SDD_SCENES: tuple[str, ...] = (
 # Environment matrix (defaults are the Remote Lab Machine values)
 # ---------------------------------------------------------------------------
 LAB_SDD_ROOT = Path("/home/efrei_stage/Desktop/Datasets/SDD")
-KAGGLE_SDD_ROOT = Path("/kaggle/input/datasets/aryashah2k/stanford-drone-dataset")
+# Kaggle mirror — SAME layout as the lab (annotations/ + videos/ + .mov).
+KAGGLE_SDD_ROOT = Path("/kaggle/input/stanford-drone-dataset")
 
 #: Signature-level default: the Remote Lab Machine root.
 DEFAULT_SDD_ROOT = LAB_SDD_ROOT
@@ -91,12 +88,10 @@ def expand_sdd_root(maybe_root: str | Path | None) -> Path:
     return Path(maybe_root).expanduser()
 
 
-#: Video subdirectory name per environment (Lab: ``videos/``, Kaggle: ``video/``).
+#: Video subdirectory name (single canonical layout; Kaggle mirrors it exactly).
 VIDEO_DIR_LAB = "videos"
-VIDEO_DIR_KAGGLE = "video"
-#: Video file extension per environment (Lab: ``.mov``, Kaggle: ``.mp4``).
+#: Video file extension per environment (single canonical layout).
 VIDEO_EXT_LAB = ".mov"
-VIDEO_EXT_KAGGLE = ".mp4"
 
 
 def scene_annotations_dir(sdd_root: Path, scene: str) -> Path:
@@ -104,17 +99,18 @@ def scene_annotations_dir(sdd_root: Path, scene: str) -> Path:
 
 
 def scene_videos_dir(sdd_root: Path, scene: str) -> Path:
-    subdir = VIDEO_DIR_KAGGLE if _is_kaggle_root(Path(sdd_root)) else VIDEO_DIR_LAB
+    subdir = VIDEO_DIR_LAB
     return Path(sdd_root) / subdir / scene
 
 
 def video_mov_path(sdd_root: Path, scene: str, video_id: str) -> Path:
     """Return the canonical raw-video path for a given (scene, video_id).
 
-    Lab layout: ``<sdd_root>/videos/<scene>/<video_id>/video.mov``;
-    Kaggle layout: ``<sdd_root>/video/<scene>/<video_id>/video.mp4``.
+    Layout: ``<sdd_root>/videos/<scene>/<video_id>/video.mov`` — identical on
+    the lab machine and the ``brendanalvey/stanford-drone-dataset`` Kaggle
+    mirror, so no environment-specific branch is needed.
     """
-    ext = VIDEO_EXT_KAGGLE if _is_kaggle_root(Path(sdd_root)) else VIDEO_EXT_LAB
+    ext = VIDEO_EXT_LAB
     return scene_videos_dir(sdd_root, scene) / video_id / f"video{ext}"
 
 

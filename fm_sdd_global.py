@@ -7,7 +7,7 @@ dataloader and CLI flags are SDD-specific.
 Dual-infrastructure defaults (see ``video_encoder.sdd_adapter``):
 the SDD root defaults to the Remote Lab Machine
 (`/home/efrei_stage/Desktop/Datasets/SDD`) and auto-switches to the Kaggle
-mount (`/kaggle/input/datasets/aryashah2k/stanford-drone-dataset`) when
+mirror (`/kaggle/input/stanford-drone-dataset`, same layout as the lab) when
 ``/kaggle`` exists. An explicit ``--sdd_root`` always wins.
 
 Usage on the remote lab machine:
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help=(
             "SDD dataset root. Default: the Remote Lab Machine root "
-            f"({DEFAULT_SDD_ROOT}); auto-switches to the Kaggle mount when "
+            f"({DEFAULT_SDD_ROOT}); auto-switches to the Kaggle mirror when "
             "/kaggle exists. An explicit value always wins."
         ),
     )
