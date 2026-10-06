@@ -1,6 +1,6 @@
 {
-  "id": "dhyaelbahri/moflow-sdd-definitive",
-  "title": "MoFlow SDD Definitive (both angles)",
+  "id": "dhyaelbahri/moflow-sdd-definitive-both-angles",
+  "title": "MoFlow SDD Definitive Both Angles",
   "code_file": "run_pipeline.py",
   "language": "python",
   "kernel_type": "script",
