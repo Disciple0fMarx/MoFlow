@@ -15,7 +15,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tools.visualize_trajectory_comparison import _load_norm_stats_cache
+from tools.visualize_trajectory_comparison import (
+    _load_norm_stats_cache,
+    _save_norm_stats_cache,
+)
 
 
 def _valid_cache(path: Path, offset: float = 0.0) -> None:
@@ -68,3 +71,29 @@ def test_empty_file_is_deleted_and_none_returned(tmp_path: Path) -> None:
     p.touch()
     assert _load_norm_stats_cache(p) is None
     assert not p.exists()
+
+
+def test_atomic_save_writes_readable_cache(tmp_path: Path) -> None:
+    """Regression: np.savez auto-appends .npz to names lacking it, so the temp
+    name must already end in .npz or os.replace dies with ENOENT."""
+    p = tmp_path / "_norm_stats_hobookstore.npz"
+    _save_norm_stats_cache(p, (1.0, 2.0, 3.0, 4.0))
+    assert p.exists()
+    # no stray temp file left behind, and no <name>.tmp.npz
+    leftovers = [f.name for f in tmp_path.iterdir()]
+    assert leftovers == [p.name]
+    data = np.load(p)
+    assert (float(data["past_min"]), float(data["past_max"])) == (1.0, 2.0)
+    assert (float(data["fut_min"]), float(data["fut_max"])) == (3.0, 4.0)
+
+
+def test_atomic_save_regenerates_over_corrupt_file(tmp_path: Path) -> None:
+    p = tmp_path / "cache.npz"
+    p.write_bytes(b"\x00garbage not a zip")
+    _save_norm_stats_cache(p, (0.0, 1.0, 2.0, 3.0))
+    assert _load_norm_stats_cache(p) == {
+        "past_min": 0.0,
+        "past_max": 1.0,
+        "fut_min": 2.0,
+        "fut_max": 3.0,
+    }

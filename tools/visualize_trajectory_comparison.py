@@ -432,6 +432,20 @@ def _build_cfg(scene: str, vid_status: str, args: argparse.Namespace) -> Config:
     return cfg
 
 
+def _save_norm_stats_cache(cache: Path, stats: tuple[float, float, float, float]) -> None:
+    """Atomically persist norm stats: write a temp sibling then rename it over
+    the destination, so a crash mid-write can never leave a truncated cache.
+
+    The temp name MUST end in ``.npz``: ``np.savez`` auto-appends ``.npz`` to
+    names that lack it, which would silently write ``<name>.tmp.npz`` and make
+    the subsequent ``os.replace`` fail with ENOENT.
+    """
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp_cache = cache.with_name(f"{cache.stem}.tmp{cache.suffix}")  # ..._stats.tmp.npz
+    np.savez(tmp_cache, past_min=stats[0], past_max=stats[1], fut_min=stats[2], fut_max=stats[3])
+    os.replace(tmp_cache, cache)
+
+
 def _load_norm_stats_cache(cache: Path) -> dict[str, float] | None:
     """Return ``{past_min, past_max, fut_min, fut_max}`` from a norm-stats cache.
 
@@ -503,12 +517,7 @@ def _ensure_norm_stats(scene: str, args: argparse.Namespace) -> tuple[float, flo
     torch.cuda.empty_cache()
 
     try:
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        # Atomic write: save to a temp sibling then rename, so a crash mid-write
-        # can never leave a truncated cache for the next run to trip over.
-        tmp_cache = cache.with_name(cache.name + ".tmp")
-        np.savez(tmp_cache, past_min=stats[0], past_max=stats[1], fut_min=stats[2], fut_max=stats[3])
-        os.replace(tmp_cache, cache)
+        _save_norm_stats_cache(cache, stats)
     except OSError as exc:  # read-only results dir -> skip caching silently
         logger.warning("could not cache norm stats (%s)", exc)
     return stats
@@ -702,15 +711,27 @@ def load_anchor_frame(
 # ---------------------------------------------------------------------------
 # Native hooks
 # ---------------------------------------------------------------------------
+def _checkpoint_path(scene: str, vid_status: str, video_id: str | None) -> Path:
+    """Run-dir checkpoint path mirroring the research scripts' OUTSUF rule.
+
+    Variants: the video-conditioned arm trains as ``_vmfull`` (``vid``), the
+    trajectory-only arm as ``_novid``. A ``--video-id`` filter appends
+    ``_vid<id>`` to BOTH variants (scripts/research/00_common.sh
+    ``vid_out_suffix``), e.g. ``_SDD_ho<scene>_vmfull_vidvideo0``.
+    """
+    variant = "vmfull" if vid_status == "vid" else "novid"
+    out_suf = f"_vid{video_id}" if video_id else ""
+    return RESULTS_DIR / f"_SDD_ho{scene}_{variant}{out_suf}" / "models" / "checkpoint_best.pt"
+
+
 def build_model_and_cfg(scene: str, vid_status: str, args: argparse.Namespace):
     """Instantiate ``ETHMotionTransformer`` + ``FlowMatcher`` natively.
 
     Mirrors ``fm_sdd_global.build_network``; loads the matching checkpoint
-    (``_SDD_ho<scene>_<vid|novid>/models/checkpoint_best.pt``) onto the
-    device and switches the denoiser to eval mode.
+    (``_SDD_ho<scene>_<vmfull|novid>[_vid<id>]/models/checkpoint_best.pt``)
+    onto the device and switches the denoiser to eval mode.
     """
-    suffix = "vid" if vid_status == "vid" else "novid"
-    ckpt_path = RESULTS_DIR / f"_SDD_ho{scene}_{suffix}" / "models" / "checkpoint_best.pt"
+    ckpt_path = _checkpoint_path(scene, vid_status, getattr(args, "video_id", None))
     if not ckpt_path.exists():
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
 
