@@ -230,6 +230,57 @@ run_py() {
     exit 5
 }
 
+# usage: cleanup_run_checkpoints <run_dir> [run_dir...]
+# Remove every on-disk checkpoint under a run dir's models/ folder. Called once
+# a fold's LAST downstream consumer has finished (e.g. vmstatic after 01, whose
+# Q6 metrics are already aggregated), so the Kaggle /kaggle/working budget is not
+# exhausted by multi-hundred-MB checkpoint files that nothing will read again.
+cleanup_run_checkpoints() {
+    local rundir
+    for rundir in "$@"; do
+        [[ -n "$rundir" && -d "${rundir}/models" ]] || continue
+        rm -f "${rundir}"/models/checkpoint_*.pt "${rundir}"/models/checkpoint_*.pth
+    done
+}
+
+# usage: _layout_link <src> <dst>   -> relative symlink, or a copy as fallback
+_layout_link() {
+    local src="$1" dst="$2" rel
+    [[ -e "$src" ]] || return 0
+    rel="$(realpath --relative-to="$(dirname "$dst")" "$src" 2>/dev/null)" || rel=""
+    if [[ -n "$rel" ]] && ln -sfn "$rel" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    if [[ -d "$src" ]]; then cp -rf "$src" "$dst"; else cp -f "$src" "$dst"; fi
+}
+
+# usage: build_supervisor_layout   -> populate ${RESEARCH_ROOT}/q3,q5,q7 aliases
+# The canonical artifacts stay where the scripts wrote them; q3/q5/q7 are thin
+# relative symlinks (copy fallback) so the supervisor's Q-mapping resolves:
+#   q3 → features/PROVENANCE*.md + every execution log
+#   q5 → q4/q4_scene_gain_summary*.csv + q4/q4_window_gains*.csv
+#   q7 → q4/figs*/  (roundabout visual renders)
+build_supervisor_layout() {
+    local root="${RESEARCH_ROOT:-}"
+    [[ -n "$root" && -d "$root" ]] || return 0
+    local q3="${root}/q3" q5="${root}/q5" q7="${root}/q7"
+    mkdir -p "$q3" "$q5" "$q7"
+
+    local f d
+    for f in "$root"/features/PROVENANCE*.md "$root"/features/*.log; do
+        [[ -f "$f" ]] && _layout_link "$f" "$q3/$(basename "$f")"
+    done
+    for f in "$root"/q*/run.log "$root"/q*/render.log; do
+        [[ -f "$f" ]] && _layout_link "$f" "$q3/$(basename "$(dirname "$f")")_$(basename "$f")"
+    done
+    for f in "$root"/q4/q4_scene_gain_summary*.csv "$root"/q4/q4_window_gains*.csv; do
+        [[ -f "$f" ]] && _layout_link "$f" "$q5/$(basename "$f")"
+    done
+    for d in "$root"/q4/figs*; do
+        [[ -d "$d" ]] && _layout_link "$d" "$q7/$(basename "$d")"
+    done
+}
+
 # Write a provenance file describing how a report was produced (audit trail).
 write_provenance() {
     local outdir="$1" script="$2"

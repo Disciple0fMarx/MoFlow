@@ -189,7 +189,16 @@ class Trainer(object):
         self.train_num_steps = cfg.OPTIMIZATION.NUM_EPOCHS * len(train_loader)
 
         self.save_samples = save_samples
-        
+
+        # Disk-budget guards (SDD research pipeline runs on Kaggle's ~20 GB
+        # /kaggle/working). ``save_trainer_state`` keeps optimizer/scheduler/
+        # scaler buffers in checkpoints (only needed to RESUME training; the SDD
+        # pipeline never resumes, so SDD cfg disables it). ``cleanup_ckpt_on_eval``
+        # drops the rolling + per-epoch checkpoints immediately after an
+        # evaluation pass, keeping only ``checkpoint_best.pt`` that Q1/Q2/Q4 read.
+        self.save_trainer_state = bool(cfg.get('save_trainer_state', True))
+        self.cleanup_ckpt_on_eval = bool(cfg.get('cleanup_ckpt_on_eval', False))
+
         # accelerator
         self.accelerator = Accelerator(
             split_batches = True,
@@ -242,24 +251,32 @@ class Trainer(object):
     def save_ckpt(self, ckpt_name):
         if not self.accelerator.is_local_main_process:
             return
+        # ``model`` + ``ema`` are the only buffers the eval/attribution paths
+        # read; optimizer/scheduler/scaler exist solely to resume training and
+        # roughly double the file size. Drop them when save_trainer_state=False
+        # (SDD) to protect the Kaggle disk budget.
         data = {
             'step': self.step,
             'model': self.accelerator.get_state_dict(self.denoiser),
-            'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
         }
+        if self.save_trainer_state:
+            data['opt'] = self.opt.state_dict()
+            data['scheduler'] = self.scheduler.state_dict()
+            data['scaler'] = self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
         torch.save(data, os.path.join(self.cfg.model_dir, f'{ckpt_name}.pt'))
 
     def save_last_ckpt(self):
+        if not self.accelerator.is_local_main_process:
+            return
         data = {
             'step': self.step,
             'model': self.accelerator.get_state_dict(self.denoiser),
-            'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
         }
+        if self.save_trainer_state:
+            data['opt'] = self.opt.state_dict()
+            data['scheduler'] = self.scheduler.state_dict()
         torch.save(data, os.path.join(self.cfg.model_dir, 'checkpoint_last.pt'))
     
     def load(self, ckpt_name):
@@ -271,16 +288,51 @@ class Trainer(object):
         model.load_state_dict(data['model'])
 
         self.step = data['step']
-        self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
+        # Opt/scheduler are omitted when save_trainer_state=False (nothing to
+        # resume from); stay tolerant so a slim checkpoint still loads.
+        if 'opt' in data:
+            self.opt.load_state_dict(data['opt'])
+        if 'scheduler' in data:
+            self.scheduler.load_state_dict(data['scheduler'])
+        if self.accelerator.is_main_process and 'ema' in data:
             # pass
             self.ema.load_state_dict(data["ema"])
 
         if 'version' in data:
             print(f"loading from version {data['version']}")
 
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
+        if exists(self.accelerator.scaler) and data.get('scaler') is not None:
             self.accelerator.scaler.load_state_dict(data['scaler'])
+
+    def cleanup_checkpoints(self, keep_best: bool = True):
+        """Delete on-disk checkpoint artifacts, optionally keeping the best.
+
+        Q1/Q2/Q4 only ever read ``checkpoint_best.pt``; the rolling
+        ``checkpoint_last.pt`` and the ``checkpoint_epoch_*.pt`` snapshots have
+        no downstream consumer after an evaluation pass, so they (and their
+        EMA/optimizer buffers) are reclaimed immediately. ``keep_best=False``
+        removes every checkpoint once a fold's last consumer has run.
+        """
+        if not self.accelerator.is_local_main_process:
+            return
+        model_dir = Path(self.cfg.model_dir)
+        if not model_dir.is_dir():
+            return
+        remaining = []
+        for f in sorted(model_dir.glob('checkpoint_*')):
+            if f.suffix not in ('.pt', '.pth'):
+                continue
+            if keep_best and f.name == 'checkpoint_best.pt':
+                remaining.append(f.name)
+                continue
+            try:
+                f.unlink()
+            except OSError:
+                remaining.append(f.name)
+        self.logger.info(
+            '[cleanup] checkpoints in %s: kept %s',
+            model_dir, remaining or 'none',
+        )
 
     def train(self):
         """
@@ -464,6 +516,10 @@ class Trainer(object):
         # window, and CUDA caching blocks plus cyclic references otherwise
         # survive into the next epoch / next run and accumulate.
         free_memory()
+        if self.cleanup_ckpt_on_eval:
+            # Reclaim checkpoint_last + per-epoch snapshots now that this fold's
+            # evaluation is done; keep checkpoint_best for Q1/Q2/Q4.
+            self.cleanup_checkpoints(keep_best=True)
         self.logger.info(f'testing complete with the {mode} ckpt')
 
 

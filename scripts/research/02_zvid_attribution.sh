@@ -78,4 +78,6 @@ for scene in $(loso_scenes "$LABEL" "$SCENE"); do
     run_py "attrib:${scene}" "$LOG" "${ARGS[@]}"
 done
 
+build_supervisor_layout 2>/dev/null || true
+
 log_to "$LOG" INFO "Q1 complete. per-scene CSVs in ${OUTDIR} (each *_attrib.csv)"

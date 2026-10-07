@@ -140,4 +140,6 @@ with open(os.path.join(os.environ["RESEARCH_ROOT"], "q2", f"q2_transfer_gain{out
 print(f"[q2] wrote q2_transfer_ade{outsuf}.csv and q2_transfer_gain{outsuf}.csv")
 PYEOF
 fi
+build_supervisor_layout 2>/dev/null || true
+
 log_to "$LOG" INFO "Q2 complete. reports in ${OUTDIR}"

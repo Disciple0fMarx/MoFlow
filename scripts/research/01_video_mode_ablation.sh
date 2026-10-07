@@ -167,4 +167,16 @@ with open(os.path.join(os.environ["RESEARCH_ROOT"], "q6", f"q6_video_mode_ade{ou
 print("[q6] wrote q6_video_mode_ade.csv")
 PYEOF
 fi
+# Disk guard: the `static` arm's checkpoints have no downstream consumer —
+# Q1/Q2/Q4 all run on `vmfull`, Q2 additionally on `novid`. The Q6 numbers are
+# already aggregated from the eval CSVs above, so reclaim these now.
+if [[ "${RESEARCH_DRY_RUN:-0}" != "1" ]]; then
+    for scene in $(loso_scenes "$LABEL" "$SCENE"); do
+        cleanup_run_checkpoints "${RESULTS_ROOT}/_SDD_ho${scene}_vmstatic$(vid_out_suffix)"
+    done
+fi
+
+# Supervisor layout: q3 links features provenance + execution logs.
+build_supervisor_layout 2>/dev/null || true
+
 log_to "$LOG" INFO "Q6 complete. reports in ${OUTDIR}"

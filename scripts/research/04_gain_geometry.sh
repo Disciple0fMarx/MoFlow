@@ -222,4 +222,7 @@ PYEOF
     fi
 fi
 
+# Supervisor layout: q5 links the q4 summary CSVs, q7 links the q4 figure dirs.
+build_supervisor_layout 2>/dev/null || true
+
 log_to "$LOG" INFO "Q4 complete. CSVs + figures in ${OUTDIR}"

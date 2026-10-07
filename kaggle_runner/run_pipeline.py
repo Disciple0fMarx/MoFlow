@@ -47,6 +47,14 @@ REPO_BRANCH = os.environ.get("MF_REPO_BRANCH", "feature/sdd-phase1-refactor")
 KAGGLE_INPUT = Path("/kaggle/input")
 KAGGLE_WORK = Path("/kaggle/working")
 REPO_DIR = KAGGLE_WORK / "MoFlow"
+RESEARCH_DIR = REPO_DIR / "report" / "research"
+RESULTS_DIR = REPO_DIR / "results_sdd" / "cor_fm"
+# Set SUPERVISOR_COPY=1 to materialise real files in q3/q5/q7 instead of
+# relative symlinks (useful if the output tarball does not preserve symlinks).
+SUPERVISOR_COPY = os.environ.get("SUPERVISOR_COPY", "0") == "1"
+# Copy the whole results tree is never intended; the final sweep below removes
+# every checkpoint once the pipeline is fully done (scope=full only).
+PRUNE_CHECKPOINTS = os.environ.get("MF_PRUNE_CHECKPOINTS", "")
 
 PIPELINE_SCOPE = os.environ.get("PIPELINE_SCOPE", "full").lower()
 SCENE = os.environ.get("SCENE", "")
@@ -251,6 +259,111 @@ def pipeline(angle: str, env: dict) -> None:
     run_script("04_gain_geometry.sh", f"{scene_args} {nb} --top-k {TOP_K} {video_args}".strip(), env)
 
 
+def _link(src: Path, dst: Path) -> None:
+    """Materialise dst as a (relative symlink to src) or a copy."""
+    try:
+        if dst.is_symlink() or dst.exists():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst, ignore_errors=True)
+            else:
+                dst.unlink()
+    except OSError:
+        pass
+    if SUPERVISOR_COPY:
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+        return
+    try:
+        dst.symlink_to(os.path.relpath(src, dst.parent))
+    except OSError:
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+
+
+def wire_supervisor_layout() -> None:
+    """Populate the supervisor-facing q3/q5/q7 aliases in report/research/.
+
+    Canonical artifacts stay where the research scripts wrote them; q3/q5/q7 are
+    thin links so the supervisor's Q-mapping resolves without moving files:
+        q3 → features/PROVENANCE*.md + every execution log (provenance trail)
+        q5 → q4/q4_scene_gain_summary*.csv + q4/q4_window_gains*.csv
+        q7 → q4/figs*/  (roundabout visual renders)
+    """
+    root = RESEARCH_DIR
+    if not root.is_dir():
+        log("Supervisor layout: research dir absent — nothing to wire.", "WARN")
+        return
+    q3, q5, q7 = root / "q3", root / "q5", root / "q7"
+    for d in (q3, q5, q7):
+        d.mkdir(parents=True, exist_ok=True)
+
+    n3 = n5 = n7 = 0
+    for f in sorted((root / "features").glob("PROVENANCE*.md")) + \
+             sorted((root / "features").glob("*.log")):
+        _link(f, q3 / f.name); n3 += 1
+    for f in sorted(root.glob("q*/run.log")) + sorted(root.glob("q*/render.log")):
+        _link(f, q3 / f"{f.parent.name}_{f.name}"); n3 += 1
+    for pat in ("q4_scene_gain_summary*.csv", "q4_window_gains*.csv"):
+        for f in sorted((root / "q4").glob(pat)):
+            _link(f, q5 / f.name); n5 += 1
+    for d in sorted((root / "q4").glob("figs*")):
+        if d.is_dir():
+            _link(d, q7 / d.name); n7 += 1
+    log(f"Supervisor layout: q3={n3} links, q5={n5} links, q7={n7} links "
+        f"(copy={SUPERVISOR_COPY})")
+
+
+def disk_report(tag: str = "") -> None:
+    try:
+        total, used, free = shutil.disk_usage(KAGGLE_WORK)
+    except OSError:
+        return
+    log(f"Disk [{tag or '-'}] working: {used/1e9:.2f} GB used / "
+        f"{total/1e9:.2f} GB ({free/1e9:.2f} GB free)")
+
+
+def prune_transients() -> None:
+    """Remove large, non-deliverable transient files before packaging.
+
+    TensorBoard event files are the only sizeable throwaway the pipeline writes
+    under results_sdd; the code_backup/ dirs are kept for audit provenance.
+    """
+    freed = n = 0
+    for p in RESULTS_DIR.rglob("events.out.tfevents.*"):
+        try:
+            freed += p.stat().st_size
+            p.unlink()
+            n += 1
+        except OSError:
+            pass
+    if n:
+        log(f"Disk guard: removed {n} TensorBoard event files ({freed/1e6:.1f} MB).")
+
+
+def prune_checkpoints() -> None:
+    """Final sweep: remove every checkpoint once the whole pipeline is done.
+
+    Only safe for PIPELINE_SCOPE=full (both angles) because the angle-2 scripts
+    currently reference the unsuffixed angle-1 checkpoint dirs; deleting them
+    mid-scope would break a later stage.
+    """
+    freed = n = 0
+    for p in RESULTS_DIR.rglob("checkpoint_*"):
+        if p.suffix not in (".pt", ".pth"):
+            continue
+        try:
+            freed += p.stat().st_size
+            p.unlink()
+            n += 1
+        except OSError:
+            pass
+    log(f"Disk guard: final checkpoint sweep removed {n} files ({freed/1e6:.1f} MB).")
+
+
 def audit(env: dict) -> None:
     log("Audit: scanning /kaggle/working for artifacts...")
     manifest = []
@@ -275,11 +388,21 @@ def main() -> None:
         run_script("00_reencode_features.sh", "--scene " + SCENE if SCENE else "", env)
     else:
         die(f"Unknown PIPELINE_SCOPE={PIPELINE_SCOPE}")
+    disk_report("after encode")
 
     if PIPELINE_SCOPE in ("full", "angle1"):
         pipeline("angle1", env)
+    disk_report("after angle1")
     if PIPELINE_SCOPE in ("full", "angle2"):
         pipeline("angle2", env)
+    disk_report("after angle2")
+
+    # Free throwaway disk before packaging, then expose the supervisor layout.
+    prune_transients()
+    wire_supervisor_layout()
+    if PIPELINE_SCOPE == "full" and PRUNE_CHECKPOINTS != "0":
+        prune_checkpoints()
+    disk_report("before audit")
 
     audit(env)
     log("Pipeline DONE.")

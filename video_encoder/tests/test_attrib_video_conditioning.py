@@ -100,6 +100,7 @@ def test_run_attribution_end_to_end(tmp_path):
         "4",
         "--out",
         str(tmp_path / "out"),
+        "--save-preds",
     ]
     cvxp.main(argv)
 
@@ -305,6 +306,7 @@ def test_conditions_subset_limits_rows_and_stacks(tmp_path, monkeypatch):
         "--conditions",
         "baseline",
         "zeroed",
+        "--save-preds",
     ]
     cvxp.main(argv)
 
@@ -317,6 +319,34 @@ def test_conditions_subset_limits_rows_and_stacks(tmp_path, monkeypatch):
     assert (tmp_path / "out_baseline.npy").exists()
     assert (tmp_path / "out_zeroed.npy").exists()
     assert not (tmp_path / "out_permuted.npy").exists()
+
+
+def test_pred_stacks_are_opt_in(tmp_path):
+    """Without --save-preds no .npy stacks are written (Kaggle disk guard)."""
+    ckpt, sdd_root, feats = _make_cvxp_env(tmp_path, arch_video=True)
+
+    argv = [
+        "--ckpt",
+        str(ckpt),
+        "--sdd-root",
+        str(sdd_root),
+        "--video-features-root",
+        str(feats),
+        "--held-out-scene",
+        "coupa",
+        "--split",
+        "test",
+        "--n-batches",
+        "1",
+        "--batch-size",
+        "4",
+        "--out",
+        str(tmp_path / "out"),
+    ]
+    cvxp.main(argv)
+
+    assert (tmp_path / "out.csv").exists()
+    assert not list(tmp_path.glob("out_*.npy"))
 
 
 def test_norm_scene_decouples_normalization_from_eval_scene(tmp_path, monkeypatch):

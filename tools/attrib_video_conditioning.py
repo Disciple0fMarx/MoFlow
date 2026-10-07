@@ -45,8 +45,9 @@ Example::
         --held-out-scene <scene> \
         --n-batches 20 --batch-size 64 --seed 0
 
-Outputs ``--out`` stem as ``<stem>_<condition>.npy`` prediction stacks plus an
-aggregate ``<stem>.csv``.
+Outputs an aggregate ``<stem>.csv`` (plus ``.json``). Per-condition
+``<stem>_<condition>.npy`` prediction stacks are written ONLY when
+``--save-preds`` is passed; they are not needed by the Q4/Q7 render pipeline.
 """
 
 from __future__ import annotations
@@ -197,6 +198,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument("--out", default="report/cvxp_attrib", help="Output stem.")
+    p.add_argument(
+        "--save-preds",
+        action="store_true",
+        help=(
+            "Also write per-condition ``<stem>_<cond>.npy`` prediction stacks "
+            "(last batch only). OFF by default: Q4/Q7 renders re-sample from "
+            "the checkpoint and never read these stacks, so writing them only "
+            "wastes the Kaggle /kaggle/working budget."
+        ),
+    )
     p.add_argument("--use-ema", action="store_true", help="Load EMA weights.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -621,11 +632,11 @@ def main(argv: list[str] | None = None) -> None:
             )
 
         batches += 1
-        # ``last_preds`` survives the loop: the .npy stacks exported below are
-        # the final batch's predictions (existing contract). Dropping the
-        # per-batch reference immediately keeps only one batch alive instead of
-        # accumulating every batch's arrays.
-        last_preds = preds
+        # The .npy stacks exported below (only when --save-preds) hold the final
+        # batch's predictions. Assigning only under the flag keeps one batch
+        # alive at most and avoids the per-cell disk write entirely by default.
+        if args.save_preds:
+            last_preds = preds
         del preds, fut_gt, b
         if args.n_batches is not None and batches >= args.n_batches:
             break
@@ -690,10 +701,15 @@ def main(argv: list[str] | None = None) -> None:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
-    # per-condition prediction stacks for downstream statistical testing
-    for cond in run_conditions:
-        if batches and last_preds.get(cond) is not None:
-            np.save(out_path.with_name(f"{out_path.stem}_{cond}.npy"), last_preds[cond])
+    # Optional per-condition prediction stacks for downstream statistical
+    # testing. OFF by default: the Q4/Q7 renderer re-samples the model itself
+    # (visualize_trajectory_comparison.py --window-index) and never reads these
+    # arrays, so writing them only burns the Kaggle disk budget. Opt in with
+    # --save-preds when a downstream notebook genuinely needs the raw stacks.
+    if args.save_preds:
+        for cond in run_conditions:
+            if batches and last_preds.get(cond) is not None:
+                np.save(out_path.with_name(f"{out_path.stem}_{cond}.npy"), last_preds[cond])
     last_preds = {}
     with open(out_path.with_suffix(".json"), "w") as f:
         json.dump(rows, f, indent=2)

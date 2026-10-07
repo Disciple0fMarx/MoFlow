@@ -10,6 +10,15 @@ agents                       : 1
 
 checkpt_freq                 : 10
 
+# -------------------- Disk-budget guards (Kaggle /kaggle/working ~20 GB) -----
+# save_trainer_state: keep optimizer/scheduler/scaler in checkpoints. Only
+#   needed to RESUME training; the SDD pipeline never resumes, and those buffers
+#   ~double each checkpoint, so SDD disables them.
+# cleanup_ckpt_on_eval: delete checkpoint_last + checkpoint_epoch_* immediately
+#   after an evaluation pass, keeping only checkpoint_best.pt (consumed by Q1/Q2/Q4).
+save_trainer_state           : False
+cleanup_ckpt_on_eval         : True
+
 # -------------------- Validation (model selection) -------------------------
 # checkpoint_best is selected on a VALIDATION split carved from the TRAINING
 # scenes only (see build_val_loader_from_train); the held-out test scene is
