@@ -254,6 +254,24 @@ _layout_link() {
     if [[ -d "$src" ]]; then cp -rf "$src" "$dst"; else cp -f "$src" "$dst"; fi
 }
 
+# usage: stage_q4_design_note   -> snapshot the Q4 design note + shipped agent
+# crop configs into ${RESEARCH_ROOT}/q4/. Static evidence, copied (not linked)
+# so later edits to docs/ never alter the delivered report.
+stage_q4_design_note() {
+    local root="${RESEARCH_ROOT:-}"
+    [[ -n "$root" && -d "$root" ]] || return 0
+    local dst="${root}/q4"
+    mkdir -p "$dst"
+    local src
+    src="${REPO_ROOT}/docs/Q4_crop_size_design_note.md"
+    [[ -f "$src" ]] && cp -f "$src" "${dst}/Q4_crop_size_design_note.md"
+    for cfg in "sdd/cor_fm.yml" "eth_ucy/cor_fm.yml"; do
+        src="${REPO_ROOT}/cfg/${cfg}"
+        [[ -f "$src" ]] && cp -f "$src" "${dst}/Q4_hyperparameter_config_$(echo "${cfg}" | tr '/' '_')"
+    done
+    return 0
+}
+
 # usage: build_supervisor_layout   -> populate ${RESEARCH_ROOT}/q3,q5,q7 aliases
 # The canonical artifacts stay where the scripts wrote them; q3/q5/q7 are thin
 # relative symlinks (copy fallback) so the supervisor's Q-mapping resolves:
@@ -263,6 +281,7 @@ _layout_link() {
 build_supervisor_layout() {
     local root="${RESEARCH_ROOT:-}"
     [[ -n "$root" && -d "$root" ]] || return 0
+    stage_q4_design_note
     local q3="${root}/q3" q5="${root}/q5" q7="${root}/q7"
     mkdir -p "$q3" "$q5" "$q7"
 
@@ -279,6 +298,7 @@ build_supervisor_layout() {
     for d in "$root"/q4/figs*; do
         [[ -d "$d" ]] && _layout_link "$d" "$q7/$(basename "$d")"
     done
+    return 0
 }
 
 # Write a provenance file describing how a report was produced (audit trail).
@@ -308,7 +328,11 @@ write_provenance() {
         echo "- RESULTS_ROOT: ${RESULTS_ROOT}"
         echo "- VIDEO_ID:  ${VIDEO_ID:-all}"
     } > "$prov"
-    if [[ -n "$VIDEO_ID" ]]; then
+    if [[ -n "$VIDEO_ID" && ! -e "${outdir}/PROVENANCE.md" ]]; then
+        # Copy only when the unsuffixed file is absent: in a two-angle run the
+        # geographic (VIDEO_ID empty) file is written directly and must stay the
+        # one named PROVENANCE.md next to the unsuffixed CSVs. Copying again here
+        # would clobber it with the video0 line (silent provenance corruption).
         cp -f "$prov" "${outdir}/PROVENANCE.md"
     fi
 }

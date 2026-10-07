@@ -8,10 +8,12 @@ restrict the loop to one held-out scene.
 
 ```
 00_common.sh                 shared env + helpers (paths, seeds, LOSO loop)
+00_reencode_features.sh      one-time clean feature-cache rebuild (pre-fix fix)
 01_video_mode_ablation.sh    Q6 : video vs static vs trajectory-only
 02_zvid_attribution.sh       Q1 : is the gain actually from z_vid?
 03_transfer_matrix.sh        Q2 : is the gain scene-specific or transferable?
 04_gain_geometry.sh          Q5/Q7 : where video helps + roundabout intent
+run_full_suite.sh            orchestrator: BOTH angles + supervisor layout
 ```
 
 ## Question → Script map
@@ -21,7 +23,7 @@ restrict the loop to one held-out scene.
 | Q1 | Gain comes from z_vid? | `02_zvid_attribution.sh` | ADE/FDE under baseline / zeroed / permuted `z_video_global` on the *same* seeded noise; `d_traj`/`d_ade` deltas per scene |
 | Q2 | Gain matrix diagonal? | `03_transfer_matrix.sh` | 8×8 and gain matrices; diag = LOSO effect, off-diag = transferable component |
 | Q3 | Strict LOSO protocol + ETH/UCY reproducibility | built into every script + `PROVENANCE.md` | per-run dir per held-out scene, fixed seeds, sampling schedule, git SHA recorded |
-| Q4 | Justify the 64×64 crop | (design note) | crop size is a hyperparameter of the agent crop path (`AGENT_CROP_SIZE`); revisit if agent-crop ablations are needed |
+| Q4 | Justify the 64×64 crop | `docs/Q4_crop_size_design_note.md` (+ staged copies under `q4/`) | crop size is a hyperparameter of the agent crop path (`AGENT_CROP_SIZE`), **inactive in this suite** (global scene-video channel only); the note states the rationale + when it becomes live |
 | Q5 | Draw gain by scene ↔ complex geometry? | `04_gain_geometry.sh` | per-scene mean gain table, ranked; low-gain scenes cross-referenced with non-linear/roundabout corridors |
 | Q6 | Video vs mere visual info? | `01_video_mode_ablation.sh` | off / static / full ADE — isolates per-window visual *content* from any-image conditioning |
 | Q7 | Roundabout exit = intent? | `04_gain_geometry.sh` `--scene deathCircle` | gain-ranked roundabout windows + multi-hypothesis renders |
@@ -85,6 +87,7 @@ run never overwrites the geographic-LOSO results.
 
 ```
 report/research/
+├── _full_suite.log            (orchestrator run log + per-stage rc summary)
 ├── q1/  <scene>_attrib.csv            (baseline/zeroed/permuted ADE+FDE+deltas)
 ├── q2/  <train>__eval_<eval>__{full,novid}.csv   (per-cell baseline)
 │        q2_transfer_ade.csv           (8×8 ADE matrix)
@@ -93,12 +96,25 @@ report/research/
 │        q4_window_gains.csv           (concatenated per-window gains)
 │        q4_scene_gain_summary.csv     (scenes ranked by mean video gain)
 │        figs/*.png                    (gain-ranked trajectory renders)
-└── q6/  q6_video_mode_ade.csv         (off/static/full per scene × horizon)
+│        Q4_crop_size_design_note.md   (design note — built by the layout step)
+│        Q4_hyperparameter_config_*.yml (cfg snapshots shipped with the note)
+├── q6/  q6_video_mode_ade.csv         (off/static/full per scene × horizon)
+└── q3/ q5/ q7/                        (supervisor aliases → linked above)
 ```
 
 ## Quick start
 
 ```bash
+# EVERYTHING — both angles (geographic LOSO + --video-id video0) plus the
+# supervisor q1–q7 layout. ~4–5 h on the lab RTX 4080 (fewer with --n-batches):
+scripts/research/run_full_suite.sh
+
+# subsets / quick passes
+scripts/research/run_full_suite.sh --angle 1 --stages "01 02" --n-batches 3 --top-k 2 --no-render
+scripts/research/run_full_suite.sh --dry-run            # print every subprocess, run nothing
+REENCODE=always scripts/research/run_full_suite.sh      # force feature re-encode first
+CLEANUP_CHECKPOINTS=1 scripts/research/run_full_suite.sh  # also delete trained ckpts at the end
+
 # Q6 — require the three trained checkpoints per scene first:
 scripts/research/01_video_mode_ablation.sh            # train + eval all scenes
 scripts/research/01_video_mode_ablation.sh --train-only --scene coupa
