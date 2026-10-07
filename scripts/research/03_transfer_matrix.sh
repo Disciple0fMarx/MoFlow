@@ -65,8 +65,8 @@ log_to "$LOG" INFO "Q2 starting. rows(train)=(${ROW_SCENES}) cols(eval)=(${COL_S
 CFG="cfg/sdd/cor_fm.yml"
 
 for train_scene in ${ROW_SCENES}; do
-    CKPT_FULL="${RESULTS_ROOT}/_SDD_ho${train_scene}_vmfull/models/checkpoint_best.pt"
-    CKPT_NOVID="${RESULTS_ROOT}/_SDD_ho${train_scene}_novid/models/checkpoint_best.pt"
+    CKPT_FULL="${RESULTS_ROOT}/_SDD_ho${train_scene}_vmfull${OUTSUF}/models/checkpoint_best.pt"
+    CKPT_NOVID="${RESULTS_ROOT}/_SDD_ho${train_scene}_novid${OUTSUF}/models/checkpoint_best.pt"
     require_ckpt "$CKPT_FULL" "$LABEL"
     require_ckpt "$CKPT_NOVID" "$LABEL"
     for eval_scene in ${COL_SCENES}; do
@@ -74,7 +74,7 @@ for train_scene in ${ROW_SCENES}; do
         for variant in full novid; do
             suffix="vmfull"
             [[ "$variant" == "novid" ]] && suffix="novid"
-            CKPT="${RESULTS_ROOT}/_SDD_ho${train_scene}_${suffix}/models/checkpoint_best.pt"
+            CKPT="${RESULTS_ROOT}/_SDD_ho${train_scene}_${suffix}${OUTSUF}/models/checkpoint_best.pt"
             ARGS=(tools/attrib_video_conditioning.py
                 --cfg "$CFG"
                 --ckpt "$CKPT"

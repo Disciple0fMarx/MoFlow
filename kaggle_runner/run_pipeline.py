@@ -52,8 +52,9 @@ RESULTS_DIR = REPO_DIR / "results_sdd" / "cor_fm"
 # Set SUPERVISOR_COPY=1 to materialise real files in q3/q5/q7 instead of
 # relative symlinks (useful if the output tarball does not preserve symlinks).
 SUPERVISOR_COPY = os.environ.get("SUPERVISOR_COPY", "0") == "1"
-# Copy the whole results tree is never intended; the final sweep below removes
-# every checkpoint once the pipeline is fully done (scope=full only).
+# Checkpoint sweeps run after each angle (and again at the end); a checkpoint is
+# only ever read by the same angle's 02/03/04, which use the _vid<id> suffix.
+# Set MF_PRUNE_CHECKPOINTS=0 to keep them all for inspection.
 PRUNE_CHECKPOINTS = os.environ.get("MF_PRUNE_CHECKPOINTS", "")
 
 PIPELINE_SCOPE = os.environ.get("PIPELINE_SCOPE", "full").lower()
@@ -344,12 +345,12 @@ def prune_transients() -> None:
         log(f"Disk guard: removed {n} TensorBoard event files ({freed/1e6:.1f} MB).")
 
 
-def prune_checkpoints() -> None:
-    """Final sweep: remove every checkpoint once the whole pipeline is done.
+def prune_checkpoints(stage: str = "final") -> None:
+    """Remove every checkpoint under results_sdd once its consumer is done.
 
-    Only safe for PIPELINE_SCOPE=full (both angles) because the angle-2 scripts
-    currently reference the unsuffixed angle-1 checkpoint dirs; deleting them
-    mid-scope would break a later stage.
+    Safe after EACH angle now that 02/03/04 locate checkpoints by the
+    ``_vid<id>`` suffix (angle 2 only reads its own dirs). Callers pass
+    ``stage="angle1"`` / ``"angle2"`` / ``"final"`` purely for the log line.
     """
     freed = n = 0
     for p in RESULTS_DIR.rglob("checkpoint_*"):
@@ -361,7 +362,7 @@ def prune_checkpoints() -> None:
             n += 1
         except OSError:
             pass
-    log(f"Disk guard: final checkpoint sweep removed {n} files ({freed/1e6:.1f} MB).")
+    log(f"Disk guard: [{stage}] checkpoint sweep removed {n} files ({freed/1e6:.1f} MB).")
 
 
 def audit(env: dict) -> None:
@@ -393,15 +394,23 @@ def main() -> None:
     if PIPELINE_SCOPE in ("full", "angle1"):
         pipeline("angle1", env)
     disk_report("after angle1")
+    # Checkpoints are per-angle now (02/03/04 use the _vid<id> suffixed run
+    # dirs), so an angle's checkpoints can be reclaimed as soon as that angle's
+    # 02/03/04 have consumed them — this is what keeps /kaggle/working alive
+    # through the second angle's 01 training (the v6 ENOSPC point).
+    if PIPELINE_SCOPE in ("full", "angle1") and PRUNE_CHECKPOINTS != "0":
+        prune_checkpoints("angle1")
     if PIPELINE_SCOPE in ("full", "angle2"):
         pipeline("angle2", env)
     disk_report("after angle2")
+    if PIPELINE_SCOPE in ("full", "angle2") and PRUNE_CHECKPOINTS != "0":
+        prune_checkpoints("angle2")
 
     # Free throwaway disk before packaging, then expose the supervisor layout.
     prune_transients()
     wire_supervisor_layout()
     if PIPELINE_SCOPE == "full" and PRUNE_CHECKPOINTS != "0":
-        prune_checkpoints()
+        prune_checkpoints("final")
     disk_report("before audit")
 
     audit(env)

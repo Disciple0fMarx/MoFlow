@@ -66,7 +66,7 @@ CFG="cfg/sdd/cor_fm.yml"
 
 # ---- Step 1: per-window attribution for every scene -----------------------
 for scene in $(loso_scenes "$LABEL" "$SCENE"); do
-    CKPT="${RESULTS_ROOT}/_SDD_ho${scene}_vmfull/models/checkpoint_best.pt"
+    CKPT="${RESULTS_ROOT}/_SDD_ho${scene}_vmfull${OUTSUF}/models/checkpoint_best.pt"
     require_ckpt "$CKPT" "$LABEL"
     ensure_features "$scene"
     ARGS=(tools/attrib_video_conditioning.py

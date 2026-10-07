@@ -57,7 +57,7 @@ log_to "$LOG" INFO "Q1 starting. scenes=($(loso_scenes "$LABEL" "$SCENE")) condi
 
 CFG="cfg/sdd/cor_fm.yml"
 for scene in $(loso_scenes "$LABEL" "$SCENE"); do
-    CKPT="${RESULTS_ROOT}/_SDD_ho${scene}_vmfull/models/checkpoint_best.pt"
+    CKPT="${RESULTS_ROOT}/_SDD_ho${scene}_vmfull${OUTSUF}/models/checkpoint_best.pt"
     require_ckpt "$CKPT" "$LABEL"
     ensure_features "$scene"
     log_to "$LOG" INFO "[${scene}] attribution on ${CKPT}"
