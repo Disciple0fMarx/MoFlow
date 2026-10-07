@@ -43,7 +43,15 @@ class FrameFeatureLookup:
                 f"Missing cached features for scene={scene!r}: "
                 f"expected {npy} and {manifest}. Run `python -m video_encoder encode ...` first."
             )
-        feats = np.load(npy)
+        try:
+            feats = np.load(npy)
+            if feats.size:
+                _ = feats[-1]  # flags a truncated .npy instead of a cryptic EOFError later
+        except (EOFError, ValueError, OSError) as exc:
+            raise ValueError(
+                f"Corrupt feature cache for scene={scene!r}: {type(exc).__name__}: {exc}. "
+                "Re-encode it with `python -m video_encoder encode-sdd --scenes <scene>`."
+            ) from exc
         man = pd.read_parquet(manifest)
         # Manifest columns: scene, frame_id, path, idx
         fmap = dict(zip(man["frame_id"].astype(int), man["row_idx"].astype(int)))
@@ -104,5 +112,13 @@ class FrameFeatureLookup:
 
 def feature_dim(root: str | Path, scene: str) -> int:
     """Inspect the cached feature dim without loading the full array."""
-    arr = np.load(Path(root) / f"{scene}.npy", mmap_mode="r")
-    return int(arr.shape[1])
+    try:
+        arr = np.load(Path(root) / f"{scene}.npy", mmap_mode="r")
+        if arr.size:
+            _ = arr[-1]  # flags a truncated .npy immediately
+        return int(arr.shape[1])
+    except (EOFError, ValueError, OSError) as exc:
+        raise ValueError(
+            f"Corrupt feature cache for scene={scene!r}: {type(exc).__name__}: {exc}. "
+            "Re-encode it with `python -m video_encoder encode-sdd --scenes <scene>`."
+        ) from exc

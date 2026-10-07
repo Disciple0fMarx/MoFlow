@@ -402,7 +402,17 @@ class SDDFrameFeatureLookup:
                 f"Missing cached features for SDD scene={scene!r}: "
                 f"expected {npy} and {manifest}. Run frame encoding first."
             )
-        feats = np.load(npy, mmap_mode="r" if mmap else None)
+        try:
+            feats = np.load(npy, mmap_mode="r" if mmap else None)
+            _ = feats.shape
+            if feats.size:
+                _ = feats[-1]  # touch the final row: flags a truncated .npy immediately
+        except (EOFError, ValueError, OSError) as exc:
+            raise ValueError(
+                f"Corrupt feature cache for SDD scene={scene!r}: {type(exc).__name__}: {exc}. "
+                "Re-encode it with `python -m video_encoder encode-sdd --scenes <scene>` "
+                "(or scripts/research/00_reencode_features.sh)."
+            ) from exc
         man = pd.read_parquet(manifest)
 
         if "video_id" not in man.columns:

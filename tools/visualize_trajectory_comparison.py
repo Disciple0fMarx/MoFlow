@@ -58,6 +58,7 @@ import gc
 import logging
 import os
 import sys
+import zipfile
 from pathlib import Path
 
 import matplotlib
@@ -431,6 +432,36 @@ def _build_cfg(scene: str, vid_status: str, args: argparse.Namespace) -> Config:
     return cfg
 
 
+def _load_norm_stats_cache(cache: Path) -> dict[str, float] | None:
+    """Return ``{past_min, past_max, fut_min, fut_max}`` from a norm-stats cache.
+
+    ``None`` when the file is missing OR corrupt (e.g. truncated by a crash
+    during ``np.savez``). A corrupt file is **deleted** so the caller's
+    recompute path runs instead of crashing with a cryptic ``EOFError`` /
+    ``BadZipFile`` on the next attempt.
+    """
+    try:
+        data = np.load(cache)
+    except (EOFError, ValueError, OSError, zipfile.BadZipFile) as exc:
+        logger.warning(
+            "[norm-stats] corrupt cache %s (%s: %s); deleting and recomputing",
+            cache, type(exc).__name__, exc,
+        )
+        cache.unlink(missing_ok=True)
+        return None
+    try:
+        return {
+            key: float(data[key]) for key in ("past_min", "past_max", "fut_min", "fut_max")
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning(
+            "[norm-stats] malformed cache %s (%s: %s); deleting and recomputing",
+            cache, type(exc).__name__, exc,
+        )
+        cache.unlink(missing_ok=True)
+        return None
+
+
 def _ensure_norm_stats(scene: str, args: argparse.Namespace) -> tuple[float, float, float, float]:
     """Return ``(past_min, past_max, fut_min, fut_max)`` for the LOSO split.
 
@@ -440,17 +471,15 @@ def _ensure_norm_stats(scene: str, args: argparse.Namespace) -> tuple[float, flo
     invocations skip the (relatively expensive) train-split index scan.
     When a ``--video-id`` filter is active the key carries the video name so
     filtered and unfiltered statistics never collide in the shared cache.
+    A cache that is corrupted/truncated (e.g. by a hard crash mid-``savez``)
+    is detected, deleted, and transparently recomputed.
     """
     vid_suffix = getattr(args, "video_id", None) or ""
     cache = RESULTS_DIR / f"_norm_stats_ho{scene}{'_'+vid_suffix if vid_suffix else ''}.npz"
     if cache.exists():
-        data = np.load(cache)
-        return (
-            float(data["past_min"]),
-            float(data["past_max"]),
-            float(data["fut_min"]),
-            float(data["fut_max"]),
-        )
+        stats = _load_norm_stats_cache(cache)
+        if stats is not None:
+            return stats["past_min"], stats["past_max"], stats["fut_min"], stats["fut_max"]
 
     logger.info("[%s] computing norm stats from train split (one-time)...", scene)
     cfg_stats = Config(str(CFG_PATH), tag="viz-stats")
@@ -475,7 +504,11 @@ def _ensure_norm_stats(scene: str, args: argparse.Namespace) -> tuple[float, flo
 
     try:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        np.savez(cache, past_min=stats[0], past_max=stats[1], fut_min=stats[2], fut_max=stats[3])
+        # Atomic write: save to a temp sibling then rename, so a crash mid-write
+        # can never leave a truncated cache for the next run to trip over.
+        tmp_cache = cache.with_name(cache.name + ".tmp")
+        np.savez(tmp_cache, past_min=stats[0], past_max=stats[1], fut_min=stats[2], fut_max=stats[3])
+        os.replace(tmp_cache, cache)
     except OSError as exc:  # read-only results dir -> skip caching silently
         logger.warning("could not cache norm stats (%s)", exc)
     return stats
