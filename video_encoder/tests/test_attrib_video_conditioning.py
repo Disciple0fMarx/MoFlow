@@ -449,3 +449,77 @@ def test_per_window_dump_wide_rows(tmp_path, monkeypatch):
         assert f"ade_min_{cond}" in first
         assert f"fde_min_{cond}" in first
     assert all(r["scene"] == "coupa" for r in rows)
+
+
+def test_per_window_window_index_is_contiguous_dataset_index(tmp_path, monkeypatch):
+    """``window_index`` must equal the contiguous local dataset index.
+
+    Regression: the running ``window_counter`` was incremented once per
+    *condition* inside the sample-condition loop, so with ``--conditions
+    baseline zeroed`` (or the default three arms) the second batch onward
+    carried inflated indices (e.g. batch 1 started at 2*bs instead of bs),
+    producing rows whose ``window_index`` exceeded the scene's test-window
+    count. The Q5/Q7 render step then failed with
+    ``[viz] window index 128 beyond 123 test windows``. Indices now come from
+    the collated per-sample ``index`` field (the dataset's own ordered index),
+    so the set must be exactly ``0..n_rows-1`` regardless of how many
+    condition arms run.
+    """
+    ckpt, _, _ = _make_cvxp_env(tmp_path, arch_video=True)
+
+    # Custom annotations: 8 tracks per video, each a contiguous 60-frame run
+    # at its own offset (anchor frames 19, 27, ..., 75). read/feature lookups
+    # need frames 0..119, so the cache covers that full range. Keeping keys
+    # distinct is essential — the per-window dedup key is
+    # (scene, video_id, anchor_frame, agent), and with the shared fixture's
+    # identical anchor (19) every track collapsed to a single row, which the
+    # counter bug could never trip.
+    from .sdd_test_utils import _ann_line
+
+    sdd_root = tmp_path / "sdd"
+    for vid in ("video0", "video1"):
+        ann_dir = sdd_root / "annotations" / "coupa" / vid
+        ann_dir.mkdir(parents=True, exist_ok=True)
+        with (ann_dir / "annotations.txt").open("w") as fp:
+            for ti in range(8):
+                for f in range(60):
+                    fp.write(_ann_line(ti, 30.0 + ti, 30.0 + f * 0.1, ti * 8 + f))
+    feats = write_synthetic_video_cache(
+        tmp_path / "feats", "coupa", ("video0", "video1"), 120, dim=512
+    )
+    cfg = Config("cfg/sdd/cor_fm.yml", "cvxp-test")
+    cfg.past_traj_min, cfg.past_traj_max = -10.0, 10.0
+    cfg.fut_traj_min, cfg.fut_traj_max = -10.0, 10.0
+
+    argv = [
+        "--ckpt",
+        str(ckpt),
+        "--sdd-root",
+        str(sdd_root),
+        "--video-features-root",
+        str(feats),
+        "--held-out-scene",
+        "coupa",
+        "--split",
+        "test",
+        "--n-batches",
+        "2",
+        "--batch-size",
+        "4",
+        "--conditions",
+        "baseline",
+        "zeroed",
+        "--per-window",
+        str(tmp_path / "windows.csv"),
+        "--out",
+        str(tmp_path / "out"),
+    ]
+    cvxp.main(argv)
+
+    import csv
+
+    with (tmp_path / "windows.csv").open() as fp:
+        rows = list(csv.DictReader(fp))
+    assert len(rows) == 8  # 2 batches x 4 windows, deduplicated across conditions
+    indices = sorted(int(r["window_index"]) for r in rows)
+    assert indices == list(range(len(rows))), indices

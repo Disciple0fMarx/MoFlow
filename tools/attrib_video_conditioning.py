@@ -487,7 +487,6 @@ def main(argv: list[str] | None = None) -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     window_rows: dict[tuple, dict[str, object]] = {}
-    window_counter = 0
 
     batches = 0
     skipped_batches = 0
@@ -590,12 +589,11 @@ def main(argv: list[str] | None = None) -> None:
                                 "video_id": video_ids[w],
                                 "anchor_frame": int(anchor[w]),
                                 "agent_in_window": a,
-                                "window_index": window_counter + w,
+                                "window_index": int(b["index"][w]),
                             }
                             window_rows[key] = wr
                         wr[f"ade_min_{cond}"] = float(ade[m])
                         wr[f"fde_min_{cond}"] = float(fde[m])
-                window_counter += int(b["batch_size"])
 
         # attribution relative to baseline
         base = preds["baseline"]  # [M, K, F, 2]
