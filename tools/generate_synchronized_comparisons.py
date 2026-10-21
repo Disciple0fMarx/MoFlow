@@ -22,6 +22,32 @@ best-of-K seed) and **share one bounding box**, so the only difference across
 panels is the conditioning. A single color language is used everywhere
 (GT = green, K=20 bundle = faint red, best-of-K = thick red).
 
+Strategic selection
+-------------------
+Evenly spaced windows often show ``off`` and ``full`` overlapping, which is
+uninformative. ``--selection-mode best_gain`` ranks windows by the video gain
+
+    ΔADE = ADE_off - ADE_full          (positive → video helps this window)
+
+and renders only the ``--top-k`` highest-gain windows per scene
+(``worst_gain`` shows the opposite tail as a control). Ranking is memory-light:
+
+* ``--rank-source auto`` (default) uses an explicit ``--metrics-csv`` if given,
+  otherwise the Q4 per-window CSVs under ``--metrics-dir`` (fast; note these
+  compare the *full* checkpoint with ``z_vid`` zeroed, a proxy for the separate
+  ``off`` checkpoint), otherwise computes the exact off-vs-full ΔADE.
+* ``--rank-source compute`` always computes the exact ΔADE by running the
+  ``off`` and ``full`` models over the test split, one model resident at a
+  time, storing only one scalar per window (no tensors, no rendering).
+* CSV rows are aligned to dataset indices via ``(video_id, anchor_frame)`` so a
+  stale or differently-filtered CSV cannot silently rank the wrong windows.
+
+The selected windows are then rendered by the normal three-variant + Grad-CAM
+pass. Each ``metadata.json`` records both ``selection_gain`` (the value used to
+rank, possibly the CSV proxy) and ``rendered_gain`` (the exact
+``ADE_off - ADE_full`` for the hypotheses actually drawn), so the two are never
+silently conflated.
+
 Output layout
 -------------
 ::
@@ -48,8 +74,16 @@ Notes
 
 Example::
 
+    # evenly spaced windows (original behaviour)
     python tools/generate_synchronized_comparisons.py \\
         --protocol both --num-samples 5 \\
+        --sdd-root /home/efrei_stage/Desktop/Datasets/SDD \\
+        --video-features-root ./features/resnet18
+
+    # the 5 windows per scene where the video arm helps most
+    python tools/generate_synchronized_comparisons.py \\
+        --protocol both --selection-mode best_gain --top-k 5 \\
+        --rank-source compute \\
         --sdd-root /home/efrei_stage/Desktop/Datasets/SDD \\
         --video-features-root ./features/resnet18
 """
@@ -100,6 +134,10 @@ from tools.visualize_trajectory_comparison import (
 from video_encoder.sdd_adapter import expand_sdd_root
 
 DEFAULT_OUT_DIR = _REPO_ROOT / "results_sdd" / "synchronized_comparisons"
+DEFAULT_METRICS_DIR = _REPO_ROOT / "report" / "research" / "q4"
+
+SELECTION_MODES = ("even", "best_gain", "worst_gain")
+RANK_SOURCES = ("auto", "csv", "compute")
 
 PANEL_TITLES = {
     "off": "off  ($z_{vid}=0$)",
@@ -428,41 +466,307 @@ def collect_variant(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Strategic window selection: rank by ΔADE = ADE_off - ADE_full
+# ---------------------------------------------------------------------------
+def _as_float(value) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _first_float(row: dict, *keys: str) -> float | None:
+    for key in keys:
+        out = _as_float(row.get(key))
+        if out is not None:
+            return out
+    return None
+
+
+def row_gain(row: dict) -> float | None:
+    """ΔADE for one metrics row (positive ⇒ the video arm helps).
+
+    Handles the Q4 aggregate schema (``gain_ade`` / ``ade_baseline`` /
+    ``ade_zeroed``) and the per-window attribution schema
+    (``ade_min_baseline`` / ``ade_min_zeroed``).
+    """
+    gain = _as_float(row.get("gain_ade"))
+    if gain is not None:
+        return gain
+    base = _first_float(
+        row, "ade_baseline", "ade_min_baseline", "ade_full", "ade_min_full"
+    )
+    off = _first_float(row, "ade_zeroed", "ade_min_zeroed", "ade_off", "ade_min_off")
+    if base is None or off is None:
+        return None
+    return off - base
+
+
+def _row_matches(row: dict, scene: str, video_id: str | None, agent_index: int) -> bool:
+    if row.get("scene") and row["scene"] != scene:
+        return False
+    if video_id is not None and row.get("video_id") and row["video_id"] != video_id:
+        return False
+    agent = _as_float(row.get("agent_in_window"))
+    if agent is not None and int(agent) != agent_index:
+        return False
+    return True
+
+
+def _metric_paths(scene: str, args: argparse.Namespace) -> list[Path]:
+    """Resolve the per-window metrics CSVs for this scene/protocol.
+
+    Exact filenames avoid mixing the global and ``--video-id`` artifacts (both
+    can contain the same ``video_id`` values, so row-level filtering is not
+    enough to tell them apart).
+    """
+    if args.metrics_csv:
+        path = Path(args.metrics_csv).expanduser()
+        if path.is_dir():
+            return sorted(path.glob("*.csv"))
+        return [path] if path.exists() else []
+    if args.rank_source == "compute":
+        return []
+
+    root = Path(args.metrics_dir).expanduser()
+    suffix = f"_vid{args.video_id}" if args.video_id else ""
+    candidates = [
+        root / f"q4_window_gains{suffix}.csv",
+        root / f"{scene}_windows{suffix}.csv",
+    ]
+    return [p for p in candidates if p.exists()]
+
+
+def _window_lookup(dataset) -> dict[tuple[str, int], int]:
+    """Map ``(video_id, anchor_frame)`` → contiguous dataset index."""
+    return {
+        (dataset.windows.video_id(i), int(dataset.windows.anchor_frame(i))): i
+        for i in range(len(dataset))
+    }
+
+
+def _row_aligned(row: dict, dataset, widx: int) -> bool:
+    video_id = row.get("video_id")
+    if video_id and dataset.windows.video_id(widx) != video_id:
+        return False
+    anchor = _as_float(row.get("anchor_frame"))
+    if anchor is not None and int(dataset.windows.anchor_frame(widx)) != int(anchor):
+        return False
+    return True
+
+
+def rank_from_metrics(
+    scene: str, args: argparse.Namespace, dataset
+) -> tuple[dict[int, float] | None, list[Path]]:
+    """Read the ranking from per-window metric CSVs, aligned to dataset indices."""
+    paths = _metric_paths(scene, args)
+    if not paths:
+        return None, []
+
+    lookup = _window_lookup(dataset)
+    ranked: dict[int, float] = {}
+    used: list[Path] = []
+    for path in paths:
+        matched = 0
+        with path.open(newline="") as fp:
+            for row in csv.DictReader(fp):
+                if not row or not _row_matches(
+                    row, scene, args.video_id, args.agent_index
+                ):
+                    continue
+                gain = row_gain(row)
+                if gain is None:
+                    continue
+
+                widx = None
+                raw_index = _as_float(row.get("window_index"))
+                if raw_index is not None and raw_index.is_integer():
+                    candidate = int(raw_index)
+                    if 0 <= candidate < len(dataset) and _row_aligned(
+                        row, dataset, candidate
+                    ):
+                        widx = candidate
+                if widx is None:
+                    video_id = row.get("video_id")
+                    anchor = _as_float(row.get("anchor_frame"))
+                    if video_id and anchor is not None:
+                        widx = lookup.get((video_id, int(anchor)))
+                if widx is None:
+                    continue
+
+                ranked[widx] = gain
+                matched += 1
+        if matched:
+            used.append(path)
+    return (ranked or None), used
+
+
+def rank_from_compute(
+    scene: str, args: argparse.Namespace, device: str
+) -> dict[int, float] | None:
+    """Exact off-vs-full ΔADE over the test split, one model resident at a time.
+
+    Only one scalar per window is retained; no bundles, frames, or activations
+    survive the per-variant loop, so this is safe to run on a full test split.
+    """
+    per_variant: dict[str, dict[int, float]] = {}
+    for variant in ("off", "full"):
+        ckpt = variant_checkpoint(scene, variant, getattr(args, "video_id", None))
+        if not ckpt.exists():
+            _console(
+                f"SKIP {args._protocol}/{scene}/{variant}: no checkpoint at "
+                f"{ckpt.parent}"
+            )
+            return None
+        denoiser, cfg = load_variant_denoiser(scene, variant, args)
+        dataset, _ = build_variant_dataset(scene, variant, args)
+        ade: dict[int, float] = {}
+        try:
+            total = len(dataset)
+            for widx in range(total):
+                batch = collate_sdd_global([dataset[widx]])
+                res = sample_window_predictions(
+                    denoiser,
+                    cfg,
+                    batch,
+                    device,
+                    args.seed,
+                    agent_index=args.agent_index,
+                )
+                ade[widx] = res["ade"]
+                del batch
+                if total >= 50 and (widx + 1) % 50 == 0:
+                    _console(f"  ranked {variant} {widx + 1}/{total}")
+        finally:
+            del denoiser, dataset
+            _free_model()
+        per_variant[variant] = ade
+
+    off, full = per_variant["off"], per_variant["full"]
+    common = sorted(set(off) & set(full))
+    return {w: off[w] - full[w] for w in common}
+
+
+def select_windows(scene: str, args: argparse.Namespace, device: str) -> dict | None:
+    """Return ``{indices, gains, source}`` for the ranked selection modes."""
+    want_best = args.selection_mode == "best_gain"
+    ranked: dict[int, float] | None = None
+    used: list[Path] = []
+
+    if args.rank_source in ("auto", "csv"):
+        paths = _metric_paths(scene, args)
+        if not paths:
+            if args.metrics_csv:
+                _console(
+                    f"  WARNING: --metrics-csv produced no files: {args.metrics_csv}"
+                )
+            if args.rank_source == "csv":
+                _console(
+                    f"SKIP {args._protocol}/{scene}: no per-window metrics CSV "
+                    f"(looked in {args.metrics_dir})"
+                )
+                return None
+            _console(f"  no per-window metrics for {scene}; computing exact ΔADE …")
+        else:
+            ckpt = variant_checkpoint(scene, "off", getattr(args, "video_id", None))
+            if not ckpt.exists():
+                _console(
+                    f"SKIP {args._protocol}/{scene}/off: no checkpoint at {ckpt.parent}"
+                )
+                return None
+            dataset, _ = build_variant_dataset(scene, "off", args)
+            try:
+                ranked, used = rank_from_metrics(scene, args, dataset)
+            finally:
+                del dataset
+                _free_model()
+            if ranked is None:
+                if args.rank_source == "csv":
+                    _console(
+                        f"SKIP {args._protocol}/{scene}: no usable rows in "
+                        + ", ".join(p.name for p in paths)
+                    )
+                    return None
+                _console(
+                    f"  metrics CSV(s) had no usable rows for {scene}; "
+                    f"computing exact ΔADE …"
+                )
+
+    if ranked is None:
+        ranked = rank_from_compute(scene, args, device)
+        if ranked is None:
+            return None
+
+    if used:
+        _console(
+            f"  ranked {len(ranked)} window(s) from "
+            + ", ".join(p.name for p in used)
+            + "  (CSV gain = z_vid-zeroed proxy; --rank-source compute for "
+            "exact novid-vs-full)"
+        )
+
+    if want_best:
+        items = sorted(ranked.items(), key=lambda kv: (-kv[1], kv[0]))
+        kept = [(w, g) for w, g in items if g > args.min_gain]
+        if not kept:
+            _console(
+                f"  WARNING: no {scene} window has ΔADE > {args.min_gain:+.2f}; "
+                f"showing the top {args.top_k} instead"
+            )
+            kept = items
+        items = kept
+    else:
+        items = sorted(ranked.items(), key=lambda kv: (kv[1], kv[0]))
+
+    top = items[: max(1, int(args.top_k))]
+    if not top:
+        return None
+
+    source = ", ".join(p.name for p in used) if used else "computed"
+    return {
+        "indices": [w for w, _ in top],
+        "gains": {w: g for w, g in top},
+        "source": source,
+    }
+
+
+def even_indices(scene: str, args: argparse.Namespace) -> list[int] | None:
+    """Original evenly spaced selection (``--num-samples``/``--window-indices``)."""
+    ckpt = variant_checkpoint(scene, "off", getattr(args, "video_id", None))
+    if not ckpt.exists():
+        _console(
+            f"SKIP {args._protocol}/{scene}/off: no checkpoint at {ckpt.parent}. "
+            f"Re-train with `python fm_sdd_global.py --held_out_scene {scene}"
+            + (f" --video-id {args.video_id}" if args.video_id else "")
+            + "`."
+        )
+        return None
+    dataset, _ = build_variant_dataset(scene, "off", args)
+    try:
+        return select_window_indices(len(dataset), args)
+    finally:
+        del dataset
+        _free_model()
+
+
 def collect_scene(
     scene: str,
+    indices: list[int],
     args: argparse.Namespace,
     backbone,
     preprocess,
     device: str,
-) -> tuple[list[int], dict[int, dict]] | None:
-    """Collect all three variants for one scene, keyed by the same window index."""
-    indices: list[int] | None = None
-    records: dict[int, dict] = {}
-
-    for variant in VARIANTS:
-        ckpt = variant_checkpoint(scene, variant, getattr(args, "video_id", None))
-        if not ckpt.exists():
-            # collect_variant prints the actionable message
-            collect_variant(scene, variant, [], args, backbone, preprocess, device)
-            return None
-        dataset, _ = build_variant_dataset(scene, variant, args)
-        idxs = select_window_indices(len(dataset), args)
-        del dataset
-        _free_model()
-        if indices is None:
-            indices = idxs
-        elif idxs != indices:
-            common = sorted(set(indices) & set(idxs))
-            _console(
-                f"  note: {scene}/{variant} window indices differ; "
-                f"using the {len(common)} shared windows"
-            )
-            indices = common
-
+) -> dict[int, dict] | None:
+    """Collect all three variants for ``indices``, one model resident at a time."""
     if not indices:
         _console(f"  no test windows for {scene}/{getattr(args, '_protocol', '?')}")
         return None
 
+    records: dict[int, dict] = {}
     for variant in VARIANTS:
         part = collect_variant(
             scene, variant, indices, args, backbone, preprocess, device
@@ -488,7 +792,7 @@ def collect_scene(
                 _console(f"  WARNING: {scene} w{widx} window mismatch across variants")
             if rec["cam"] is not None:
                 slot["cam"] = rec["cam"]
-    return indices, records
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +804,8 @@ def render_scene(
     indices: list[int],
     records: dict[int, dict],
     args: argparse.Namespace,
+    ranking: dict[int, float] | None = None,
+    rank_source: str = "even",
 ) -> list[dict]:
     dir_name = f"{scene}_video0" if protocol == "video0" else scene
     out_root = Path(args.out_dir) / protocol / dir_name
@@ -557,6 +863,15 @@ def render_scene(
             "agent_index": args.agent_index,
             "gradcam_variant": args.gradcam_variant,
             "cam_available": rec["cam"] is not None,
+            "selection_mode": args.selection_mode,
+            "selection_rank": (
+                (indices.index(widx) + 1) if ranking is not None else None
+            ),
+            "selection_gain": (ranking.get(widx) if ranking is not None else None),
+            "rank_source": rank_source,
+            # Always the exact ΔADE for the hypotheses actually drawn, which is
+            # what a reader should quote (CSV-based selection may be a proxy).
+            "rendered_gain": float(bundles["off"]["ade"] - bundles["full"]["ade"]),
             "variants": {
                 v: {
                     "ade_min": float(bundles[v]["ade"]),
@@ -591,11 +906,40 @@ def run_protocol(
     rows: list[dict] = []
     for scene in args.scenes:
         _console(f"=== {protocol}/{scene} ===")
-        collected = collect_scene(scene, args, backbone, preprocess, device)
-        if collected is None:
+
+        ranking: dict[int, float] | None = None
+        if args.selection_mode == "even":
+            indices = even_indices(scene, args)
+            rank_source = "even"
+        else:
+            selection = select_windows(scene, args, device)
+            if selection is None:
+                continue
+            indices = selection["indices"]
+            ranking = selection["gains"]
+            rank_source = selection["source"]
+            _console(
+                f"  selected {len(indices)} window(s) by {args.selection_mode} "
+                f"({rank_source}): "
+                + ", ".join(f"w{w}(ΔADE={ranking[w]:+.2f})" for w in indices)
+            )
+
+        if not indices:
             continue
-        indices, records = collected
-        rows.extend(render_scene(scene, protocol, indices, records, args))
+        records = collect_scene(scene, indices, args, backbone, preprocess, device)
+        if not records:
+            continue
+        rows.extend(
+            render_scene(
+                scene,
+                protocol,
+                indices,
+                records,
+                args,
+                ranking=ranking,
+                rank_source=rank_source,
+            )
+        )
     return rows
 
 
@@ -607,14 +951,57 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--num-samples",
         type=int,
         default=5,
-        help="Evenly spaced test windows per scene (default 5).",
+        help="Evenly spaced test windows per scene in even mode (default 5).",
     )
     p.add_argument(
         "--window-indices",
         nargs="+",
         type=int,
         default=None,
-        help="Explicit window indices (overrides --num-samples).",
+        help="Explicit window indices (forces even mode).",
+    )
+    p.add_argument(
+        "--selection-mode",
+        choices=list(SELECTION_MODES),
+        default="even",
+        help=(
+            "even: evenly spaced windows; best_gain/worst_gain: rank by "
+            "ΔADE = ADE_off - ADE_full and keep --top-k per scene."
+        ),
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Windows per scene in best_gain/worst_gain mode (default 5).",
+    )
+    p.add_argument(
+        "--min-gain",
+        type=float,
+        default=0.0,
+        help=(
+            "best_gain only: drop windows with ΔADE <= this value before taking "
+            "the top-k (default 0.0; falls back to top-k if none qualify)."
+        ),
+    )
+    p.add_argument(
+        "--rank-source",
+        choices=list(RANK_SOURCES),
+        default="auto",
+        help=(
+            "auto: use --metrics-csv or the Q4 CSVs if present, else compute; "
+            "csv: require per-window metrics; compute: exact off-vs-full ΔADE."
+        ),
+    )
+    p.add_argument(
+        "--metrics-csv",
+        default=None,
+        help="Explicit per-window metrics CSV (or a directory of CSVs).",
+    )
+    p.add_argument(
+        "--metrics-dir",
+        default=str(DEFAULT_METRICS_DIR),
+        help="Directory holding q4_window_gains*.csv / <scene>_windows*.csv.",
     )
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     p.add_argument("--sdd-root", default=None)
@@ -665,6 +1052,10 @@ def main(argv: list[str] | None = None) -> None:
     args.video_id = None
     args._protocol = "global"
 
+    if args.window_indices and args.selection_mode != "even":
+        _console("note: --window-indices overrides --selection-mode")
+        args.selection_mode = "even"
+
     backbone, _dim, preprocess = gcam._make_backbone(
         args.backbone, pretrained=args.pretrained, device=args.device
     )
@@ -690,6 +1081,11 @@ def main(argv: list[str] | None = None) -> None:
             "agent_index",
             "gradcam_variant",
             "cam_available",
+            "selection_mode",
+            "selection_rank",
+            "selection_gain",
+            "rendered_gain",
+            "rank_source",
             "ade_off",
             "ade_static",
             "ade_full",
@@ -710,6 +1106,17 @@ def main(argv: list[str] | None = None) -> None:
                         "agent_index": r["agent_index"],
                         "gradcam_variant": r["gradcam_variant"],
                         "cam_available": r["cam_available"],
+                        "selection_mode": r["selection_mode"],
+                        "selection_rank": (
+                            "" if r["selection_rank"] is None else r["selection_rank"]
+                        ),
+                        "selection_gain": (
+                            ""
+                            if r["selection_gain"] is None
+                            else f"{r['selection_gain']:+.6f}"
+                        ),
+                        "rendered_gain": f"{r['rendered_gain']:+.6f}",
+                        "rank_source": r["rank_source"],
                         "ade_off": f"{r['variants']['off']['ade_min']:.6f}",
                         "ade_static": f"{r['variants']['static']['ade_min']:.6f}",
                         "ade_full": f"{r['variants']['full']['ade_min']:.6f}",

@@ -9,6 +9,8 @@ namespaces (the helper module decodes frames, the new module draws backgrounds).
 
 from __future__ import annotations
 
+import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -221,3 +223,284 @@ def test_main_skips_scene_when_a_variant_is_missing(tmp_path, monkeypatch, capsy
     captured = capsys.readouterr().out
     assert "SKIP global/coupa/static" in captured
     assert "no checkpoint" in captured
+
+
+# ---------------------------------------------------------------------------
+# Strategic selection (best_gain / worst_gain)
+# ---------------------------------------------------------------------------
+def _make_args(sdd_root: Path, feats: Path, scene: str) -> object:
+    args = sync._parse_args(
+        [
+            "--scenes",
+            scene,
+            "--sdd-root",
+            str(sdd_root),
+            "--video-features-root",
+            str(feats),
+            "--no-pretrained",
+            "--sampling_steps",
+            "3",
+            "--seed",
+            "42",
+        ]
+    )
+    args.video_id = None
+    args._protocol = "global"
+    args.device = "cpu"
+    return args
+
+
+def _write_metrics_csv(path: Path, dataset, gain_fn) -> None:
+    with path.open("w", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "scene",
+                "video_id",
+                "anchor_frame",
+                "window_index",
+                "ade_min_baseline",
+                "ade_min_zeroed",
+            ],
+        )
+        writer.writeheader()
+        for i in range(len(dataset)):
+            gain = float(gain_fn(i))
+            writer.writerow(
+                {
+                    "scene": dataset.windows.scene_id(i),
+                    "video_id": dataset.windows.video_id(i),
+                    "anchor_frame": int(dataset.windows.anchor_frame(i)),
+                    "window_index": i,
+                    "ade_min_baseline": f"{1.0:.6f}",
+                    "ade_min_zeroed": f"{1.0 + gain:.6f}",
+                }
+            )
+
+
+def test_row_gain_supports_both_csv_schemas():
+    aggregate = {
+        "gain_ade": "0.42",
+        "ade_baseline": "1.00",
+        "ade_zeroed": "1.42",
+    }
+    per_window = {"ade_min_baseline": "1.00", "ade_min_zeroed": "1.25"}
+    assert sync.row_gain(aggregate) == pytest.approx(0.42)
+    assert sync.row_gain(per_window) == pytest.approx(0.25)
+    # video hurts ⇒ negative ΔADE
+    assert sync.row_gain(
+        {"ade_min_baseline": "1.00", "ade_min_zeroed": "0.75"}
+    ) == pytest.approx(-0.25)
+    assert sync.row_gain({"ade_min_baseline": "nan"}) is None
+
+
+def test_rank_from_metrics_aligns_by_video_and_anchor(tmp_path, monkeypatch):
+    scene = "coupa"
+    results_root = tmp_path / "results"
+    _stage_run_dirs(results_root, scene, None)
+    monkeypatch.setattr(q, "RESULTS_DIR", results_root)
+
+    sdd_root = write_synthetic_sdd(
+        tmp_path / "sdd",
+        n_scenes=5,
+        videos_per_scene=2,
+        frames_per_video=60,
+        sdd_scenes=True,
+    )
+    feats = write_synthetic_video_cache(
+        tmp_path / "feats", scene, ("video0", "video1"), 60, dim=512
+    )
+    args = _make_args(sdd_root, feats, scene)
+    dataset, _ = sync.build_variant_dataset(scene, "off", args)
+    assert len(dataset) >= 2
+
+    # Deliberately corrupt window_index so the (video_id, anchor_frame) lookup
+    # has to do the alignment.
+    chosen = {0: 0.10, len(dataset) - 1: 0.90}
+    csv_path = tmp_path / "metrics.csv"
+    with csv_path.open("w", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "scene",
+                "video_id",
+                "anchor_frame",
+                "window_index",
+                "ade_min_baseline",
+                "ade_min_zeroed",
+            ],
+        )
+        writer.writeheader()
+        for i, gain in chosen.items():
+            writer.writerow(
+                {
+                    "scene": scene,
+                    "video_id": dataset.windows.video_id(i),
+                    "anchor_frame": int(dataset.windows.anchor_frame(i)),
+                    "window_index": -1,
+                    "ade_min_baseline": "1.0",
+                    "ade_min_zeroed": f"{1.0 + gain:.6f}",
+                }
+            )
+
+    args.metrics_csv = str(csv_path)
+    ranked, used = sync.rank_from_metrics(scene, args, dataset)
+    assert used == [csv_path]
+    assert set(ranked) == set(chosen)
+    for i, gain in chosen.items():
+        assert ranked[i] == pytest.approx(gain, abs=1e-6)
+
+
+def test_main_best_gain_from_csv(tmp_path, monkeypatch):
+    scene = "coupa"
+    results_root = tmp_path / "results"
+    _stage_run_dirs(results_root, scene, None)
+    monkeypatch.setattr(q, "RESULTS_DIR", results_root)
+    monkeypatch.setattr(q, "load_anchor_frame", _fake_anchor_frame)
+    monkeypatch.setattr(sync, "load_anchor_frame", _fake_anchor_frame)
+
+    sdd_root = write_synthetic_sdd(
+        tmp_path / "sdd",
+        n_scenes=5,
+        videos_per_scene=2,
+        frames_per_video=60,
+        sdd_scenes=True,
+    )
+    feats = write_synthetic_video_cache(
+        tmp_path / "feats", scene, ("video0", "video1"), 60, dim=512
+    )
+    args = _make_args(sdd_root, feats, scene)
+    dataset, _ = sync.build_variant_dataset(scene, "off", args)
+    n = len(dataset)
+
+    # Monotone gain so the two highest indices win deterministically.
+    csv_path = tmp_path / "metrics.csv"
+    _write_metrics_csv(csv_path, dataset, lambda i: (i + 1) / 100.0)
+
+    out_dir = tmp_path / "out"
+    sync.main(
+        [
+            "--scenes",
+            scene,
+            "--protocol",
+            "global",
+            "--selection-mode",
+            "best_gain",
+            "--rank-source",
+            "csv",
+            "--metrics-csv",
+            str(csv_path),
+            "--top-k",
+            "2",
+            "--sampling_steps",
+            "3",
+            "--no-pretrained",
+            "--sdd-root",
+            str(sdd_root),
+            "--video-features-root",
+            str(feats),
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    metas = [
+        json.loads(p.read_text())
+        for p in sorted((out_dir / "global" / scene).glob("sample_*/metadata.json"))
+    ]
+    assert len(metas) == 2
+    assert [m["window_index"] for m in metas] == [n - 1, n - 2]
+    for rank, meta in enumerate(metas, start=1):
+        assert meta["selection_mode"] == "best_gain"
+        assert meta["rank_source"] == "metrics.csv"
+        assert meta["selection_rank"] == rank
+        expected = (meta["window_index"] + 1) / 100.0
+        assert meta["selection_gain"] == pytest.approx(expected, abs=1e-6)
+        # rendered_gain is the exact ΔADE for the drawn panels (not the CSV value)
+        assert np.isfinite(meta["rendered_gain"])
+
+
+def test_main_best_gain_compute_matches_rendered_ade(tmp_path, monkeypatch):
+    scene = "coupa"
+    results_root = tmp_path / "results"
+    _stage_run_dirs(results_root, scene, None)
+    monkeypatch.setattr(q, "RESULTS_DIR", results_root)
+    monkeypatch.setattr(q, "load_anchor_frame", _fake_anchor_frame)
+    monkeypatch.setattr(sync, "load_anchor_frame", _fake_anchor_frame)
+
+    sdd_root = write_synthetic_sdd(
+        tmp_path / "sdd",
+        n_scenes=5,
+        videos_per_scene=2,
+        frames_per_video=60,
+        sdd_scenes=True,
+    )
+    feats = write_synthetic_video_cache(
+        tmp_path / "feats", scene, ("video0", "video1"), 60, dim=512
+    )
+    out_dir = tmp_path / "out"
+
+    sync.main(
+        [
+            "--scenes",
+            scene,
+            "--protocol",
+            "global",
+            "--selection-mode",
+            "best_gain",
+            "--rank-source",
+            "compute",
+            "--top-k",
+            "1",
+            "--sampling_steps",
+            "3",
+            "--no-pretrained",
+            "--sdd-root",
+            str(sdd_root),
+            "--video-features-root",
+            str(feats),
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    metas = list((out_dir / "global" / scene).glob("sample_*/metadata.json"))
+    assert len(metas) == 1
+    meta = json.loads(metas[0].read_text())
+    assert meta["selection_mode"] == "best_gain"
+    assert meta["rank_source"] == "computed"
+    rendered_gain = (
+        meta["variants"]["off"]["ade_min"] - meta["variants"]["full"]["ade_min"]
+    )
+    assert meta["rendered_gain"] == pytest.approx(rendered_gain, abs=1e-6)
+    # With rank_source=compute the ranking metric and the drawn panels agree.
+    assert meta["selection_gain"] == pytest.approx(rendered_gain, abs=1e-6)
+
+
+def test_metric_paths_keeps_protocols_separate(tmp_path):
+    metrics = tmp_path / "q4"
+    metrics.mkdir()
+    for name in (
+        "q4_window_gains.csv",
+        "q4_window_gains_vidvideo0.csv",
+        "coupa_windows.csv",
+        "coupa_windows_vidvideo0.csv",
+    ):
+        (metrics / name).write_text("scene\n")
+
+    args = _make_args(tmp_path, tmp_path, "coupa")
+    args.metrics_dir = str(metrics)
+    args.metrics_csv = None
+    args.rank_source = "auto"
+
+    args.video_id = None
+    assert [p.name for p in sync._metric_paths("coupa", args)] == [
+        "q4_window_gains.csv",
+        "coupa_windows.csv",
+    ]
+
+    args.video_id = "video0"
+    assert [p.name for p in sync._metric_paths("coupa", args)] == [
+        "q4_window_gains_vidvideo0.csv",
+        "coupa_windows_vidvideo0.csv",
+    ]
