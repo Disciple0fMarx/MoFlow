@@ -194,8 +194,15 @@ def sample_window_predictions(
     batch: dict,
     device: str,
     seed: int,
+    agent_index: int = 0,
 ) -> dict:
-    """Sample K futures for one collated window and return host NumPy arrays."""
+    """Sample K futures for one collated window and return host NumPy arrays.
+
+    ``agent_index`` selects the pedestrian within the flattened ``(b a)`` axis;
+    SDD's global config uses ``AGENTS=1`` so the default ``0`` is the window's
+    single pedestrian. Keeping it explicit lets a synchronized comparison,
+    which loads the variants separately, address the *same* agent every time.
+    """
     torch.manual_seed(seed)
     if device.startswith("cuda"):
         torch.cuda.manual_seed_all(seed)
@@ -220,23 +227,24 @@ def sample_window_predictions(
     # give the absolute pixel anchor used to place them on a video frame.
     past_full = batch["past_traj_original_scale"].numpy()
     obs_np = rearrange(past_full[..., 2:4], "b a p d -> (b a) p d").astype(np.float64)[
-        0
+        agent_index
     ]
     obs_abs = rearrange(past_full[..., 0:2], "b a p d -> (b a) p d").astype(np.float64)[
-        0
+        agent_index
     ]
 
     best, best_idx = select_best_of_k(preds_np, gt_np)
+    ai = agent_index
     ade = float(
-        np.linalg.norm(preds_np[0] - gt_np[0], axis=-1).mean(axis=-1)[best_idx[0]]
+        np.linalg.norm(preds_np[ai] - gt_np[ai], axis=-1).mean(axis=-1)[best_idx[ai]]
     )
     return {
         "obs": obs_np,
         "obs_abs": obs_abs,
-        "gt": gt_np[0],
-        "preds": preds_np[0],
-        "best": best[0],
-        "best_idx": int(best_idx[0]),
+        "gt": gt_np[ai],
+        "preds": preds_np[ai],
+        "best": best[ai],
+        "best_idx": int(best_idx[ai]),
         "ade": ade,
     }
 
