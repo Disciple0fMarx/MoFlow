@@ -91,6 +91,10 @@ def parse_config():
     parser.add_argument('--weight_decay', type=float, default=None, help='Override the weight decay in the config file.')
     ### Optimization configuration ###
 
+    parser.add_argument('--video_mode', default=None, choices=['off', 'static', 'full'], help='Video mode ablation: off/static/full')
+    parser.add_argument('--video_features_root', default=None, type=str)
+    parser.add_argument('--no_video', action='store_true')
+
     return parser.parse_args()
 
 
@@ -196,10 +200,41 @@ def init_basics(args):
 
 
     ### Update data configuration ###
-    def _update_data_params(args, cfg, tag):	
+    def _update_data_params(args, cfg, tag):
 
         cfg.subset = args.subset
         tag += f'_{cfg.subset}'
+
+        # video mode ablation
+        if args.video_mode is not None:
+            cfg.VIDEO_MODE = args.video_mode
+            try:
+                cfg.MODEL.CONTEXT_ENCODER.VIDEO_MODE = args.video_mode
+            except Exception:
+                pass
+            if args.video_mode == 'off' or args.no_video:
+                try:
+                    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = False
+                except Exception:
+                    pass
+            else:
+                try:
+                    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = True
+                except Exception:
+                    pass
+            tag += f'_vm{args.video_mode}'
+        elif args.no_video:
+            try:
+                cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = False
+            except Exception:
+                pass
+            tag += '_novid'
+
+        if args.video_features_root is not None:
+            try:
+                cfg.MODEL.CONTEXT_ENCODER.VIDEO_FEATURES_ROOT = args.video_features_root
+            except Exception:
+                pass
 
         cfg.rotate = args.rotate
         if args.rotate:
@@ -286,14 +321,16 @@ def build_data_loader(cfg, args):
     """
     Build the data loader for the ETH dataset.
     """
+    video_mode = getattr(args, 'video_mode', None) or getattr(cfg, 'VIDEO_MODE', None)
     train_dset = ETHDataset(
         cfg=cfg,
         training=True,
         data_dir=args.data_dir,
         subset=args.subset,
         rotate_time_frame=args.rotate_time_frame,
-        type = args.data_source)
-    
+        type = args.data_source,
+        video_mode=video_mode)
+
 
     train_loader = DataLoader(
         train_dset,
@@ -303,23 +340,24 @@ def build_data_loader(cfg, args):
         collate_fn=seq_collate_eth,
         pin_memory=True)
 
-   
+
     test_dset = ETHDataset(
         cfg=cfg,
         training=False,
         data_dir=args.data_dir,
         subset=args.subset,
         rotate_time_frame=args.rotate_time_frame,
-        type = args.data_source)
-        
+        type = args.data_source,
+        video_mode=video_mode)
+
     test_loader = DataLoader(
         test_dset,
-        batch_size=cfg.test_batch_size, ### change it from 500 
+        batch_size=cfg.test_batch_size, ### change it from 500
         shuffle=False,
         num_workers=4,
         collate_fn=seq_collate_eth,
         pin_memory=True)
-    
+
     return train_loader, test_loader
 
 
