@@ -12,6 +12,17 @@ import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from video_encoder.moflow_adapter import FrameFeatureLookup
 
+# TU-Clausthal raw parser (Kaggle-ready, no local pickle dependency)
+try:
+    from data.tu_clausthal_eth_ucy_parser import find_tu_clausthal_root, load_scene_data, TU_CLAUSTHAL_MAP
+except Exception:
+    try:
+        from tu_clausthal_eth_ucy_parser import find_tu_clausthal_root, load_scene_data, TU_CLAUSTHAL_MAP
+    except Exception:
+        find_tu_clausthal_root = None
+        load_scene_data = None
+        TU_CLAUSTHAL_MAP = {}
+
 
 def seq_collate_eth(batch):
     (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, z_video, agent_crops) = zip(*batch)

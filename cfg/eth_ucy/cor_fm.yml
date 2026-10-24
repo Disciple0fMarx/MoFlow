@@ -1,3 +1,9 @@
+# ------------------- Dataset (TU-Clausthal / Kaggle) -------------------------
+# For Kaggle, attach the TU-Clausthal ETH/UCY dataset to /kaggle/input and
+# it will be auto-detected. Override with --data_root or --data_dir.
+data_root: null  # e.g., /kaggle/input/ethucy or path to datasets/ with ETH/seq_eth, UCY/students03,...
+data_source: 'original'
+
 # ------------------- General Options -------------------------
 description                  : Correlated FlowMatching
 results_root_dir             : results_eth_ucy

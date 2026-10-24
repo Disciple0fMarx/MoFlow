@@ -30,7 +30,7 @@ def parse_config():
     parser.add_argument('--data_source', default='original', type=str, help='Data source for the experiment. Either be original or preprocessed ones from LED.')
     parser.add_argument('--epochs', default=None, type=int, help='Override the number of epochs in the config file.')
     parser.add_argument('--batch_size', default=None, type=int, help='Override the batch size in the config file.')
-    parser.add_argument('--data_dir', type=str, default='./data/eth_ucy', help='Directory where the data is stored.')
+    parser.add_argument('--data_dir', type=str, default=None, help='Directory where the data is stored. For Kaggle/TU-Clausthal, leave None to auto-detect /kaggle/input or use --data_root.')
     parser.add_argument('--n_train', type=int, default=None, help='Override the number training scenes used.')
     parser.add_argument('--n_test', type=int, default=None, help='Override the number testing scenes used.')
     parser.add_argument('--checkpt_freq', default=5, type=int, help='Override the checkpt_freq in the config file.')
@@ -93,6 +93,7 @@ def parse_config():
 
     parser.add_argument('--video_mode', default=None, choices=['off', 'static', 'full'], help='Video mode ablation: off/static/full')
     parser.add_argument('--video_features_root', default=None, type=str)
+    parser.add_argument('--data_root', type=str, default=None, help='TU-Clausthal dataset root (Kaggle /kaggle/input/...). Overrides data_dir.')
     parser.add_argument('--no_video', action='store_true')
 
     return parser.parse_args()
