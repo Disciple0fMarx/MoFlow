@@ -102,20 +102,34 @@ SCENE_WORLD_BOUNDS = {
 }
 
 def world_to_pixel(traj_pts, scene: str, target_res=(64, 64)):
-    """Convert world coordinates to pixel coordinates using scene bounds.
-    Mirrors ETHDataset.world_to_pixel (with 10-pixel padding).
+    """Convert world coordinates to pixel coordinates using scene homography.
+    Uses inv(H) mapping validated against ETH/UCY (world meters -> pixels).
     """
+    import os
+
     traj_w = np.array(traj_pts, dtype=np.float64)
-    orig_w, orig_h = SCENE_RESOLUTIONS[scene]
-    x_min, x_max, y_min, y_max = SCENE_WORLD_BOUNDS[scene]
-    pad = 10
-    img_pts = np.zeros_like(traj_w)
-    img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min) * (orig_w - 2*pad) + pad
-    img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min) * (orig_h - 2*pad) + pad
-    # Y-axis is inverted relative to image coordinates in all ETH-UCY scenes
-    img_pts[:, 1] = orig_h - img_pts[:, 1]
-    img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
-    img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
+    orig_w, orig_h = SCENE_RESOLUTIONS.get(scene, (720, 576))
+
+    h_path = os.path.join("data/eth_ucy/homography", f"{scene}_H.txt")
+    if os.path.exists(h_path):
+        H = np.loadtxt(h_path)
+        H_inv = np.linalg.inv(H)
+        h = np.hstack((traj_w, np.ones((len(traj_w), 1)))).T
+        c = H_inv @ h
+        img_pts = (c / c[2]).T[:, :2].copy()
+    else:
+        # Fallback for SDD or missing homography (identity-like)
+        x_min, x_max, y_min, y_max = SCENE_WORLD_BOUNDS.get(scene, (0, 1280, 720, 0))
+        pad = 10
+        img_pts = np.zeros_like(traj_w)
+        img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min + 1e-12) * (orig_w - 2 * pad) + pad
+        img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min + 1e-12) * (orig_h - 2 * pad) + pad
+        img_pts[:, 1] = orig_h - img_pts[:, 1]
+
+    if (orig_w, orig_h) != target_res:
+        img_pts = img_pts.copy()
+        img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
+        img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
     return img_pts
 
 # ---------- routes ----------

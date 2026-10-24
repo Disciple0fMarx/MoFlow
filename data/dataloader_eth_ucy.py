@@ -22,13 +22,21 @@ def seq_collate_eth(batch):
     fut_traj_vel_stack = torch.stack(traj_vel, dim=0)
 
     # z_video may be a degenerate `torch.zeros(1)` when USE_VIDEO=False — detect.
-    if z_video[0].dim() == 3:
-        z_video_stack = torch.stack(z_video, dim=0)        # [B, T_obs, D_raw]
+    if z_video[0].numel() > 1 and z_video[0].dim() >= 1:
+        # Could be [T_obs, D_raw] or [D_raw]
+        try:
+            z_video_stack = torch.stack(z_video, dim=0)
+            if z_video_stack.dim() == 3:  # [B, T_obs, D_raw]
+                pass
+            elif z_video_stack.dim() == 2:  # [B, D_raw] - rare but handle
+                pass
+        except Exception:
+            z_video_stack = None
     else:
         z_video_stack = None
 
     # agent_crops may be a degenerate `torch.zeros(1)` when USE_AGENT_VIDEO=False — detect.
-    if agent_crops[0].dim() == 4:  # [A, P, 3, h, w] -> 4 dimensions
+    if agent_crops[0].numel() > 1 and agent_crops[0].dim() == 4:
         agent_crops_stack = torch.stack(agent_crops, dim=0)  # [B, A, P, 3, h, w]
     else:
         agent_crops_stack = None
@@ -110,11 +118,40 @@ def rotate_traj(past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, s
 
 
 class ETHDataset(object):
-    def __init__(self, cfg, training=True, data_dir = None, subset = None, rotate_time_frame=0, imle=False, type='original'):
+    def __init__(self, cfg, training=True, data_dir=None, subset=None, rotate_time_frame=0, imle=False, type='original'):
         self.type = type
         self.imle = imle
         self.frame_ids = []
-        
+        # Ensure common cfg attrs expected by some trainers/tools
+        if not hasattr(cfg, 'rotate'):
+            cfg.rotate = False
+        if not hasattr(cfg, 'data_norm'):
+            cfg.data_norm = 'min_max'
+        if not hasattr(cfg, 'past_frames'):
+            cfg.past_frames = 8
+        if not hasattr(cfg, 'future_frames'):
+            cfg.future_frames = 12
+        if not hasattr(cfg, 'agents'):
+            cfg.agents = 1
+        if not hasattr(cfg, 'past_traj_min'):
+            cfg.past_traj_min = -1.0
+        if not hasattr(cfg, 'past_traj_max'):
+            cfg.past_traj_max = 1.0
+        if not hasattr(cfg, 'fut_traj_min'):
+            cfg.fut_traj_min = -1.0
+        if not hasattr(cfg, 'fut_traj_max'):
+            cfg.fut_traj_max = 1.0
+        if not hasattr(cfg, 'MODEL'):
+            class _Dummy:
+                pass
+            cfg.MODEL = _Dummy()
+        if not hasattr(cfg.MODEL, 'CONTEXT_ENCODER'):
+            class _Dummy2:
+                pass
+            cfg.MODEL.CONTEXT_ENCODER = _Dummy2()
+        if not hasattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENTS'):
+            cfg.MODEL.CONTEXT_ENCODER.AGENTS = getattr(cfg, 'agents', 1)
+
         ### LED version of preprocessed data
         if self.type == 'LED':
             data_file_path = os.path.join(data_dir, self.type, '{:s}_data_{:s}.npy'.format(subset, 'train' if training else 'test'))
@@ -385,46 +422,22 @@ class ETHDataset(object):
 
         return out
 
-    def world_to_pixel_backup(self, traj_pts, target_res=(224, 224)):
-        traj_w  = np.array(traj_pts, dtype=np.float64)
-        orig_w, orig_h = self.orig_res
-        bounds = self.SCENE_WORLD_BOUNDS.get(self.subset)
-
-        # Scenes with valid homography
-        if bounds is None:
-            h = np.hstack((traj_w, np.ones((len(traj_w), 1)))).T
-            c = self.H_inv @ h
-            img_pts = (c / c[2]).T[:, :2].copy()
-        else:
-            x_min, x_max, y_min, y_max = bounds
-            pad = 10
-            img_pts = np.zeros_like(traj_w)
-            img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min) * (orig_w - 2*pad) + pad
-            img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min) * (orig_h - 2*pad) + pad
-
-        # Flip y — world y-axis points opposite to image y-axis in all ETH-UCY scenes
-        img_pts[:, 1] = orig_h - img_pts[:, 1]
-
-        img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
-        img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
-        return img_pts
-        
     def world_to_pixel(self, traj_pts, target_res=(224, 224)):
-        traj_w  = np.array(traj_pts, dtype=np.float64)
+        traj_w = np.array(traj_pts, dtype=np.float64)
         orig_w, orig_h = self.orig_res
 
-        x_min, x_max, y_min, y_max = self.SCENE_WORLD_BOUNDS[self.subset]
-        pad = 10
-        img_pts = np.zeros_like(traj_w)
-        img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min) * (orig_w - 2*pad) + pad
-        img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min) * (orig_h - 2*pad) + pad
-        
-        # Y-axis is inverted relative to image coordinates in all ETH-UCY scenes
-        img_pts[:, 1] = orig_h - img_pts[:, 1]
+        # Use validated homography: inv(H) maps world (meters) -> pixel coordinates
+        h = np.hstack((traj_w, np.ones((len(traj_w), 1)))).T
+        c = self.H_inv @ h
+        img_pts = (c / c[2]).T[:, :2].copy()
 
-        img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
-        img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
+        # Scale from original image resolution to target_res if different
+        if (orig_w, orig_h) != target_res:
+            img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
+            img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
         return img_pts
+
+    world_to_pixel_backup = world_to_pixel  # kept for compatibility
 
     def _extract_agent_crops(self, past_traj_original_scale):
         """

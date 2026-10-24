@@ -84,7 +84,7 @@ def test_pipeline():
 
             # 6. Visual Check (Overlay ALL pedestrians per scene)
             sample_video = batch['video'][0]      # [8, 3, 224, 224]
-            sample_indexes = batch['indexes']
+            sample_indexes = batch.get('indexes', batch.get('index'))
 
             sample_idx    = int(sample_indexes[0])
             target_frame  = int(dataset.frame_ids[sample_idx])
