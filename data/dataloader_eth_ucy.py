@@ -497,8 +497,17 @@ class ETHDataset(object):
         c = self.H_inv @ h
         img_pts = (c / c[2]).T[:, :2].copy()
 
+        # Apply scene-specific coordinate conventions per notebook alignment
+        if self.subset in ('univ', 'zara1', 'zara2'):
+            img_pts = np.column_stack([img_pts[:, 0] + orig_w / 2.0, orig_h / 2.0 - img_pts[:, 1]])
+        elif self.subset == 'hotel':
+            img_pts = img_pts.copy()
+        else:  # eth
+            img_pts = img_pts.copy()
+
         # Scale from original image resolution to target_res if different
         if (orig_w, orig_h) != target_res:
+            img_pts = img_pts.copy()
             img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
             img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
         return img_pts
