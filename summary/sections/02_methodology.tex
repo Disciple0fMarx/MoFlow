@@ -1,0 +1,94 @@
+\section{Methodology}
+
+\subsection{Conditional Flow Matching}
+The baseline MoFlow architecture approximates a target vector field $U^t$ by learning a neural network $v_\theta$ that maps a Gaussian noise distribution to the true data distribution. For numerical stability, the model solves an equivalent data-space prediction task:
+\begin{equation}
+    D_\theta(Y^t, C, t) := Y^t + (1-t)v_\theta(Y^t, C, t)
+\end{equation}
+where $t \in [0, 1)$ represents the flow time, and $C$ represents the contextual information.
+
+\subsection{Video-Conditioned Multimodal Fusion}
+To extend this to a video-conditioned framework, we process an observed video clip $V \in \mathbb{R}^{T_{obs} \times H \times W \times 3}$. A global video encoder extracts scene-level context $z_{video\_global} \in \mathbb{R}^{L_{global} \times D}$. 
+
+To combine this with the trajectory-social tokens $z_{traj}$, we employ a Cross-Attention fusion mechanism:
+\begin{equation}
+    z_{fused} = \text{CrossAttention}(Q=z_{traj}, K=z_{video}, V=z_{video})
+\end{equation}
+The resulting fused context modulates the generative flow field $v_\theta(Y^t, t | z_{traj}, z_{video})$, directly influencing the sampling of the $K$ diverse future trajectories.
+
+\subsection{Agent-Centric Visual Conditioning}
+In parallel to the global scene context, we also formulate an alternative agent-centric visual encoding strategy. Rather than extracting a single representation for the entire environment, this approach dynamically extracts localized visual patches from the video frames. 
+
+For each agent $i$ at a given timestep, spatial coordinates are projected onto the pixel space using the scene's homography matrix. A visual patch $P_i \in \mathbb{R}^{H_p \times W_p \times 3}$ is cropped around the agent's mapped location. A dedicated convolutional encoder then processes these patches to yield agent-specific visual tokens $z_{video\_local}^{(i)} \in \mathbb{R}^{D}$. 
+
+This localized formulation aims to capture fine-grained environmental constraints immediately surrounding the pedestrian (e.g., adjacent obstacles or physical boundaries). The resulting local tokens can be fused with the agent's corresponding trajectory tokens, offering a highly localized modulation of the generative flow field. The success of this approach is strictly dependent on the precision of the world-to-pixel coordinate transformations.
+
+\subsection{Architecture Overview}
+The overall processing pipeline of Video-MoFlow is illustrated in Figure \ref{fig:architecture}.
+
+\begin{figure}[htpb]
+    \centering
+    % Placeholder for Excalidraw / TikZ integration
+    \begin{tikzpicture}[node distance=2cm, auto, thick, scale=0.8, transform shape]
+        % Define styles
+        \tikzstyle{block} = [rectangle, draw, blue, text width=3cm, text centered, rounded corners, minimum height=1.2cm]
+        \tikzstyle{subblock} = [rectangle, draw, green!60!black, text width=2.5cm, text centered, rounded corners, minimum height=0.8cm]
+        \tikzstyle{redblock} = [rectangle, draw, red, text width=4cm, text centered, rounded corners, minimum height=1.2cm]
+        \tikzstyle{line} = [draw, -latex', thick]
+
+        % Top Inputs
+        \node [block] (kinematic) {Kinematic Input};
+        \node [above of=kinematic, node distance=1cm, text width=3.5cm, align=center] {Past trajectories \\ $X_{past} \in \mathbb{R}^{N \times T_{obs} \times d}$};
+
+        \node [block, right of=kinematic, node distance=5.5cm] (visual) {Visual Input};
+        \node [above of=visual, node distance=1cm, text width=3.5cm, align=center] {Observed video clip \\ $V \in \mathbb{R}^{T_{obs} \times H \times W \times 3}$};
+
+        \node [block, right of=visual, node distance=4.5cm] (noise) {Gaussian Noise};
+
+        % Middle Encoders
+        \node [block, below of=kinematic, node distance=3cm, minimum height=3.5cm] (social) {};
+        \node [above, node distance=1.3cm] at (social.center) {\textcolor{blue}{Social Encoder}};
+        \node [subblock, below of=social, node distance=0.2cm, yshift=0.8cm] (mlp) {MLP};
+        \node [subblock, below of=mlp, node distance=1.2cm] (mha) {Multi-Head \\ Attention};
+        \path [line] (mlp) -- (mha);
+
+        \node [block, below of=visual, node distance=3cm, minimum height=3.5cm] (video) {};
+        \node [above, node distance=1.3cm] at (video.center) {\textcolor{blue}{Video Encoder}};
+        \node [subblock, below of=video, node distance=0.5cm] (resnet) {ResNet-18};
+
+        % Cross-Modal Fusion
+        \node [block, below right of=social, node distance=4.5cm, xshift=1.2cm, text width=5cm] (fusion) {Cross-Modal Fusion};
+
+        % Math formulas Left of Fusion
+        \node [left of=fusion, node distance=5.5cm, align=left] {
+            $z_{fused} = softmax\left(\frac{Q K^\top}{\sqrt{D}}\right) V_{attn}$ \\[0.2cm]
+            $Q = z_{traj}$ \\[0.2cm]
+            $K = V_{attn} = z_{video}$
+        };
+
+        % Concatenation
+        \node [rectangle, draw, black, rounded corners, below of=fusion, node distance=2.5cm, text width=3cm, text centered, minimum height=0.8cm] (concat) {Concatenation};
+
+        % Motion Decoder
+        \node [redblock, below of=concat, node distance=2cm] (decoder) {Motion Decoder};
+
+        % Final Output
+        \node [below of=decoder, node distance=1.5cm, font=\Large\bfseries] (output) {K Diverse Future Trajectories};
+
+        % Edges
+        \path [line] (kinematic) -- (social);
+        \path [line] (visual) -- (video);
+        \path [line] (social) -- node [left, xshift=-0.2cm, yshift=0.3cm] {$z_{traj} \in \mathbb{R}^{N \times L_{traj} \times D}$} (fusion);
+        \path [line] (video) -- node [right, xshift=0.2cm, yshift=0.3cm] {$z_{video} \in \mathbb{R}^{L_{global} \times D}$} (fusion);
+        \path [line] (fusion) -- node [left, align=right] {$z_{ctx} = Fusion(z_{traj}, z_{fused})$} (concat);
+        \path [line] (noise) |- (concat);
+        \path [line] (concat) -- (decoder);
+        \path [line] (decoder) -- (output);
+
+        % Dashed bounding box
+        \draw[dashed, thick, rounded corners] (-3.5, 1.5) rectangle (12, -9);
+    \end{tikzpicture}
+    \caption{Overview of the Video-MoFlow architecture. Global visual tokens and social-trajectory tokens are fused to modulate the conditional flow matching decoder.}
+    \label{fig:architecture}
+\end{figure}
+

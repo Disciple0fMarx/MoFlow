@@ -1,0 +1,28 @@
+\section{Experiments and Results}
+To evaluate the impact of visual conditioning, we compare the global video encoder implementation of Video-MoFlow against the baseline MoFlow model on the ETH/UCY dataset.
+
+\subsection{Quantitative Results}
+Our evaluation focuses on the minimum Average Displacement Error ($\text{minADE}_{20}$) at 4.8s and the minimum Final Displacement Error ($\text{minFDE}_{20}$) at 4.0s. As shown in Table \ref{tab:eth_ucy_results}, the current integration of global scene context generally increases displacement errors compared to the baseline.Performance degradation is most notable on the hotel and eth subsets, with minADE errors increasing by 176.95\% and 20.18\%, respectively. Conversely, marginal performance gains are observed on the zara1 subset (+6.97\% in minADE; +13.95\% in minFDE). These preliminary findings indicate that while the architecture executes successfully, the global visual features may currently introduce noise or unaligned contextual priors. This necessitates further investigation and debugging of the visual-kinematic cross-attention layers.
+
+\begin{table}[htpb]
+    \centering
+    \caption{Quantitative comparison on the ETH/UCY dataset. Lower values indicate better performance.}
+    \label{tab:eth_ucy_results}
+    \begin{tabular}{lllrrl}
+        \toprule
+        Dataset & Metric & Horizon & MoFlow (Teacher) & GVM (Teacher) & Performance Gain \\
+        \midrule
+        eth & ADE\_min & 4.8s & 0.462023 & 0.555257 & -20.18\% \\
+        eth & FDE\_min & 4.0s & 0.666986 & 0.826500 & -23.92\% \\
+        hotel & ADE\_min & 4.8s & 0.152223 & 0.421575 & -176.95\% \\
+        hotel & FDE\_min & 4.0s & 0.268332 & 0.765176 & -185.16\% \\
+        univ & ADE\_min & 4.8s & 0.247981 & 0.292342 & -17.89\% \\
+        univ & FDE\_min & 4.0s & 0.438123 & 0.540382 & -23.34\% \\
+        zara1 & ADE\_min & 4.8s & 0.172554 & 0.160521 & +6.97\% \\
+        zara1 & FDE\_min & 4.0s & 0.309535 & 0.266357 & +13.95\% \\
+        zara2 & ADE\_min & 4.8s & 0.124809 & 0.126629 & -1.46\% \\
+        zara2 & FDE\_min & 4.0s & 0.223136 & 0.214746 & +3.76\% \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+

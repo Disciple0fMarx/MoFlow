@@ -1,0 +1,13 @@
+\section{Next Steps and Action Plan}
+
+To address the current implementation roadblocks and advance the evaluation of Video-MoFlow, the immediate action plan is structured around isolated debugging and external pipeline development. Activities are temporarily scoped to accommodate the current lack of access to the remote computing environment.
+
+\subsection{Homography Validation and Correction}
+To resolve the coordinate mapping failures in the agent-centric encoder, the immediate priority is to rigorously validate the OpenTraj homography matrices for the ETH and Hotel subsets. We will construct an isolated, standalone local debugging script using OpenCV to manually project trajectory coordinates onto sample frames. This will allow us to quantify the spatial drift and formulate corrected transformation matrices before re-integrating them into the pipeline.
+
+\subsection{SDD Evaluation Pipeline Refactoring}
+To adhere to the required Leave-One-Scene-Out (LOSO) cross-validation protocol for the Stanford Drone Dataset, we will develop dedicated, external evaluation scripts. This approach ensures we can interact with the core modeling repository to compute pixel-space metrics without modifying any lines of its underlying source code. 
+
+\subsection{Memory Optimization}
+Upon restoration of remote compute access, we will implement memory-efficient data loading strategies for the 70 GB SDD repository. This will involve investigating dynamic batch loading and tensor offloading techniques to prevent the Out-Of-Memory failures previously encountered during the scene ingestion phase.
+

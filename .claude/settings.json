@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "fileWriter": {
+      "operations": [
+        {
+          "matcher": "**/*.py",
+          "operation": "black --quiet {file_path} && isort --quiet {file_path}"
+        }
+      ]
+    },
+    "before": {
+      "operations": [
+        {
+          "matcher": "bash:python fm_eth.py*",
+          "operation": "echo '⚠️  About to run training script. Verify your config in cfg/eth_ucy/cor_fm.yml is correct.' && read -p 'Continue? (y/N): ' -n 1 -r && echo    && if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 1; fi"
+        },
+        {
+          "matcher": "bash:python imle_eth.py*",
+          "operation": "echo '⚠️  About to run IMLE training script. Verify your config in cfg/eth_ucy/imle.yml is correct.' && read -p 'Continue? (y/N): ' -n 1 -r && echo    && if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 1; fi"
+        }
+      ]
+    },
+    "after": {
+      "operations": [
+        {
+          "matcher": "bash:python -m video_encoder.scripts.build_frame_index*",
+          "operation": "echo '✅  Frame index built successfully. Remember to update your config if you changed data paths.'"
+        },
+        {
+          "matcher": "bash:python test_*",
+          "operation": "echo '🧪  Tests completed. Consider running /verify to confirm behavioral changes.'"
+        }
+      ]
+    },
+    "allow": [
+      "bash:ls data/*",
+      "bash:ls cfg/*",
+      "bash:ls models/*",
+      "bash:ls video_encoder/*",
+      "bash:ls tests/*",
+      "bash:find . -name \"*.py\" -o -name \"*.yml\" -o -name \"*.txt\" -o -name \"*.pkl\"",
+      "bash:python fm_eth.py*",
+      "bash:python imle_eth.py*",
+      "bash:python -m video_encoder.*",
+      "bash:python test_*.py*",
+      "bash:python -m pytest*",
+      "bash:black*",
+      "bash:isort*",
+      "bash:git status",
+      "bash:git diff",
+      "bash:git log --oneline*",
+      "bash:cp *.yml cfg/*",
+      "bash:mkdir -p *",
+      "bash:touch *"
+    ]
+  }
+}

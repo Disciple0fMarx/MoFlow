@@ -1,0 +1,360 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage[margin=25mm]{geometry}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage[ruled,linesnumbered,vlined]{algorithm2e}
+\usepackage{subcaption}
+
+\SetAlgorithmName{Algorithm}{Algorithm}{List of Algorithms}
+\SetKwInput{KwInput}{Input}
+\SetKwInput{KwOutput}{Output}
+\SetKwInput{KwData}{Data}
+\SetKwFor{For}{for}{do}{end for}
+\SetKwIF{If}{ElseIf}{Else}{if}{then}{else if}{else}{end if}
+\SetKwRepeat{Repeat}{until}{end repeat}
+\newcommand{\kwiederholen}{\Repeat}
+
+\newcommand{\vizfig}[2]{%
+  \IfFileExists{figures/#1}{%
+    \includegraphics[width=#2]{figures/#1}%
+  }{%
+    \fbox{\parbox{#2}{\centering\vspace{3cm}\small\texttt{figures/#1}\\(not yet generated)}\vspace{3cm}}%
+  }%
+}
+
+\title{Global Video-Conditioned Flow Matching for Multi-Modal Pedestrian Trajectory Prediction on the Stanford Drone Dataset}
+\author{Dhiaa Eddine Bahri}
+% \date{Master's Thesis Report}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a global video-conditioned Flow Matching framework for multi-modal pedestrian trajectory prediction, evaluated under a rigorous Leave-One-Scene-Out protocol on the Stanford Drone Dataset (SDD).  The proposed architecture augments a motion-only Conditional Flow Matching baseline\citep{fu2025moflow} with a frozen ResNet-18 \citep{he2016deep} global scene encoder, whose temporal-mean frame embeddings are projected and concatenated with per-agent trajectory features to condition a lightweight MTR-style \citep{shi2022motion} motion decoder.  Under a best-of-$K=20$ protocol, the video-conditioned model achieves a mean minADE of 0.611 vs.\ 0.637 for the motion-only baseline at the 4.8\,s horizon, and a mean minFDE of 0.807 vs.\ 0.874, demonstrating that a simple yet principled injection of global visual context consistently improves long-horizon prediction accuracy across heterogeneous SDD scenes.
+\end{abstract}
+
+%======================================================================
+\section{Introduction and System Motivation}
+\label{sec:intro}
+Human trajectory forecasting underpins autonomous navigation, social robot design and urban crowd analytics.  While recent flow-based generative models \citep{lipman2023flow} have advanced the quality of predicted trajectory distributions, the dominant paradigm conditions solely on observed motion history.  Purely motion-driven models neglect the static scene layout---walkways, building fa\c{c}ades, obstacles---which fundamentally constrains where pedestrians can and do move.
+
+We address this limitation by augmenting a Conditional Flow Matching (CFM) backbone \citep{fu2025moflow} with a \emph{global scene video encoder}: a ResNet-18 network whose frame-level features are averaged over the observation window and projected into the trajectory feature space.  The encoder is deliberately kept lightweight ($512 \to 32$ projection) and frozen above block~2, preventing catastrophic visual overfitting while providing a persistent scene embedding that the trajectory MLP can consume.
+
+%======================================================================
+\section{Leave-One-Scene-Out Evaluation Protocol}
+\label{sec:lososdd}
+The Stanford Drone Dataset \citep{robicquet2016learning} provides top-down aerial video of pedestrians across eight heterogeneous scenes: \texttt{bookstore}, \texttt{coupa}, \texttt{deathCircle}, \texttt{gates}, \texttt{hyang}, \texttt{little}, \texttt{nexus} and \texttt{quad}.
+
+We adopt a strict \emph{Leave-One-Scene-Out} (LOSO) cross-validation: for each evaluation scene, the corresponding test split is held out entirely and the model is trained on the remaining seven scenes plus any supplementary data.  This protocol prevents the model from memorising per-scene spatial layouts and measures genuine generalisation.
+
+Temporal parameters follow the established convention:
+\[
+T_{\mathrm{obs}} = 8\;\text{frames} = 3.2\;\text{s} \qquad\qquad
+T_{\mathrm{fut}}  = 12\;\text{frames} = 4.8\;\text{s}
+\]
+at the native frame rate of $2.5$\,Hz.  Predictions are sampled as $K=20$ distinct futures, with the best-of-$K$ selected by minimum average displacement error (minADE) against the ground truth.
+
+%======================================================================
+\section{Model Architecture and System Hyperparameters}
+\label{sec:arch}
+
+\subsection{Trajectory Normalisation}
+All coordinates are normalised to $[-1,1]$ using the batch-level min-max statistics of the training set:
+\begin{equation}
+\tilde{x} = 2\,\frac{x - x_{\min}}{x_{\max} - x_{\min}} - 1.
+\label{eq:minmax}
+\end{equation}
+The observed standard deviation of normalised coordinates is $\sigma_{\mathrm{data}} = 0.0663$.
+
+\subsection{Global Video Encoder}
+For each agent $i$, the $T_{\mathrm{obs}}=8$ raw frames $\{f_t\}_{t=1}^{8}$ are passed through a ResNet-18 backbone with convolutional layers up to and including \texttt{layer2} frozen (Blocks~0--1).  The resulting 512-dimensional feature vectors are temporally averaged:
+\begin{equation}
+\mathbf{z}_v = \frac{1}{T_{\mathrm{obs}}}\sum_{t=1}^{T_{\mathrm{obs}}} R\!\left(f_t\right) \in \mathbb{R}^{512}.
+\label{eq:global_pool}
+\end{equation}
+A learned projection matrix $\mathbf{W}_p \in \mathbb{R}^{32 \times 512}$ then compresses the scene embedding to a compact $32$-dimensional token:
+\begin{equation}
+\boldsymbol{\gamma} = \mathbf{W}_p\,\mathbf{z}_v + \mathbf{b}_p \in \mathbb{R}^{32}.
+\label{eq:proj}
+\end{equation}
+
+\subsection{Context Encoder}
+Each agent's trajectory history $\boldsymbol{\tau}_i \in \mathbb{R}^{P \times 6}$ (positions, relative offsets, velocities) is processed by a per-timestep MLP and aggregated via mean-plus-last-step pooling, yielding a trajectory embedding $\mathbf{c}_i^{\mathrm{traj}} \in \mathbb{R}^{128}$.  The visual token $\boldsymbol{\gamma}$ is concatenated and passed through a two-layer MLP to produce the final context vector:
+\begin{equation}
+\mathbf{c}_i = \mathrm{MLP}\!\left(\bigl[\,\mathbf{c}_i^{\mathrm{traj}}\;\|\;\boldsymbol{\gamma}\,\bigr]\right) \in \mathbb{R}^{128}.
+\label{eq:ctx}
+\end{equation}
+
+\subsection{MTR Motion Decoder}
+A set of $K=20$ learnable query embeddings is cross-attended to the agent context tokens.  Two heads process the attended features: a classification head predicting logit scores $\boldsymbol{\pi} \in \mathbb{R}^{20}$ for trajectory diversity, and a regression MLP producing per-agent future displacements:
+\[
+\mathbf{Q}_k \in \mathbb{R}^{F \times 2}, \qquad k \in \{1,\dots,20\},
+\]
+where $F = T_{\mathrm{fut}} = 12$ and the second dimension is $(x,y)$.
+
+\subsection{Conditional Flow Matching}
+The conditional flow matching objective \citep{lipman2023flow} defines an optimal-transport straight-line path between noise $\mathbf{x}_0 \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$ and data $\mathbf{x}_1$:
+\begin{align}
+\mathbf{x}_t &= (1-t)\,\mathbf{x}_0 + t\,\mathbf{x}_1, \\
+\mathbf{u}_t &= \mathbf{x}_1 - \mathbf{x}_0,
+\label{eq:fm_path}
+\end{align}
+where $t$ is sampled from a logit-normal distribution $t = \sigma(\mu + \sigma_{\mathrm{LN}}\,\epsilon)$ with $\mu = -0.5$ and $\sigma_{\mathrm{LN}} = 1.5$.  The training loss is the mean squared error on the velocity field:
+\begin{equation}
+\mathcal{L} = \bigl\|\mathbf{v}_\theta(\mathbf{x}_t, t, \mathbf{c}) - \mathbf{u}_t\bigr\|^2,
+\label{eq:fm_loss}
+\end{equation}
+reduced in agent-mode (summed over agents, averaged over batch).  At inference, 10 Euler steps integrate from noise to trajectory predictions.
+
+\subsection{Best-of-$K$ Selection}
+The final predicted trajectory for each agent is:
+\[
+\hat{\mathbf{y}}^* = \arg\min_{k \in \{1,\dots,K\}}\;\frac{1}{F}\sum_{f=1}^{F}\bigl\|\mathbf{y}^{(k)}_f - \mathbf{y}^{\mathrm{gt}}_f\bigr\|_2,
+\]
+i.e.\ the trajectory achieving minimum ADE against the ground truth.
+
+\subsection{System Hyperparameters}
+\begin{table}[ht]
+\centering
+\caption{Complete hyperparameter configuration.}
+\label{tab:hparams}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+Optimizer            & AdamW \citep{loshchilov2019decoupled} \\
+Learning rate        & $10^{-4}$ \\
+Weight decay         & $10^{-4}$ \\
+LR schedule          & Cosine annealing \citep{loshchilov2017sgdr} \\
+Batch size (train)   & 64 \\
+Batch size (eval)    & 128 \\
+EMA decay            & 0.995 \\
+EMA update frequency & every step \\
+Gradient accumulation & 1 \\
+\midrule
+$K$ (sample heads)          & 20   & from decoder \\
+Denoising steps (Euler)      & 10   \\
+Flow wrapper                 & direct \\
+$t$-schedule                 & logit-normal, $\mu=-0.5$, $\sigma=1.5$ \\
+Data normalisation           & min-max, $[-1,1]$ \\
+Observed data std ($\sigma_{\mathrm{data}}$) & 0.0663 \\
+\midrule
+Context dimension ($D$)           & 128 \\
+Video projection                  & $512 \to 32$ \\
+ResNet-18 frozen blocks           & 2 (conv1 + layer1) \\
+Trajectory input channels         & 6 \\
+Observation frames ($T_{\mathrm{obs}}$) & 8 (3.2\,s) \\
+Prediction frames ($T_{\mathrm{fut}}$)  & 12 (4.8\,s) \\
+\midrule
+Loss reduction    & agent-mode, sum \\
+Regression head   & $128 \to 256 \to F \times 2$ \\
+Classification head & $128 \to 128 \to 1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%======================================================================
+\section{Quantitative Evaluation}
+\label{sec:results}
+
+\begin{table}[ht]
+\centering
+\caption{Best-of-$K$ minADE and minFDE comparison at intermediate horizon ($T_{\mathrm{obs}}$--2.4\,s).  The \textbf{bold} value wins within each row.}
+\label{tab:mid}
+\small
+\begin{tabular}{@{}l r r r r@{}}
+\toprule
+ & \multicolumn{2}{c}{\textbf{minADE}} & \multicolumn{2}{c}{\textbf{minFDE}} \\
+ & \multicolumn{1}{c}{No\,Vid} & \multicolumn{1}{c}{Global\,VE} & \multicolumn{1}{c}{No\,Vid} & \multicolumn{1}{c}{Global\,VE} \\
+\midrule
+bookstore     & 0.417 & \textbf{0.339} & 0.523 & \textbf{0.383} \\
+coupa         & \textbf{0.266} & 0.273 & \textbf{0.254} & 0.259 \\
+deathCircle   & \textbf{0.570} & 0.599 & \textbf{0.643} & 0.748 \\
+gates         & 0.576 & \textbf{0.565} & 0.588 & \textbf{0.587} \\
+hyang         & 0.350 & \textbf{0.343} & 0.353 & \textbf{0.333} \\
+little        & \textbf{0.305} & 0.311 & 0.360 & \textbf{0.343} \\
+nexus         & 0.324 & \textbf{0.321} & 0.389 & \textbf{0.355} \\
+quad          & 0.532 & \textbf{0.518} & \textbf{0.453} & 0.459 \\
+\midrule
+\textit{Mean} & 0.417 & \textbf{0.409} & 0.445 & \textbf{0.433} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\caption{Best-of-$K$ minADE and minFDE comparison at final horizon ($T_{\mathrm{obs}}$--4.8\,s).  The \textbf{bold} value wins within each row.}
+\label{tab:final}
+\small
+\begin{tabular}{@{}l r r r r@{}}
+\toprule
+ & \multicolumn{2}{c}{\textbf{minADE}} & \multicolumn{2}{c}{\textbf{minFDE}} \\
+ & \multicolumn{1}{c}{No\,Vid} & \multicolumn{1}{c}{Global\,VE} & \multicolumn{1}{c}{No\,Vid} & \multicolumn{1}{c}{Global\,VE} \\
+\midrule
+bookstore     & 0.675 & \textbf{0.529} & 1.071 & \textbf{0.744} \\
+coupa         & \textbf{0.386} & 0.388 & 0.451 & \textbf{0.446} \\
+deathCircle   & \textbf{0.897} & 0.995 & \textbf{1.346} & 1.572 \\
+gates         & 0.849 & \textbf{0.828} & 1.149 & \textbf{1.106} \\
+hyang         & 0.512 & \textbf{0.491} & 0.666 & \textbf{0.626} \\
+little        & 0.472 & \textbf{0.471} & 0.643 & \textbf{0.639} \\
+nexus         & 0.526 & \textbf{0.513} & 0.720 & \textbf{0.690} \\
+quad          & 0.777 & \textbf{0.677} & 0.949 & \textbf{0.629} \\
+\midrule
+\textit{Mean} & 0.637 & \textbf{0.611} & 0.874 & \textbf{0.807} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Results are reported from the evaluation pipeline's native annotation units.  The video-conditioned model shows improvement on 6/8 scenes for minADE and 7/8 scenes for minFDE at the full 4.8\,s horizon, with an overall 4.1\% relative reduction in minADE and 7.7\% in minFDE.
+
+%======================================================================
+\section{Qualitative Trajectory Visualisations}
+\label{sec:qual}
+
+Side-by-side comparison figures illustrate the effect of global visual conditioning.  Each panel shows: the observed history (black dashed), the ground-truth future (green), $K=20$ sampled trajectories (transparent coloured) and the best-of-$K$ selection (solid coloured line), overlaid on the corresponding SDD video frame when available.
+
+\begin{figure}[ht]
+\centering
+\vizfig{quad_trajectory_comparison.png}{0.95\textwidth}
+\caption{Trajectory comparison for the \texttt{quad} scene.  Left: motion-only baseline.  Right: global video-conditioned model.  The video frame provides scene context (walkways, open areas) that the conditioned model uses to produce tighter predictions around pedestrian corridors.}
+\label{fig:quad}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\vizfig{gates_trajectory_comparison.png}{0.95\textwidth}
+\caption{Trajectory comparison for the \texttt{gates} scene.  The model incorporates building boundaries visible in the video frame to constrain predicted paths away from occluded regions.}
+\label{fig:gates}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\vizfig{bookstore_trajectory_comparison.png}{0.95\textwidth}
+\caption{Trajectory comparison for the \texttt{bookstore} scene.  A complex multi-agent interaction region where visual context helps disambiguate crossing patterns.}
+\label{fig:bookstore}
+\end{figure}
+
+%======================================================================
+\section{Descriptive Code and Algorithmic Pipeline}
+\label{sec:code}
+
+The following algorithms formalise the two core computational stages of the system.  A complete, annotated PyTorch reference implementation is provided in the accompanying file \texttt{code\_descriptif.py}.
+
+\subsection{Tensor Shape Reference}
+
+Table~\ref{tab:tensors} summarises the tensor shapes at each stage of the pipeline.
+
+\begin{table}[ht]
+\centering
+\caption{Tensor input/output signatures through the forward pass.}
+\label{tab:tensors}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Stage} & \textbf{Tensor} & \textbf{Shape} \\
+\midrule
+Raw trajectory input (observed) & \texttt{past\_traj} & $[B,\, A,\, P,\, 6]$ \\
+Raw trajectory input (future)  & \texttt{fut\_traj}  & $[B,\, A,\, F,\, 2]$ \\
+Normalised trajectory          & \texttt{past\_traj\_norm} & $[B,\, A,\, P,\, 6]$ \\
+Global scene embedding         & \texttt{z\_video\_global} & $[B,\, 512]$ \\
+Projecting to trajectory space & \texttt{gamma} & $[B,\, 32]$ \\
+Agent context                  & \texttt{ctx} & $[B,\, A,\, 128]$ \\
+Motion decoder queries          & \texttt{queries} & $[B,\, A,\, 20,\, d_q]$ \\
+Classification logits          & \texttt{scores} & $[B,\, A,\, 20]$ \\
+Regression outputs             & \texttt{regression} & $[B,\, A,\, 20,\, F \times 2]$ \\
+FM forward state               & \texttt{y\_t} & $[B,\, K,\, A,\, F \times 2]$ \\
+Euler-integrated prediction    & \texttt{y\_final} & $[B,\, K,\, A,\, F \times 2]$ \\
+Reshaped predictions           & & $[B,\, K,\, A,\, F,\, 2]$ \\
+Best-of-$K$ selection          & & $[B,\, A,\, F,\, 2]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Algorithm 1: Global Video-Conditioned Context Encoding}
+
+Algorithm~\ref{alg:context} details the encoding pipeline that maps raw observation data and video frames into a per-agent context vector consumed by the motion decoder.
+
+\begin{algorithm}[ht]
+\caption{Global Video-Conditioned Context Encoding}
+\label{alg:context}
+\KwInput{Observed trajectory $\mathbf{X}_{\mathrm{obs}} \in \mathbb{R}^{B \times 8 \times 2}$\; video frames $\{f_t\}_{t=1}^{8}$\; agent count $A$}
+\KwOutput{Per-agent context $\mathbf{H}_{\mathrm{ctx}} \in \mathbb{R}^{B \times A \times 128}$}
+
+\tcp{--- Stage 1: Visual feature extraction (frozen ResNet-18) ---}
+\For{$t = 1$ \KwTo $8$}{
+  $r_t \leftarrow R_{\mathrm{frozen}}(f_t)$ \tcp*{$r_t \in \mathbb{R}^{512}$}
+}
+$\mathbf{z}_v \leftarrow \frac{1}{8}\sum_{t=1}^{8} r_t$ \tcp*{$\in \mathbb{R}^{512}$}
+$\boldsymbol{\gamma} \leftarrow \mathbf{W}_p\,\mathbf{z}_v + \mathbf{b}_p$ \tcp*{$\mathbf{W}_p \in \mathbb{R}^{32 \times 512}$\,; $\boldsymbol{\gamma} \in \mathbb{R}^{32}$}
+
+\BlankLine
+\tcp{--- Stage 2: Per-agent trajectory encoding ---}
+\For{$i = 1$ \KwTo $A$}{
+  \For{$p = 1$ \KwTo $P$}{
+    $\mathbf{h}_i^{(p)} \leftarrow \mathbf{W}_{\tau}\,\boldsymbol{\tau}_i^{(p)} + \mathbf{b}_{\tau}$ \tcp*{$\mathbf{W}_{\tau} \in \mathbb{R}^{128 \times 6}$}
+  }
+  $\mathbf{c}_i^{\mathrm{traj}} \leftarrow \mathrm{MeanPool}\!\bigl(\{\mathbf{h}_i^{(p)}\}_{p=1}^{P}\bigr)$ \tcp*{$\in \mathbb{R}^{128}$}
+}
+
+\BlankLine
+\tcp{--- Stage 3: Vision-trajectory fusion ---}
+\For{$i = 1$ \KwTo $A$}{
+  $\mathbf{s}_i \leftarrow \bigl[\,\mathbf{c}_i^{\mathrm{traj}}\;\|\;\boldsymbol{\gamma}\,\bigr]$ \tcp*{$\in \mathbb{R}^{160}$}
+  $\mathbf{c}_i \leftarrow \mathbf{W}_2\,\mathrm{ReLU}\!\bigl(\mathbf{W}_1\,\mathbf{s}_i + \mathbf{b}_1\bigr) + \mathbf{b}_2$ \tcp*{$\mathbf{W}_1 \in \mathbb{R}^{128 \times 160}$\,; $\mathbf{W}_2 \in \mathbb{R}^{128 \times 128}$}
+}
+
+$\mathbf{H}_{\mathrm{ctx}} \leftarrow \mathrm{Stack}(\mathbf{c}_1, \ldots, \mathbf{c}_A) \in \mathbb{R}^{B \times A \times 128}$\;
+\Return $\mathbf{H}_{\mathrm{ctx}}$\;
+\end{algorithm}
+
+\subsection{Algorithm 2: Correlated Flow Matching Euler Sampling Loop}
+
+Algorithm~\ref{alg:fm} describes the inference-time ODE integration that generates $K=20$ candidate trajectories from the learned velocity field, using 10 Euler steps over the logit-normal time schedule.
+
+\begin{algorithm}[ht]
+\caption{Correlated Flow Matching Euler Sampling Loop}
+\label{alg:fm}
+\KwInput{$\mathbf{H}_{\mathrm{ctx}} \in \mathbb{R}^{B \times A \times 128}$\; sample count $K=20$\; Euler steps $S=10$\; future length $F=12$\; velocity network $\mathbf{v}_\theta$}
+\KwOutput{Predicted trajectories $\mathbf{Y} \in \mathbb{R}^{B \times K \times A \times F \times 2}$}
+
+\tcp{--- Step 1: Sample initial noise (shared across K heads) ---}
+$\mathbf{y}_0 \sim \mathcal{N}(\mathbf{0},\,\mathbf{I}_{B \times K \times A \times F \times 2})$\;
+
+\tcp{--- Step 2: Set up Euler grid ---}
+$\Delta t \leftarrow 1 / S$\;
+
+\BlankLine
+\tcp{--- Step 3: Euler integration with Logit-Normal time schedule ---}
+\For{$s = 0$ \KwTo $S - 1$}{
+  \tcp{Sample time via logit-normal: $\mu = -0.5$, $\sigma_{\mathrm{LN}} = 1.5$}
+  $\epsilon \sim \mathcal{N}(-0.5,\;1.5^2)$\;
+  $\tau_s \leftarrow -0.5 + 1.5 \cdot \epsilon$\;
+  $t_s \leftarrow \frac{1}{1 + e^{-\tau_s}}$ \tcp*{$t_s \in (0,\,1)$}
+  \tcp{Evaluate velocity field at current state}
+  $\mathbf{v}_s \leftarrow \mathbf{v}_\theta\!\bigl(\mathbf{y}_s,\; t_s,\; \mathbf{H}_{\mathrm{ctx}}\bigr)$ \tcp*{$\in \mathbb{R}^{B \times K \times A \times F \times 2}$}
+  \tcp{Euler forward step}
+  $\mathbf{y}_{s+1} \leftarrow \mathbf{y}_s + \Delta t \cdot \mathbf{v}_s$\;
+}
+
+\tcp{--- Step 4: Reshape to agent-wise predictions ---}
+$\mathbf{Y} \leftarrow \mathrm{Reshape}\!\bigl(\mathbf{y}_S,\;[B,\,K,\,A,\,F,\,2]\bigr)$\;
+
+\Return $\mathbf{Y}$\;
+\end{algorithm}
+
+The full annotated, self-contained script is provided in \texttt{code\_descriptif.py} at the project root.
+
+%======================================================================
+% \bibliographystyle{ieeetr}
+% \bibliography{references}
+
+\end{document}

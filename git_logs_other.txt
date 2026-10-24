@@ -1,0 +1,609 @@
+9018786705598982a9600608420b01539ee42728
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-08 02:08:58 +0100
+test: implement end-to-end backbone verification for multimodal orchestration
+- Introduces an integration test for the ETHMotionTransformer (Teacher) and ETHIMLETransformer (Student) backbones. It validates the logic for extracting synchronised 5D video tensors from the batch dictionary and confirms that the resulting video-conditioned context (`z_ctx`) is correctly formatted with shape (Batch, Agents, 128) for use by the Motion Decoder.
+
+
+
+A	test_backbone_integration.py
+5924ae3333f285fcbfae2b9afa345c3e4acf1353
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-08 02:06:42 +0100
+feat(model): enable multimodal orchestration in the MotionTransformer backbone
+- Updates the forward pass of both the Teacher (`ETHMotionTransformer`) and Student (`ETHIMLETransformer`) classes to extract video_frames from the batch dictionary.
+- This commit enables the backbone to orchestrate the flow of 5D video tensors into the context encoder, ensuring the Conditional Flow Matching Decoder is modulated by visual evidence.
+
+
+
+M	models/backbone_eth_ucy.py
+9fa03e8161776c9fda7500197ef2b5f594389723
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-08 01:59:33 +0100
+test: implement integration verification for multimodal context and backbone flow
+- Introduces a suite of integration tests to validate the complete architectural pipeline.
+- Confirms that 4D trajectory inputs and 5D video tensors are correctly processed to yield the required (Batch, Agents, 128) context tokens.
+- These tests serve as a "multimodal dry run," ensuring the system is stable before launching the heavy fm_eth.py training loop.
+
+
+
+A	test_integrated_encoder.py
+b1b9eb0f7d266e7169f3a08cebb630531877e95c
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-08 01:52:36 +0100
+feat(model): implement Video-Conditioned ETHEncoder with Cross-Modal Fusion
+- Transforms the original trajectory-only encoder into a multimodal unit by integrating the `GlobalVideoEncoder` and `CrossModalFusion` modules.
+- Implements Variant B (Cross-Attention), allowing agent kinematic tokens (`z_traj`) to query visual scene features (`z_video`) to produce a scene-grounded context.
+- Maintains backward compatibility for baseline runs by supporting optional video inputs.
+
+
+
+M	models/context_encoder/eth_encoder.py
+b5720adcc504e7f1254ab7307cf5c24000bc0af0
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-07 03:13:56 +0100
+test: implement unit verification for Cross-modal Fusion attention mechanism
+Introduced a unit test for the Cross-modal Conditioning Module to validate Variant B (Cross-Attention). The script confirms that kinematic trajectory tokens (`z_traj`) can successfully query visual tokens (`z_video`) via Multi-Head Attention to produce a unified video-conditioned context (`z_ctx`) of shape (Batch, 8, 128) without dimensional mismatch.
+
+
+
+A	test_fusion_module.py
+61258ae9fa33ad1ef91554bff9adc735b1139bc3
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-07 03:12:38 +0100
+test: implement unit verification for Global Video Encoder feature extraction
+Created a standalone test script to verify the Global Video Encoder. t validates the processing of 5D video batch tensors (Batch, 8, 3, 224, 224) through the ResNet backbone and confirms that global spatial average pooling (across dimensions) correctly distills features into the required 128-dimensional visual tokens (`z_video`)
+
+
+
+A	test_video_encoder.py
+3ddbc50253b298866dc16ab46247def15085a3bd
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-07 03:10:12 +0100
+feat(model): implement cross-modal attention fusion for video conditioning
+- Implemented Variant B (Cross-modal Conditioning Module) using Multi-Head Cross-Attention.
+- Configures kinematic trajectory tokens (`z_traj`) as the Query to "interrogate" visual tokens (`z_video`) for environmental constraints.
+- The module includes Layer Normalization and a residual connection to produce a unified Video-conditioned context (`z_ctx`) of shape `(Batch, 8, 128)`, ready for injection into the flow matching decoder.
+
+
+
+A	models/context_encoder/fusion_module.py
+3baa69a3e59fe9a7e8845b0492c6b0c827031b82
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-07 03:07:59 +0100
+feat(model): implement ResNet-based Global Video Encoder for visual tokens
+- Implements the Global Video Encoder using a ResNet-18 backbone to extract scene-level context.
+- Uses global spatial average pooling across dimensions
+ to distill 7×7 feature maps into semantic context vectors.
+- Projects the resulting features into a 128-dimensional embedding space (`z_video​`) to ensure compatibility with the trajectory encoder and upcoming cross-modal fusion.
+
+
+
+A	models/context_encoder/video_encoder.py
+06954b058a12b8452a84288cf6669765410fb6aa
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-07 02:13:33 +0100
+refactor(test): accommodate homography coord conversion
+
+
+
+M	test_video_pipeline.py
+46a40285eacead1ad62393f2b71ce55dbb9c3eb3
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-07 02:12:30 +0100
+feat(data): add world to pixel conversion
+- NOTE: in its current state, this only works for the `zara1` and `zara2` scenes.
+
+
+
+M	data/dataloader_eth_ucy.py
+d34a96e47893defa62cdc6d9f2bcf06dd90f79ee
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-06 03:06:24 +0100
+feat(data): add homography matrices
+
+
+
+A	data/eth_ucy/homography/eth_H.txt
+A	data/eth_ucy/homography/hotel_H.txt
+A	data/eth_ucy/homography/univ_H.txt
+A	data/eth_ucy/homography/zara1_H.txt
+A	data/eth_ucy/homography/zara2_H.txt
+ef9cba12c879de8cb449eb40c540be68f3ccfefa
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-06 02:58:47 +0100
+test: implement multimodal pipeline verification with trajectory overlays
+
+
+
+M	test_video_pipeline.py
+e345b0bc0a657258404d64bb5348b0a984730933
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-06 02:58:20 +0100
+fix(data): extend ETH dataloader for video conditioning and fix synchronization crashes
+
+
+
+M	data/dataloader_eth_ucy.py
+c7b5a5371f03316bfd4beb3501ee51d112a5f691
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-05 16:44:19 +0100
+feat(test): add simple verification script for the video data pipeline
+- Added `test_video_pipeline.py` to validate tensor shapes and visual synchronization between video frames and trajectory coordinates.
+
+
+
+A	test_video_pipeline.py
+2cde52ebd9312ef806ee893999c91585e891d06c
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-05 16:43:48 +0100
+feat(data): implement synchronized video extraction in ETHDataset
+- Updated `ETHDataset.__init__` to initialize video paths and frame transforms.
+- Modified `ETHDataset.__getitem__` to extract 8 frames (`T_obs`) synchronized with trajectory data using a 10-frame step (2.5 FPS).
+- Refactored `seq_collate_eth` and `seq_collate_imle_train` to support multi-modal batches for both teacher and student models.
+
+
+
+M	data/dataloader_eth_ucy.py
+6ecabb627e12ef4df81fdcd92596517bffd91b4f
+Dhya El Bahri <disciple0fmarx@tuta.io>
+2026-05-05 00:46:26 +0100
+feat(videos): add ETH/UCY scene videos
+
+
+
+A	data/eth_ucy/videos/eth.avi
+A	data/eth_ucy/videos/hotel.avi
+A	data/eth_ucy/videos/univ.avi
+A	data/eth_ucy/videos/zara1.avi
+A	data/eth_ucy/videos/zara2.avi
+33811c316e35347286253fdb9422856b0fef9ffe
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-12-15 11:39:44 -0800
+Delete eval_imle_eth.py
+
+
+
+D	eval_imle_eth.py
+e604a7024e2e453dce1c02f05dd9cbc058bfd437
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-12-15 11:39:28 -0800
+Delete eval_imle_nba.py
+
+
+
+D	eval_imle_nba.py
+3ae45c130dc05a59549eddf138b9b998a994271e
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-12-15 11:35:30 -0800
+Update README to remove some evaluation scripts
+
+
+
+M	README.md
+a45ece7f6d54ac602fad9be75ff224a0eb6fac3a
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-09-22 16:34:18 -0700
+Merge pull request #6 from Frank-Star-fn/main
+Corrected the serial number
+
+142f77b4f4843f01b1ab5b90004d2e91720d6f99
+Frank Star <72490620+Frank-Star-fn@users.noreply.github.com>
+2025-09-22 18:35:53 +0800
+Corrected the serial number
+Corrected the serial number
+
+
+M	README.md
+8491b4a4174570f078ab960a5137af54dbeb1d87
+Felix Fu <sunshinesea.f@gmail.com>
+2025-07-22 11:11:20 -0700
+update the code based on issue #5, specify the data_source for ETH dataset, update README about the ETH dataset setup, remove the debugging overfit option in the code
+
+
+
+M	README.md
+M	eval_eth.py
+M	eval_imle_eth.py
+M	eval_imle_nba.py
+M	fm_eth.py
+M	fm_sdd.py
+M	imle_eth.py
+M	imle_sdd.py
+42475550b67625c2d9380dc268d1e7c0d66ea595
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-07-20 14:37:35 -0700
+Update LICENSE
+
+
+
+M	LICENSE
+9753d34dc3ffd972397c4a1fe3ddd6fdf1f606da
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-07-20 14:36:51 -0700
+Create LICENSE
+
+
+
+A	LICENSE
+b4ac324bd8955f9789d84f01f38f7733c79f881b
+Felix Fu <841808303@qq.com>
+2025-06-25 23:45:21 -0700
+fix issue #4, many thanks to SamuelYH-1
+
+
+
+M	data/dataloader_nba.py
+b524a2231f047cd365c02871f2930e31b3c279b3
+Felix Fu <841808303@qq.com>
+2025-06-19 21:51:42 -0700
+fixed the date in news :: README.md
+
+
+
+M	README.md
+11d126f53e464e926ceba50cf5a7d4921b3db640
+Felix Fu <841808303@qq.com>
+2025-04-28 19:24:27 -0700
+update the readme to clarify the place of teacher samples again
+
+
+
+M	README.md
+28396121da120bf12b318577c297b0cb5bbad6bb
+Felix Fu <841808303@qq.com>
+2025-04-26 19:01:57 -0700
+clarify the training process of IMLE, esp. where to place the teacher samples
+
+
+
+M	README.md
+M	data/dataloader_eth_ucy.py
+M	data/dataloader_nba.py
+M	data/dataloader_sdd.py
+af1a5c8bda4ea3016faeca5b9c6cc40d98e76556
+Felix Fu <841808303@qq.com>
+2025-04-23 23:22:54 -0700
+add more training info to the readme file
+
+
+
+M	README.md
+37620d99c9add3d50a5b43475c4ef1e039f83cc6
+Felix Fu <841808303@qq.com>
+2025-03-31 21:40:11 -0700
+update the news
+
+
+
+M	README.md
+74e00105d41b4f0d22518cc7c61b2c298fc9db34
+Felix Fu <841808303@qq.com>
+2025-03-30 16:16:04 -0700
+add a .gitignore file add additional HF checkpoints of samples and model weights
+
+
+
+A	.gitignore
+M	README.md
+2e39c5c819f81ea87ea0c89e2281e93ae60f9557
+Felix Fu <841808303@qq.com>
+2025-03-30 11:46:43 -0700
+add evaluation code for IMLE models and save samples. Update the readme file and add project structure section
+
+
+
+M	README.md
+M	imle_eth.py
+M	imle_nba.py
+M	imle_sdd.py
+f1b374bd3c1f39e825540fee158c357ec7870ea4
+Felix Fu <841808303@qq.com>
+2025-03-28 17:02:15 -0700
+fix bugs in sdd dataloader, fix the min requirement txt
+
+
+
+M	README.md
+M	data/dataloader_sdd.py
+M	requirements.txt
+7219eddb6ae25ca17beefa156e1375ff17e4593d
+Felix Fu <841808303@qq.com>
+2025-03-28 10:05:12 -0700
+update the contact info
+
+
+
+M	README.md
+97bbf3733ca3b1b47ef4d0952f3a54e6f8682fdb
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-28 00:29:19 -0700
+Update README.md
+
+
+
+M	README.md
+ee7047ecd572cf0501476579dc92564a9e19dc31
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-28 00:28:16 -0700
+Update README.md
+
+
+
+M	README.md
+d35341663636dcaf152ec3cdc96dcbddbb2064b0
+Felix Fu <841808303@qq.com>
+2025-03-28 00:23:17 -0700
+update the image of architecture and the description
+
+
+
+M	README.md
+A	images/moflow-architecture.png
+7473d0375a3d8d38bbc8f70fb474b1bf20304215
+Felix Fu <841808303@qq.com>
+2025-03-28 00:10:57 -0700
+update acknowledgement
+
+
+
+M	README.md
+2af58a18f34c4051dc996ea9a324bba21a8723ec
+Felix Fu <841808303@qq.com>
+2025-03-28 00:06:01 -0700
+add suggestions
+
+
+
+M	README.md
+cb52374768ac5f0f07feb5ea1ea72ac738274398
+Felix Fu <841808303@qq.com>
+2025-03-27 23:51:22 -0700
+Update the website badge
+
+
+
+M	README.md
+7d2132ecf3a1b1597f80918fa4b1f79d685c064c
+Felix Fu <841808303@qq.com>
+2025-03-27 23:41:28 -0700
+update v1
+
+
+
+M	README.md
+A	cfg/eth_ucy/cor_fm.yml
+A	cfg/eth_ucy/imle.yml
+A	cfg/nba/cor_fm.yml
+A	cfg/nba/imle.yml
+A	cfg/sdd/cor_fm.yml
+A	cfg/sdd/imle.yml
+A	data/dataloader_eth_ucy.py
+A	data/dataloader_nba.py
+A	data/dataloader_sdd.py
+A	data/eth_ucy/LED/eth_data_test.npy
+A	data/eth_ucy/LED/eth_data_train.npy
+A	data/eth_ucy/LED/eth_num_test.npy
+A	data/eth_ucy/LED/eth_num_train.npy
+A	data/eth_ucy/LED/hotel_data_test.npy
+A	data/eth_ucy/LED/hotel_data_train.npy
+A	data/eth_ucy/LED/hotel_num_test.npy
+A	data/eth_ucy/LED/hotel_num_train.npy
+A	data/eth_ucy/LED/univ_data_test.npy
+A	data/eth_ucy/LED/univ_data_train.npy
+A	data/eth_ucy/LED/univ_num_test.npy
+A	data/eth_ucy/LED/univ_num_train.npy
+A	data/eth_ucy/LED/zara1_data_test.npy
+A	data/eth_ucy/LED/zara1_data_train.npy
+A	data/eth_ucy/LED/zara1_num_test.npy
+A	data/eth_ucy/LED/zara1_num_train.npy
+A	data/eth_ucy/LED/zara2_data_test.npy
+A	data/eth_ucy/LED/zara2_data_train.npy
+A	data/eth_ucy/LED/zara2_num_test.npy
+A	data/eth_ucy/LED/zara2_num_train.npy
+A	data/eth_ucy/download_eth_ucy_dataset.sh
+A	data/eth_ucy/original/eth/eth_test.pkl
+A	data/eth_ucy/original/eth/eth_train.pkl
+A	data/eth_ucy/original/eth/eth_val.pkl
+A	data/eth_ucy/original/eth/test/biwi_eth.txt
+A	data/eth_ucy/original/eth/train/biwi_hotel_train.txt
+A	data/eth_ucy/original/eth/train/crowds_zara01_train.txt
+A	data/eth_ucy/original/eth/train/crowds_zara02_train.txt
+A	data/eth_ucy/original/eth/train/crowds_zara03_train.txt
+A	data/eth_ucy/original/eth/train/students001_train.txt
+A	data/eth_ucy/original/eth/train/students003_train.txt
+A	data/eth_ucy/original/eth/train/uni_examples_train.txt
+A	data/eth_ucy/original/eth/val/biwi_hotel_val.txt
+A	data/eth_ucy/original/eth/val/crowds_zara01_val.txt
+A	data/eth_ucy/original/eth/val/crowds_zara02_val.txt
+A	data/eth_ucy/original/eth/val/crowds_zara03_val.txt
+A	data/eth_ucy/original/eth/val/students001_val.txt
+A	data/eth_ucy/original/eth/val/students003_val.txt
+A	data/eth_ucy/original/eth/val/uni_examples_val.txt
+A	data/eth_ucy/original/hotel/hotel_test.pkl
+A	data/eth_ucy/original/hotel/hotel_train.pkl
+A	data/eth_ucy/original/hotel/hotel_val.pkl
+A	data/eth_ucy/original/hotel/test/biwi_hotel.txt
+A	data/eth_ucy/original/hotel/train/biwi_eth_train.txt
+A	data/eth_ucy/original/hotel/train/crowds_zara01_train.txt
+A	data/eth_ucy/original/hotel/train/crowds_zara02_train.txt
+A	data/eth_ucy/original/hotel/train/crowds_zara03_train.txt
+A	data/eth_ucy/original/hotel/train/students001_train.txt
+A	data/eth_ucy/original/hotel/train/students003_train.txt
+A	data/eth_ucy/original/hotel/train/uni_examples_train.txt
+A	data/eth_ucy/original/hotel/val/biwi_eth_val.txt
+A	data/eth_ucy/original/hotel/val/crowds_zara01_val.txt
+A	data/eth_ucy/original/hotel/val/crowds_zara02_val.txt
+A	data/eth_ucy/original/hotel/val/crowds_zara03_val.txt
+A	data/eth_ucy/original/hotel/val/students001_val.txt
+A	data/eth_ucy/original/hotel/val/students003_val.txt
+A	data/eth_ucy/original/hotel/val/uni_examples_val.txt
+A	data/eth_ucy/original/raw/all_data/biwi_eth.txt
+A	data/eth_ucy/original/raw/all_data/biwi_hotel.txt
+A	data/eth_ucy/original/raw/all_data/crowds_zara01.txt
+A	data/eth_ucy/original/raw/all_data/crowds_zara02.txt
+A	data/eth_ucy/original/raw/all_data/crowds_zara03.txt
+A	data/eth_ucy/original/raw/all_data/students001.txt
+A	data/eth_ucy/original/raw/all_data/students003.txt
+A	data/eth_ucy/original/raw/all_data/uni_examples.txt
+A	data/eth_ucy/original/raw/train/biwi_eth_train.txt
+A	data/eth_ucy/original/raw/train/biwi_hotel_train.txt
+A	data/eth_ucy/original/raw/train/crowds_zara01_train.txt
+A	data/eth_ucy/original/raw/train/crowds_zara02_train.txt
+A	data/eth_ucy/original/raw/train/crowds_zara03_train.txt
+A	data/eth_ucy/original/raw/train/students001_train.txt
+A	data/eth_ucy/original/raw/train/students003_train.txt
+A	data/eth_ucy/original/raw/train/uni_examples_train.txt
+A	data/eth_ucy/original/raw/val/biwi_eth_val.txt
+A	data/eth_ucy/original/raw/val/biwi_hotel_val.txt
+A	data/eth_ucy/original/raw/val/crowds_zara01_val.txt
+A	data/eth_ucy/original/raw/val/crowds_zara02_val.txt
+A	data/eth_ucy/original/raw/val/crowds_zara03_val.txt
+A	data/eth_ucy/original/raw/val/students001_val.txt
+A	data/eth_ucy/original/raw/val/students003_val.txt
+A	data/eth_ucy/original/raw/val/uni_examples_val.txt
+A	data/eth_ucy/original/univ/test/students001.txt
+A	data/eth_ucy/original/univ/test/students003.txt
+A	data/eth_ucy/original/univ/train/biwi_eth_train.txt
+A	data/eth_ucy/original/univ/train/biwi_hotel_train.txt
+A	data/eth_ucy/original/univ/train/crowds_zara01_train.txt
+A	data/eth_ucy/original/univ/train/crowds_zara02_train.txt
+A	data/eth_ucy/original/univ/train/crowds_zara03_train.txt
+A	data/eth_ucy/original/univ/train/uni_examples_train.txt
+A	data/eth_ucy/original/univ/univ_test.pkl
+A	data/eth_ucy/original/univ/univ_train.pkl
+A	data/eth_ucy/original/univ/univ_val.pkl
+A	data/eth_ucy/original/univ/val/biwi_eth_val.txt
+A	data/eth_ucy/original/univ/val/biwi_hotel_val.txt
+A	data/eth_ucy/original/univ/val/crowds_zara01_val.txt
+A	data/eth_ucy/original/univ/val/crowds_zara02_val.txt
+A	data/eth_ucy/original/univ/val/crowds_zara03_val.txt
+A	data/eth_ucy/original/univ/val/uni_examples_val.txt
+A	data/eth_ucy/original/zara1/test/crowds_zara01.txt
+A	data/eth_ucy/original/zara1/train/biwi_eth_train.txt
+A	data/eth_ucy/original/zara1/train/biwi_hotel_train.txt
+A	data/eth_ucy/original/zara1/train/crowds_zara02_train.txt
+A	data/eth_ucy/original/zara1/train/crowds_zara03_train.txt
+A	data/eth_ucy/original/zara1/train/students001_train.txt
+A	data/eth_ucy/original/zara1/train/students003_train.txt
+A	data/eth_ucy/original/zara1/train/uni_examples_train.txt
+A	data/eth_ucy/original/zara1/val/biwi_eth_val.txt
+A	data/eth_ucy/original/zara1/val/biwi_hotel_val.txt
+A	data/eth_ucy/original/zara1/val/crowds_zara02_val.txt
+A	data/eth_ucy/original/zara1/val/crowds_zara03_val.txt
+A	data/eth_ucy/original/zara1/val/students001_val.txt
+A	data/eth_ucy/original/zara1/val/students003_val.txt
+A	data/eth_ucy/original/zara1/val/uni_examples_val.txt
+A	data/eth_ucy/original/zara1/zara1_test.pkl
+A	data/eth_ucy/original/zara1/zara1_train.pkl
+A	data/eth_ucy/original/zara1/zara1_val.pkl
+A	data/eth_ucy/original/zara2/test/crowds_zara02.txt
+A	data/eth_ucy/original/zara2/train/biwi_eth_train.txt
+A	data/eth_ucy/original/zara2/train/biwi_hotel_train.txt
+A	data/eth_ucy/original/zara2/train/crowds_zara01_train.txt
+A	data/eth_ucy/original/zara2/train/crowds_zara03_train.txt
+A	data/eth_ucy/original/zara2/train/students001_train.txt
+A	data/eth_ucy/original/zara2/train/students003_train.txt
+A	data/eth_ucy/original/zara2/train/uni_examples_train.txt
+A	data/eth_ucy/original/zara2/val/biwi_eth_val.txt
+A	data/eth_ucy/original/zara2/val/biwi_hotel_val.txt
+A	data/eth_ucy/original/zara2/val/crowds_zara01_val.txt
+A	data/eth_ucy/original/zara2/val/crowds_zara03_val.txt
+A	data/eth_ucy/original/zara2/val/students001_val.txt
+A	data/eth_ucy/original/zara2/val/students003_val.txt
+A	data/eth_ucy/original/zara2/val/uni_examples_val.txt
+A	data/eth_ucy/original/zara2/zara2_test.pkl
+A	data/eth_ucy/original/zara2/zara2_train.pkl
+A	data/eth_ucy/original/zara2/zara2_val.pkl
+A	data/nba/original/nba_test.npy
+A	data/nba/original/nba_train.npy
+A	data/sdd/nsp/sdd_nsp_test.pkl
+A	data/sdd/nsp/sdd_nsp_train.pkl
+A	data/sdd/original/sdd_test.pkl
+A	data/sdd/original/sdd_train.pkl
+A	data/store_pickle_eth_files.py
+A	eval_eth.py
+A	eval_imle_eth.py
+A	eval_imle_nba.py
+A	eval_nba.py
+A	eval_sdd.py
+A	fm_eth.py
+A	fm_nba.py
+A	fm_sdd.py
+A	images/moflow-imle.png
+A	imle_eth.py
+A	imle_nba.py
+A	imle_sdd.py
+A	models/backbone.py
+A	models/backbone_eth_ucy.py
+A	models/context_encoder/__init__.py
+A	models/context_encoder/eth_encoder.py
+A	models/context_encoder/mtr_encoder.py
+A	models/flow_matching.py
+A	models/imle.py
+A	models/motion_decoder/__init__.py
+A	models/motion_decoder/mtr_decoder.py
+A	models/utils/common_layers.py
+A	models/utils/polyline_encoder.py
+A	requirements.txt
+A	trainer/denoising_model_trainers.py
+A	trainer/imle_trainers.py
+A	utils/config.py
+A	utils/normalization.py
+A	utils/utils.py
+4972ff185a92107b368a038d04bfe4d827987107
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-05 10:33:17 -0800
+Update README.md
+
+
+
+M	README.md
+2833101f6dbdd5f05db3b2f398885719ec7884e5
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-05 10:26:33 -0800
+upload star history
+
+
+
+M	README.md
+9b4aa45f85e6aa8274a93d7d2c5a3154cf604333
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-05 10:12:31 -0800
+Update README.md
+
+
+
+M	README.md
+914a8fd9a5cb6682bf95d7ec972b87a841919428
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-04 22:10:36 -0800
+Update README.md
+
+
+
+M	README.md
+458e16f8c8a7d46ad742046e68e12feb7d007db7
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-04 22:10:05 -0800
+Update README.md
+
+
+
+M	README.md
+7a0f04d84643b0d6f582d0821f29a2c05edcde28
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-04 22:04:23 -0800
+Update README.md
+
+
+
+M	README.md
+0c3a74f8ba08749ce199ec5bda2b7029a8dc7a16
+Felix Fu <45562044+felix-yuxiang@users.noreply.github.com>
+2025-03-04 21:47:43 -0800
+Initial commit
+
+
+
+A	README.md

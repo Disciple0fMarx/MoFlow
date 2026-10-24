@@ -1,0 +1,37 @@
+\documentclass[12pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs} % For professional, scientifically-acceptable tables
+\usepackage{tikz}     % For drawing architectural diagrams
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{authblk}
+
+\geometry{margin=1in}
+
+\title{Video-MoFlow: Video-Conditioned One-Step Flow Matching for Human Trajectory Forecasting}
+\author{Dhiaa Eddine Bahri}
+\affil{Higher Institute of Multimedia Arts of Manouba (ISAMM) \\ Data Science and Information Retrieval}
+\date{August 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Human trajectory forecasting requires modeling complex, multi-modal future movements. We extend the one-step flow matching model, MoFlow, by integrating rich visual evidence from video inputs. By conditioning the generative flow field on global visual tokens, our proposed Video-MoFlow significantly reduces spatial ambiguity. Preliminary results on the ETH/UCY dataset demonstrate the efficacy of our global video encoder in improving trajectory precision.
+\end{abstract}
+
+\input{sections/01_introduction}
+\input{sections/02_methodology}
+\input{sections/03_experiments}
+\input{sections/04_limitations}
+\input{sections/05_conclusion}
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
+

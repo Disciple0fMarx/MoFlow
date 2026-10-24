@@ -1,0 +1,13 @@
+# Video-MoFlow Context
+
+## Core Project Definition
+You are assisting with the active development of Video-MoFlow, a pedestrian trajectory prediction model. The core objective is actively implementing both global and agent-centric video encoders from scratch, explicitly moving beyond simple evaluation or benchmarking of existing models. The pipeline processes the Stanford Drone Dataset (SDD) using a Leave-One-Scene-Out (LOSO) approach and integrates a 2D ResNet-18 backbone for spatial feature extraction prior to temporal pooling.
+
+## Operating Environment & Workflow
+*   **Dual Infrastructure:** Full multi-epoch training and massive dataset storage (raw `.mov` files) are handled on a remote lab machine (`/home/efrei_stage/Desktop/Datasets/SDD`, video layout `<sdd_root>/videos/<scene>/<video_id>/video.mov`). Kaggle is used strictly as an isolated compute profiler for rapid VRAM checks and tensor shape validation using compressed `.mp4` datasets (`/kaggle/input/datasets/aryashah2k/stanford-drone-dataset`, layout `<sdd_root>/video/<scene>/<video_id>/video.mp4`). All CLI parsers and function signatures default to the Remote Lab values; Kaggle resolves via `/kaggle` auto-detection or explicit overrides (enforced in `video_encoder/sdd_adapter.py`).
+*   **Configuration:** The architecture relies heavily on a central `utils.config.Config` object. Any new arguments, paths, or hyperparameters must integrate seamlessly into this existing YAML structure rather than hardcoding values.
+*   **Coding Standard:** Prioritize the usage pages and script execution logic. When documenting code or writing summaries, keep the text concise while maintaining a formal, academic tone.
+
+## Current Execution State
+The dataloader (`data/dataloader_sdd_global.py`) has been stabilized, redundant encoding bugs have been stripped, and the spatial bounding box alignment has been visually verified. `z_video_global` is now wired end-to-end under the scene-level contract `[B, 512]`: the dataloader temporally pools cached window features `[P, D_raw]` → `[D_raw]` per sample (uncached fallback remains the scalar sentinel `tensor([0.])`, collated to `None`), and `ETHEncoder` variant A accepts both `[B, 512]` (scene-level broadcast) and legacy `[B, P, 512]` (ETH/UCY) inputs. Kaggle profiling cells (dummy `[N_frames, 512]` `.npy` cache generation + DataLoader/CUDA dry-run with VRAM reporting) have been drafted and CPU-validated against the real teacher stack (`ETHMotionTransformer` + `FlowMatcher.p_losses`); the pending step is executing the two-cell dry-run on a Kaggle GPU session to obtain the VRAM envelope before lab-machine training.
+

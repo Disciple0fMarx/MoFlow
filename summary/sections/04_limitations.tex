@@ -1,0 +1,13 @@
+\section{Implementation Roadblocks and Diagnostic Status}
+The integration of visual encoders has introduced specific data pipeline and coordinate mapping challenges. Current development is focused on isolating these bottlenecks across both the global and agent-centric implementations.
+
+\subsection{Global Video Encoder: Stanford Drone Dataset (SDD)}
+\textbf{Hardware and Memory Constraints:} Development on the SDD dataset is currently paused due to compute limitations. The ingestion pipeline for the custom 70 GB SDD repository (comprising raw video scenes and raw text annotations) triggered an Out-Of-Memory (OOM) failure, resulting in a crash on the remote compute node. Active debugging and memory optimization will resume once access to the remote environment is restored.
+
+\textbf{Evaluation Protocol Discrepancies:} Adhering strictly to the Leave-One-Scene-Out (LOSO) cross-validation protocol requires significant refactoring of the baseline evaluation logic, as the default MoFlow repository does not natively execute this protocol for SDD. Furthermore, metric evaluation on SDD is conducted in pixel space, bypassing the homography requirements of ETH/UCY, which necessitates a parallel, isolated evaluation pipeline.
+
+\subsection{Agent-Centric Video Encoder}
+\textbf{Coordinate Mapping Failures:} The agent-centric visual pipeline is currently failing due to inaccurate world-to-pixel coordinate mapping. Visual diagnostics confirm that the dynamic cropping mechanism frequently extracts spatial patches that do not contain the target agents.
+
+\textbf{Homography and Projection Bugs:} This failure is classified as a severe logic bug stemming from misaligned homography matrices. Preliminary testing indicates that while the transformation matrices (sourced via OpenTraj) project trajectories accurately for the \textit{zara1} and \textit{zara2} scenes, they produce significant spatial drift on other subsets such as \textit{eth} and \textit{hotel}. Consequently, the visual tokens extracted do not correlate spatially with the kinematic data, corrupting the feature fusion process. Precise isolation of the matrix transformations is pending the restoration of compute access.
+

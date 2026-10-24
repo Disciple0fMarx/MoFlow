@@ -1,0 +1,39 @@
+\begin{thebibliography}{1}
+
+\bibitem{fu2025moflow}
+Y.~Fu, Q.~Yan, L.~Wang, K.~Li, and R.~Liao, ``{MoFlow}: One-step flow matching
+  for human trajectory forecasting via implicit maximum likelihood estimation
+  based distillation,'' in {\em Proceedings of the IEEE/CVF Conference on
+  Computer Vision and Pattern Recognition (CVPR)}, 2025.
+
+\bibitem{he2016deep}
+K.~He, X.~Zhang, S.~Ren, and J.~Sun, ``Deep residual learning for image
+  recognition,'' in {\em IEEE Conference on Computer Vision and Pattern
+  Recognition (CVPR)}, 2016.
+
+\bibitem{shi2022motion}
+L.~Shi, L.~Wang, C.~Long, S.~Zhou, M.~Zhou, Z.~Fu, and Z.~Yuan, ``Motion
+  transformer with global intention localization and local movement
+  refinement,'' in {\em Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2022.
+
+\bibitem{lipman2023flow}
+Y.~Lipman, R.~T.~Q. Chen, H.~Ben-Hamu, M.~Nickel, and M.~Le, ``Flow matching
+  for generative modeling,'' in {\em International Conference on Learning
+  Representations (ICLR)}, 2023.
+
+\bibitem{robicquet2016learning}
+A.~Robicquet, A.~Sadeghian, A.~Alahi, and S.~Savarese, ``Learning social
+  etiquette: Human trajectory prediction in crowded scenes,'' in {\em European
+  Conference on Computer Vision (ECCV)}, 2016.
+
+\bibitem{loshchilov2019decoupled}
+I.~Loshchilov and F.~Hutter, ``Decoupled weight decay regularization,'' in {\em
+  International Conference on Learning Representations (ICLR)}, 2019.
+
+\bibitem{loshchilov2017sgdr}
+I.~Loshchilov and F.~Hutter, ``{SGDR}: Stochastic gradient descent with warm
+  restarts,'' in {\em International Conference on Learning Representations
+  (ICLR)}, 2017.
+
+\end{thebibliography}

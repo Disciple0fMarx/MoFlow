@@ -1,0 +1,62 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{fu2025moflow}
+\citation{he2016deep}
+\citation{shi2022motion}
+\citation{lipman2023flow}
+\citation{fu2025moflow}
+\citation{robicquet2016learning}
+\providecommand \oddpage@label [2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction and System Motivation}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction and System Motivation}{section.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Leave-One-Scene-Out Evaluation Protocol}{1}{section.2}\protected@file@percent }
+\newlabel{sec:lososdd}{{2}{1}{Leave-One-Scene-Out Evaluation Protocol}{section.2}{}}
+\citation{lipman2023flow}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Model Architecture and System Hyperparameters}{2}{section.3}\protected@file@percent }
+\newlabel{sec:arch}{{3}{2}{Model Architecture and System Hyperparameters}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Trajectory Normalisation}{2}{subsection.3.1}\protected@file@percent }
+\newlabel{eq:minmax}{{1}{2}{Trajectory Normalisation}{equation.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Global Video Encoder}{2}{subsection.3.2}\protected@file@percent }
+\newlabel{eq:global_pool}{{2}{2}{Global Video Encoder}{equation.2}{}}
+\newlabel{eq:proj}{{3}{2}{Global Video Encoder}{equation.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Context Encoder}{2}{subsection.3.3}\protected@file@percent }
+\newlabel{eq:ctx}{{4}{2}{Context Encoder}{equation.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}MTR Motion Decoder}{2}{subsection.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Conditional Flow Matching}{2}{subsection.3.5}\protected@file@percent }
+\newlabel{eq:fm_path}{{6}{2}{Conditional Flow Matching}{equation.6}{}}
+\newlabel{eq:fm_loss}{{7}{2}{Conditional Flow Matching}{equation.7}{}}
+\citation{loshchilov2019decoupled}
+\citation{loshchilov2017sgdr}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.6}Best-of-$K$ Selection}{3}{subsection.3.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.7}System Hyperparameters}{3}{subsection.3.7}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Complete hyperparameter configuration.}}{3}{table.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{tab:hparams}{{1}{3}{Complete hyperparameter configuration}{table.caption.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Quantitative Evaluation}{3}{section.4}\protected@file@percent }
+\newlabel{sec:results}{{4}{3}{Quantitative Evaluation}{section.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Qualitative Trajectory Visualisations}{3}{section.5}\protected@file@percent }
+\newlabel{sec:qual}{{5}{3}{Qualitative Trajectory Visualisations}{section.5}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Best-of-$K$ minADE and minFDE comparison at intermediate horizon ($T_{\mathrm  {obs}}$--2.4\,s). The \textbf  {bold} value wins within each row.}}{4}{table.caption.2}\protected@file@percent }
+\newlabel{tab:mid}{{2}{4}{Best-of-$K$ minADE and minFDE comparison at intermediate horizon ($T_{\mathrm {obs}}$--2.4\,s). The \textbf {bold} value wins within each row}{table.caption.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Best-of-$K$ minADE and minFDE comparison at final horizon ($T_{\mathrm  {obs}}$--4.8\,s). The \textbf  {bold} value wins within each row.}}{4}{table.caption.3}\protected@file@percent }
+\newlabel{tab:final}{{3}{4}{Best-of-$K$ minADE and minFDE comparison at final horizon ($T_{\mathrm {obs}}$--4.8\,s). The \textbf {bold} value wins within each row}{table.caption.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Descriptive Code and Algorithmic Pipeline}{4}{section.6}\protected@file@percent }
+\newlabel{sec:code}{{6}{4}{Descriptive Code and Algorithmic Pipeline}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Tensor Shape Reference}{4}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Algorithm 1: Global Video-Conditioned Context Encoding}{4}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Algorithm 2: Correlated Flow Matching Euler Sampling Loop}{4}{subsection.6.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Trajectory comparison for the \texttt  {quad} scene. Left: motion-only baseline. Right: global video-conditioned model. The video frame provides scene context (walkways, open areas) that the conditioned model uses to produce tighter predictions around pedestrian corridors.}}{5}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:quad}{{1}{5}{Trajectory comparison for the \texttt {quad} scene. Left: motion-only baseline. Right: global video-conditioned model. The video frame provides scene context (walkways, open areas) that the conditioned model uses to produce tighter predictions around pedestrian corridors}{figure.caption.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Trajectory comparison for the \texttt  {gates} scene. The model incorporates building boundaries visible in the video frame to constrain predicted paths away from occluded regions.}}{5}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:gates}{{2}{5}{Trajectory comparison for the \texttt {gates} scene. The model incorporates building boundaries visible in the video frame to constrain predicted paths away from occluded regions}{figure.caption.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Trajectory comparison for the \texttt  {bookstore} scene. A complex multi-agent interaction region where visual context helps disambiguate crossing patterns.}}{6}{figure.caption.6}\protected@file@percent }
+\newlabel{fig:bookstore}{{3}{6}{Trajectory comparison for the \texttt {bookstore} scene. A complex multi-agent interaction region where visual context helps disambiguate crossing patterns}{figure.caption.6}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Tensor input/output signatures through the forward pass.}}{6}{table.caption.7}\protected@file@percent }
+\newlabel{tab:tensors}{{4}{6}{Tensor input/output signatures through the forward pass}{table.caption.7}{}}
+\@writefile{loa}{\contentsline {algocf}{\numberline {1}{\ignorespaces Global Video-Conditioned Context Encoding}}{7}{algocf.1}\protected@file@percent }
+\newlabel{alg:context}{{1}{7}{Algorithm 1: Global Video-Conditioned Context Encoding}{algocf.1}{}}
+\@writefile{loa}{\contentsline {algocf}{\numberline {2}{\ignorespaces Correlated Flow Matching Euler Sampling Loop}}{7}{algocf.2}\protected@file@percent }
+\newlabel{alg:fm}{{2}{7}{Algorithm 2: Correlated Flow Matching Euler Sampling Loop}{algocf.2}{}}
+\gdef \@abspage@last{7}

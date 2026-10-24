@@ -1,0 +1,44 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\providecommand \oddpage@label [2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Baseline Model Architecture}{1}{section.1}\protected@file@percent }
+\newlabel{sec:baseline}{{1}{1}{Baseline Model Architecture}{section.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Kinematics-only baseline of the MoFlow Teacher ($NV$): the past trajectory is compressed by a kinematics encoder into $h_{kin}$, and the conditional flow-matching decoder regresses the future distribution. }}{2}{figure.caption.1}\protected@file@percent }
+\newlabel{fig:arch-baseline}{{1}{2}{Kinematics-only baseline of the MoFlow Teacher ($NV$): the past trajectory is compressed by a kinematics encoder into $h_{kin}$, and the conditional flow-matching decoder regresses the future distribution}{figure.caption.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Global Video Encoder Architecture}{2}{section.2}\protected@file@percent }
+\newlabel{sec:global}{{2}{2}{Global Video Encoder Architecture}{section.2}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Global-video extension ($GV$): the observed clip is embedded by the video backbone, pooled into a scene-level token $v_{global}$, and fused with the trajectory stream before the flow-matching decoder. }}{3}{figure.caption.2}\protected@file@percent }
+\newlabel{fig:arch-global}{{2}{3}{Global-video extension ($GV$): the observed clip is embedded by the video backbone, pooled into a scene-level token $v_{global}$, and fused with the trajectory stream before the flow-matching decoder}{figure.caption.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Results: Baseline vs.\ Global Video Encoder}{3}{section.3}\protected@file@percent }
+\newlabel{sec:results-baseline-global}{{3}{3}{Results: Baseline vs.\ Global Video Encoder}{section.3}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Per-scene comparison, Baseline (``NV'') vs.\ Global Video Encoder (``GV''). Scene mean over the reported horizons. Lower is better. }}{3}{table.caption.3}\protected@file@percent }
+\newlabel{tab:nv-vs-ve}{{1}{3}{Per-scene comparison, Baseline (``NV'') vs.\ Global Video Encoder (``GV''). Scene mean over the reported horizons. Lower is better}{table.caption.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Agent-Centric Video Encoder Architecture}{3}{section.4}\protected@file@percent }
+\newlabel{sec:agent}{{4}{3}{Agent-Centric Video Encoder Architecture}{section.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Qualitative comparison on a bookstore window: no-video, global and agent-centric conditioning. In a dense, structured scene the visual branches anchor the sampled futures to the walkable area. }}{4}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:bookstore}{{3}{4}{Qualitative comparison on a bookstore window: no-video, global and agent-centric conditioning. In a dense, structured scene the visual branches anchor the sampled futures to the walkable area}{figure.caption.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Results: Including Agent-Centric Video}{4}{section.5}\protected@file@percent }
+\newlabel{sec:results-agent}{{5}{4}{Results: Including Agent-Centric Video}{section.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Agent-centric extension ($AV$): per-agent crops around the target are encoded into local tokens that condition a cross-attention where the kinematic state acts as query; the locally fused context $c_{vis}$ is then combined with the trajectory stream before the flow-matching decoder. }}{5}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:arch-agent}{{4}{5}{Agent-centric extension ($AV$): per-agent crops around the target are encoded into local tokens that condition a cross-attention where the kinematic state acts as query; the locally fused context $c_{vis}$ is then combined with the trajectory stream before the flow-matching decoder}{figure.caption.5}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Overall means over the eight scenes (scene mean over the reported horizons) for the three Teacher models, and relative change $\Delta $ of Global (GV) and Agent-Centric (AV) with respect to No-Video (NV). Lower is better except where it measures dispersion. }}{5}{table.caption.6}\protected@file@percent }
+\newlabel{tab:overall}{{2}{5}{Overall means over the eight scenes (scene mean over the reported horizons) for the three Teacher models, and relative change $\Delta $ of Global (GV) and Agent-Centric (AV) with respect to No-Video (NV). Lower is better except where it measures dispersion}{table.caption.6}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Per-scene best-of-$K$ / joint final metrics for the three models. Scene mean over the reported horizons. Lower is better. }}{5}{table.caption.7}\protected@file@percent }
+\newlabel{tab:min-family}{{3}{5}{Per-scene best-of-$K$ / joint final metrics for the three models. Scene mean over the reported horizons. Lower is better}{table.caption.7}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces The three Teacher architectures compared: (a) kinematics-only baseline, (b) global-video, and (c) agent-centric conditioning. }}{6}{figure.caption.8}\protected@file@percent }
+\newlabel{fig:arch-combined}{{5}{6}{The three Teacher architectures compared: (a) kinematics-only baseline, (b) global-video, and (c) agent-centric conditioning}{figure.caption.8}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Interpretation of Results}{6}{section.6}\protected@file@percent }
+\newlabel{sec:interpretation}{{6}{6}{Interpretation of Results}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Crowd density and social interactions}{6}{subsection.6.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Scene-complexity statistics aggregated over all recordings of each SDD scene. $\overline  {A}_{\mathrm  {ped}}$/$A_{\max }$: mean/peak active pedestrians per frame; $\mathrm  {pairs}_{<d}$: mean number of pedestrian pairs per frame with centres closer than $d$~px; $n_{\mathrm  {NP}}$: distinct non-pedestrian tracks; $\overline  {A}_{\mathrm  {NP}}$: mean active non-pedestrian agents per frame; $\overline  {v}$: mean per-frame step length (px/frame); $\kappa $: fraction of the scene footprint covered by pedestrian boxes.}}{7}{table.caption.9}\protected@file@percent }
+\newlabel{tab:complexity}{{4}{7}{Scene-complexity statistics aggregated over all recordings of each SDD scene. $\overline {A}_{\mathrm {ped}}$/$A_{\max }$: mean/peak active pedestrians per frame; $\mathrm {pairs}_{<d}$: mean number of pedestrian pairs per frame with centres closer than $d$~px; $n_{\mathrm {NP}}$: distinct non-pedestrian tracks; $\overline {A}_{\mathrm {NP}}$: mean active non-pedestrian agents per frame; $\overline {v}$: mean per-frame step length (px/frame); $\kappa $: fraction of the scene footprint covered by pedestrian boxes}{table.caption.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}The role of heterogeneous and dynamic non-pedestrian obstacles}{7}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Trade-off between the global prior and the agent-centric focus}{8}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Status and limitations}{9}{subsection.6.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Qualitative comparison on a nexus window: no-video vs.\ global vs.\ agent-centric conditioning. In this vehicle-dense scene the agent-centric branch is the one that keeps the predicted futures closest to the observed target. }}{9}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:nexus}{{6}{9}{Qualitative comparison on a nexus window: no-video vs.\ global vs.\^^Magent-centric conditioning. In this vehicle-dense scene the agent-centric branch is the one that keeps the predicted futures closest to the observed target}{figure.caption.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Conclusion and Next Steps}{9}{section.7}\protected@file@percent }
+\newlabel{sec:conclusion}{{7}{9}{Conclusion and Next Steps}{section.7}{}}
+\gdef \@abspage@last{10}
