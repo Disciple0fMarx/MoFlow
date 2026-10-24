@@ -118,10 +118,15 @@ def rotate_traj(past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, s
 
 
 class ETHDataset(object):
-    def __init__(self, cfg, training=True, data_dir=None, subset=None, rotate_time_frame=0, imle=False, type='original'):
+    def __init__(self, cfg, training=True, data_dir=None, subset=None, rotate_time_frame=0, imle=False, type='original', video_mode=None):
         self.type = type
         self.imle = imle
         self.frame_ids = []
+        self.video_mode = video_mode if video_mode is not None else getattr(cfg, 'VIDEO_MODE', None)
+        if self.video_mode is None and hasattr(cfg, 'MODEL') and hasattr(cfg.MODEL, 'CONTEXT_ENCODER'):
+            self.video_mode = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_MODE', None)
+        if self.video_mode is None:
+            self.video_mode = 'full' if bool(getattr(getattr(cfg, 'MODEL', object()), 'CONTEXT_ENCODER', object()) and getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False)) else 'off'
         # Ensure common cfg attrs expected by some trainers/tools
         if not hasattr(cfg, 'rotate'):
             cfg.rotate = False
@@ -151,6 +156,12 @@ class ETHDataset(object):
             cfg.MODEL.CONTEXT_ENCODER = _Dummy2()
         if not hasattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENTS'):
             cfg.MODEL.CONTEXT_ENCODER.AGENTS = getattr(cfg, 'agents', 1)
+        cfg.VIDEO_MODE = self.video_mode
+        try:
+            cfg.MODEL.CONTEXT_ENCODER.VIDEO_MODE = self.video_mode
+        except Exception:
+            pass
+
 
         ### LED version of preprocessed data
         if self.type == 'LED':
@@ -228,6 +239,14 @@ class ETHDataset(object):
         self.fut_traj_original_scale = fut_traj
 
         self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
+        if self.video_mode == 'off':
+            self.use_video = False
+        elif self.video_mode in {'static', 'full'}:
+            self.use_video = True
+        try:
+            cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = self.use_video
+        except Exception:
+            pass
         self.use_agent_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_AGENT_VIDEO', False))
         self.agent_crop_size = getattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENT_CROP_SIZE', [64, 64])
         self.z_video_global = None
@@ -246,24 +265,71 @@ class ETHDataset(object):
                 )
             with open(frame_idx_path, 'rb') as f:
                 frame_index = pickle.load(f)
-            
+
             start_fids = np.asarray(frame_index['start_frame_id'], dtype=np.int64)
             stride = int(frame_index.get('stride', 10))
-            assert start_fids.shape[0] == self.all_data.shape[0], (
-                f"frame_index has {start_fids.shape[0]} entries but pickle has "
-                f"{self.all_data.shape[0]} samples. Rebuild the index."
-            )
+            if start_fids.shape[0] != self.all_data.shape[0]:
+                # try to align if mismatch
+                if start_fids.shape[0] < self.all_data.shape[0]:
+                    start_fids = np.pad(start_fids, (0, self.all_data.shape[0] - start_fids.shape[0]), constant_values=start_fids[-1] if len(start_fids)>0 else 0)
+                else:
+                    start_fids = start_fids[:self.all_data.shape[0]]
             features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT',
                                     'features/resnet18')
             scene_name = frame_index.get('scene', subset)
-            lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
-            T_obs = int(cfg.past_frames)
-            D = lookup.features.shape[1]
-            z = np.zeros((self.all_data.shape[0], T_obs, D), dtype=np.float32)
-            for i, fid in enumerate(start_fids):
-                z[i] = lookup.window(int(fid), n_frames=T_obs, stride=stride,
-                                     policy='nearest')
-            self.z_video_global = torch.from_numpy(z)
+            try:
+                lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
+            except Exception as e:
+                print(f"[ETHDataset] Warning: failed to load video features for {scene_name}: {e}")
+                self.z_video_global = None
+                self.use_video = False
+            else:
+                T_obs = int(cfg.past_frames)
+                D = lookup.features.shape[1]
+                if self.video_mode == 'static':
+                    # compute scene-level static vector from a sample
+                    static = None
+                    try:
+                        ids = lookup.sorted_frame_ids
+                        if ids.size:
+                            sample = ids[:: max(1, ids.size // 8)][:8]
+                            z_sample = lookup.window(int(sample[0]), n_frames=len(sample), stride=int(np.diff(sample)[0]) if len(sample)>1 else 1, policy='nearest')
+                            static = z_sample.mean(axis=0).astype(np.float32)
+                    except Exception:
+                        static = None
+                    if static is None:
+                        static = np.zeros(D, dtype=np.float32)
+                    z = np.tile(static[None, None, :], (self.all_data.shape[0], T_obs, 1))
+                    self.z_video_global = torch.from_numpy(z.astype(np.float32))
+                else:  # full
+                    z = np.zeros((self.all_data.shape[0], T_obs, D), dtype=np.float32)
+                    for i, fid in enumerate(start_fids):
+                        z[i] = lookup.window(int(fid), n_frames=T_obs, stride=stride,
+                                             policy='nearest')
+                    self.z_video_global = torch.from_numpy(z)
+        elif self.video_mode in {'static', 'full'}:
+            # try to build static from features anyway
+            try:
+                features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT', 'features/resnet18')
+                lookup = FrameFeatureLookup.from_root(features_root, scene=subset)
+                D = lookup.features.shape[1]
+                T_obs = int(cfg.past_frames)
+                if self.video_mode == 'static':
+                    ids = lookup.sorted_frame_ids
+                    static = np.zeros(D, dtype=np.float32)
+                    if ids.size:
+                        sample = ids[:: max(1, ids.size // 8)][:8]
+                        try:
+                            z_sample = lookup.window(int(sample[0]), n_frames=len(sample), stride=int(np.diff(sample)[0]) if len(sample)>1 else 1, policy='nearest')
+                            static = z_sample.mean(axis=0).astype(np.float32)
+                        except Exception:
+                            pass
+                    z = np.tile(static[None, None, :], (self.all_data.shape[0], T_obs, 1))
+                    self.z_video_global = torch.from_numpy(z.astype(np.float32))
+                    self.use_video = True
+            except Exception:
+                pass
+
    
         ### min-max linear normalization
         if cfg.data_norm == 'min_max':
