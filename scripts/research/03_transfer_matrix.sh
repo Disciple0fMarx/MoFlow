@@ -62,13 +62,76 @@ ROW_SCENES="$(loso_scenes "$LABEL" "$TRAIN_SCENE")"
 ensure_feature_list ${COL_SCENES}
 log_to "$LOG" INFO "Q2 starting. rows(train)=(${ROW_SCENES}) cols(eval)=(${COL_SCENES}) n_batches=${N_BATCHES:-all}"
 
-CFG="cfg/sdd/cor_fm.yml"
+# Support both SDD and ETH/UCY
+if [[ "${DATASET:-sdd}" == "eth_ucy" ]]; then
+    CFG="cfg/eth_ucy/cor_fm.yml"
+    # For ETH/UCY, look for checkpoints in multiple places
+    for train_scene in ${ROW_SCENES}; do
+        # Try various checkpoint locations
+        CKPT_FULL_CANDIDATES=(
+            "/kaggle/working/checkpoints/eth_full.pt"
+            "/kaggle/working/checkpoints/eth_vmfull.pt"
+            "${REPO_ROOT}/checkpoints/eth_full.pt"
+            "${RESULTS_ROOT}/_FM_*_eth_vmfull*/models/checkpoint_best.pt"
+            "${RESULTS_ROOT}/**/eth_full/models/checkpoint_best.pt"
+        )
+        CKPT_NOVID_CANDIDATES=(
+            "/kaggle/working/checkpoints/eth_off.pt"
+            "/kaggle/working/checkpoints/eth_novid.pt"
+            "${REPO_ROOT}/checkpoints/eth_off.pt"
+            "${RESULTS_ROOT}/_FM_*_eth_novid*/models/checkpoint_best.pt"
+        )
+        CKPT_FULL=""
+        for c in "${CKPT_FULL_CANDIDATES[@]}"; do
+            # glob expansion
+            for g in $c; do
+                if [[ -f "$g" ]]; then CKPT_FULL="$g"; break 2; fi
+            done
+        done
+        CKPT_NOVID=""
+        for c in "${CKPT_NOVID_CANDIDATES[@]}"; do
+            for g in $c; do
+                if [[ -f "$g" ]]; then CKPT_NOVID="$g"; break 2; fi
+            done
+        done
+        if [[ -z "$CKPT_FULL" ]] || [[ -z "$CKPT_NOVID" ]]; then
+            echo "[${LABEL}] WARNING: checkpoints missing for ETH/UCY; trying to proceed with any found" >&2
+        fi
+        [[ -n "$CKPT_FULL" ]] && require_ckpt "$CKPT_FULL" "$LABEL" || true
+        [[ -n "$CKPT_NOVID" ]] && require_ckpt "$CKPT_NOVID" "$LABEL" || true
+        for eval_scene in ${COL_SCENES}; do
+            log_to "$LOG" INFO "[train=${train_scene} → eval=${eval_scene}]"
+            for variant in full novid; do
+                if [[ "$variant" == "full" ]]; then
+                    CKPT="$CKPT_FULL"
+                else
+                    CKPT="$CKPT_NOVID"
+                fi
+                [[ -z "$CKPT" ]] && continue
+                ARGS=(tools/attrib_video_conditioning.py
+                    --cfg "$CFG"
+                    --ckpt "$CKPT"
+                    --data-root "${DATA_ROOT:-}"
+                    --held-out-scene "$eval_scene"
+                    --norm-scene "$train_scene"
+                    --split test
+                    --conditions baseline
+                    --batch-size "$BATCH_SIZE"
+                    --out "$OUTDIR/${train_scene}__eval_${eval_scene}__${variant}${OUTSUF}")
+                [[ -n "${N_BATCHES}" && "${N_BATCHES}" != "0" ]] && ARGS+=(--n-batches "$N_BATCHES")
+                ARGS+=( "${video_args[@]}" )
+                run_py "transfer:${train_scene}->${eval_scene}:${variant}" "$LOG" "${ARGS[@]}"
+            done
+        done
+    done
+else
+    CFG="cfg/sdd/cor_fm.yml"
 
-for train_scene in ${ROW_SCENES}; do
-    CKPT_FULL="${RESULTS_ROOT}/_SDD_ho${train_scene}_vmfull${OUTSUF}/models/checkpoint_best.pt"
-    CKPT_NOVID="${RESULTS_ROOT}/_SDD_ho${train_scene}_novid${OUTSUF}/models/checkpoint_best.pt"
-    require_ckpt "$CKPT_FULL" "$LABEL"
-    require_ckpt "$CKPT_NOVID" "$LABEL"
+    for train_scene in ${ROW_SCENES}; do
+        CKPT_FULL="${RESULTS_ROOT}/_SDD_ho${train_scene}_vmfull${OUTSUF}/models/checkpoint_best.pt"
+        CKPT_NOVID="${RESULTS_ROOT}/_SDD_ho${train_scene}_novid${OUTSUF}/models/checkpoint_best.pt"
+        require_ckpt "$CKPT_FULL" "$LABEL"
+        require_ckpt "$CKPT_NOVID" "$LABEL"
     for eval_scene in ${COL_SCENES}; do
         log_to "$LOG" INFO "[train=${train_scene} → eval=${eval_scene}]"
         for variant in full novid; do

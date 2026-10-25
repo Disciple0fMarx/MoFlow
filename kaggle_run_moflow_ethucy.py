@@ -91,6 +91,7 @@ def main():
     print("\n" + "=" * 60)
     print("M2: Global Video Encoder Training - off/static/full modes")
     print("=" * 60)
+    os.makedirs(os.path.join(KAGGLE_WORK, 'checkpoints'), exist_ok=True)
     for video_mode in ['off', 'static', 'full']:
         print(f"\n--- Training with video_mode={video_mode} ---")
         cmd = [
@@ -98,12 +99,31 @@ def main():
             "--cfg", "cfg/eth_ucy/cor_fm.yml",
             "--subset", "eth",
             "--video_mode", video_mode,
-            "--epochs", "5",  # Quick test on Kaggle
+            "--epochs", "50",
             "--batch_size", "64"
         ]
         if data_root:
             cmd.extend(["--data_root", data_root])
         run_cmd(cmd, check=False)
+        # Try to save checkpoints to common locations
+        try:
+            import glob, shutil
+            # look for checkpoints
+            for ckpt in glob.glob('results*/**/checkpoint_best.pt', recursive=True):
+                for target in [os.path.join(KAGGLE_WORK, 'checkpoints', f'eth_{video_mode}.pt'),
+                               os.path.join(KAGGLE_WORK, 'checkpoints', f'{video_mode}.pt')]:
+                    try:
+                        shutil.copy2(ckpt, target)
+                    except Exception:
+                        pass
+            for ckpt in glob.glob('results*/**/checkpoint_last.pt', recursive=True):
+                for target in [os.path.join(KAGGLE_WORK, 'checkpoints', f'eth_{video_mode}_last.pt')]:
+                    try:
+                        shutil.copy2(ckpt, target)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     
     # M3: Grad-CAM
     print("\n" + "=" * 60)

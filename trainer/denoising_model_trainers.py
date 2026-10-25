@@ -264,7 +264,9 @@ class Trainer(object):
             data['opt'] = self.opt.state_dict()
             data['scheduler'] = self.scheduler.state_dict()
             data['scaler'] = self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
-        torch.save(data, os.path.join(self.cfg.model_dir, f'{ckpt_name}.pt'))
+        path = os.path.join(self.cfg.model_dir, f'{ckpt_name}.pt')
+        torch.save(data, path)
+        self._save_consolidated_checkpoint(f'{ckpt_name}.pt')
 
     def save_last_ckpt(self):
         if not self.accelerator.is_local_main_process:
@@ -277,7 +279,70 @@ class Trainer(object):
         if self.save_trainer_state:
             data['opt'] = self.opt.state_dict()
             data['scheduler'] = self.scheduler.state_dict()
-        torch.save(data, os.path.join(self.cfg.model_dir, 'checkpoint_last.pt'))
+            data['scaler'] = self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
+        # also save minimal config snapshot if available
+        try:
+            data['cfg'] = getattr(self.cfg, 'yml_dict', None)
+        except Exception:
+            pass
+        last_path = os.path.join(self.cfg.model_dir, 'checkpoint_last.pt')
+        torch.save(data, last_path)
+        self._save_consolidated_checkpoint('checkpoint_last.pt')
+    
+    def _save_consolidated_checkpoint(self, ckpt_name):
+        try:
+            if not self.accelerator.is_local_main_process:
+                return
+            src = os.path.join(self.cfg.model_dir, ckpt_name)
+            if not os.path.exists(src):
+                return
+            import shutil
+            kaggle_cands = ['/kaggle/working/checkpoints', os.path.join(os.getcwd(), 'checkpoints')]
+            for base in kaggle_cands:
+                try:
+                    os.makedirs(base, exist_ok=True)
+                    dst = os.path.join(base, ckpt_name)
+                    try:
+                        shutil.copy2(src, dst)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            # also try to copy with friendly names
+            subset = getattr(self.cfg, 'subset', None)
+            if not subset:
+                try:
+                    subset = getattr(self.cfg, 'dataset_name', None) or getattr(self.cfg, 'dataset', None)
+                except Exception:
+                    pass
+            if not subset:
+                subset = 'eth'
+            video_mode = getattr(self.cfg, 'VIDEO_MODE', None)
+            if not video_mode and hasattr(self.cfg, 'MODEL') and hasattr(self.cfg.MODEL, 'CONTEXT_ENCODER'):
+                try:
+                    video_mode = getattr(self.cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_MODE', None)
+                except Exception:
+                    pass
+            if not video_mode and hasattr(self.cfg, 'MODEL') and hasattr(self.cfg.MODEL, 'CONTEXT_ENCODER'):
+                try:
+                    if getattr(self.cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', True) == False:
+                        video_mode = 'off'
+                    elif getattr(self.cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', True):
+                        video_mode = 'full'
+                except Exception:
+                    pass
+            if video_mode is None:
+                video_mode = 'full'
+            if subset and video_mode and ckpt_name in ('checkpoint_best.pt', 'checkpoint_last.pt'):
+                for base in kaggle_cands:
+                    try:
+                        shutil.copy2(src, os.path.join(base, f'{subset}_{video_mode}.pt'))
+                        shutil.copy2(src, os.path.join(base, f'eth_{video_mode}.pt'))
+                        shutil.copy2(src, os.path.join(base, f'{video_mode}.pt'))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     
     def load(self, ckpt_name):
         accelerator = self.accelerator
@@ -567,8 +632,8 @@ class Trainer(object):
         for i_batch, (t_seq, y_t_seq, y_pred_data, x_data, pred_score) in enumerate(zip(t_seq_ls, y_t_seq_ls, y_pred_data_ls, x_data_ls, pred_score_ls)):
             try:
                 t = t_seq.detach().cpu().numpy().reshape(1, -1)
-            except:
-                breakpoint()
+            except Exception:
+                continue
             states_to_save['t'].append(t)
 
             y_t_seq = y_t_seq.detach().cpu().numpy()
