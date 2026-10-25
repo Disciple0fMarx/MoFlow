@@ -1,10 +1,10 @@
 {
-  "id": "dhya/moflow-ethucy-tuclausthal",
+  "id": "dhyaelbahri/moflow-eth-ucy-tu-clausthal-m1-m6-pipeline",
   "title": "MoFlow ETH/UCY TU-Clausthal M1-M6 Pipeline",
   "code_file": "kaggle_run_moflow_ethucy.py",
   "language": "python",
   "kernel_type": "script",
-  "is_private": true,
+  "is_private": false,
   "enable_gpu": true,
   "enable_tpu": false,
   "enable_internet": true,

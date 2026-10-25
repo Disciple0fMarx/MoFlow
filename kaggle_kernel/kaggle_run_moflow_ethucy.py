@@ -63,7 +63,7 @@ def main():
     
     # Install dependencies
     print("\n[STEP 3] Installing dependencies...")
-    run_cmd([sys.executable, "-m", "pip", "install", "-q", "easydict", "einops", "tensorboardX", "pyyaml"], check=False)
+    run_cmd([sys.executable, "-m", "pip", "install", "-q", "easydict", "einops", "tensorboardX", "pyyaml", "GitPython"], check=False)
     
     # Determine data root
     data_root = None
@@ -109,7 +109,10 @@ def main():
     print("\n" + "=" * 60)
     print("M3: Grad-CAM Spatial Attribution")
     print("=" * 60)
-    run_cmd([sys.executable, "tools/gradcam_eth.py", "--help"], check=False)
+    if os.path.exists('tools/gradcam_eth.py'):
+        run_cmd([sys.executable, "tools/gradcam_eth.py", "--help"], check=False)
+    else:
+        print("tools/gradcam_eth.py not found, skipping")
     
     # M4: Latent Perturbation
     print("\n" + "=" * 60)
@@ -132,7 +135,8 @@ def main():
 import torch
 from video_encoder.agent_encoder import AgentVideoEncoder
 enc = AgentVideoEncoder()
-x = torch.randn(4, 8, 3, 64, 64)
+# AgentVideoEncoder expects [B, A, T, 3, H, W] based on usage in ETHEncoder
+x = torch.randn(2, 3, 8, 3, 64, 64)
 y = enc(x)
 print('Agent encoder output:', y.shape)
 """], check=False)

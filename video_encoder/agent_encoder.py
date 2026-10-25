@@ -107,6 +107,12 @@ class AgentVideoEncoder(nn.Module):
         (defaults to ``self.chunk_size``).  ``None`` runs the whole batch in a
         single backbone forward (original behaviour).
         """
+        if video_crops.dim() == 5:
+            # [B, T, C, H, W] or [A, T, C, H, W] -> add agent dim
+            video_crops = video_crops.unsqueeze(1)
+        elif video_crops.dim() == 4:
+            # [T, C, H, W] -> add batch and agent dims
+            video_crops = video_crops.unsqueeze(0).unsqueeze(0)
         B, A, T, C, H, W = video_crops.shape
 
         if B * A * T == 0:
