@@ -1,0 +1,15 @@
+{
+  "id": "dhya/moflow-ethucy-tuclausthal",
+  "title": "MoFlow ETH/UCY TU-Clausthal M1-M6 Pipeline",
+  "code_file": "kaggle_run_moflow_ethucy.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
