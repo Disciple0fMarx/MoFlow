@@ -412,6 +412,48 @@ def main():
         ) 
 
     trainer.train()
+    # Export checkpoints to common locations
+    try:
+        import glob, os, shutil
+        os.makedirs('/kaggle/working/checkpoints', exist_ok=True)
+        os.makedirs(os.path.join(os.getcwd(), 'checkpoints'), exist_ok=True)
+        subset = getattr(cfg, 'subset', 'eth')
+        video_mode = getattr(cfg, 'VIDEO_MODE', None)
+        if not video_mode and hasattr(cfg, 'MODEL') and hasattr(cfg.MODEL, 'CONTEXT_ENCODER'):
+            try:
+                vm = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_MODE', None)
+                if vm:
+                    video_mode = vm
+                elif getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', True) == False:
+                    video_mode = 'off'
+                else:
+                    video_mode = 'full'
+            except Exception:
+                pass
+        if not video_mode:
+            video_mode = 'full'
+        # look for best/last
+        for pattern in [os.path.join(cfg.model_dir, 'checkpoint_best.pt'), os.path.join(cfg.model_dir, 'checkpoint_last.pt')]:
+            if os.path.exists(pattern):
+                for target in [
+                    f'/kaggle/working/checkpoints/{subset}_{video_mode}.pt',
+                    f'/kaggle/working/checkpoints/eth_{video_mode}.pt',
+                    f'/kaggle/working/checkpoints/{video_mode}.pt',
+                    os.path.join('checkpoints', f'{subset}_{video_mode}.pt'),
+                ]:
+                    try:
+                        shutil.copy2(pattern, target)
+                    except Exception:
+                        pass
+        # also copy any ckpt in models dir
+        for ckpt in glob.glob(os.path.join(cfg.model_dir, '*.pt')):
+            for target_base in ['/kaggle/working/checkpoints', os.path.join(os.getcwd(), 'checkpoints')]:
+                try:
+                    shutil.copy2(ckpt, os.path.join(target_base, os.path.basename(ckpt)))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
