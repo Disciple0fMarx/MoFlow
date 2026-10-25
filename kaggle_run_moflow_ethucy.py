@@ -63,7 +63,7 @@ def main():
     
     # Install dependencies
     print("\n[STEP 3] Installing dependencies...")
-    run_cmd([sys.executable, "-m", "pip", "install", "-q", "easydict", "einops", "tensorboardX", "pyyaml", "GitPython"], check=False)
+    run_cmd([sys.executable, "-m", "pip", "install", "-q", "easydict", "einops", "tensorboardX", "pyyaml", "GitPython", "ema-pytorch"], check=False)
     
     # Determine data root
     data_root = None
@@ -124,7 +124,13 @@ def main():
     print("\n" + "=" * 60)
     print("M5: Cross-Scene Transfer Matrices")
     print("=" * 60)
-    run_cmd(["bash", "scripts/research/03_transfer_matrix.sh"], check=False)
+    env = os.environ.copy()
+    env['DATASET'] = 'eth_ucy'
+    if data_root:
+        env['DATA_ROOT'] = data_root
+    env['REPO_ROOT'] = str(repo_dir)
+    result = subprocess.run(["bash", "scripts/research/03_transfer_matrix.sh"], cwd=repo_dir, env=env)
+    print(f"M5 exit code: {result.returncode}")
     
     # M6: Agent-Centric Fusion
     print("\n" + "=" * 60)

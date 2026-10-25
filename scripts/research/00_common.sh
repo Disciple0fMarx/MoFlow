@@ -336,3 +336,11 @@ write_provenance() {
         cp -f "$prov" "${outdir}/PROVENANCE.md"
     fi
 }
+
+# ETH/UCY scenes for TU-Clausthal
+ETH_UCY_SCENES=(eth hotel univ zara1 zara2)
+
+# Override loso_scenes for ETH/UCY if DATASET is eth_ucy
+if [[ "${DATASET:-sdd}" == "eth_ucy" ]]; then
+    SDD_SCENES=("${ETH_UCY_SCENES[@]}")
+fi
