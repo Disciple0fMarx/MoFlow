@@ -1,175 +1,199 @@
 #!/usr/bin/env python
 """
-Kaggle Kernel Runner for MoFlow ETH/UCY TU-Clausthal Pipeline
-Clones TU-Clausthal datasets and runs M1-M6 verification/training
+Kaggle Kernel Runner for MoFlow ETH/UCY M1-M6 pipeline.
+
+The heavy lifting (data parsing / homography / video features) is expected to
+be precomputed and attached as a Kaggle dataset with this layout:
+
+    <root>/original/<subset>/<subset>_{train,val,test}.pkl
+    <root>/original/<subset>/<subset>_{train,test}_frame_index.pkl
+    <root>/homography/<subset>_H.txt
+    <root>/features/resnet18/<subset>.npy
+
+If no processed dataset is attached we fall back to cloning the raw
+TU-Clausthal repository, but training requires the processed pickles, so the
+run is skipped with an explicit error instead of silently "succeeding".
 """
+import glob
 import os
-import sys
+import shutil
 import subprocess
-import json
+import sys
 from pathlib import Path
 
-# Kaggle paths
 KAGGLE_INPUT = Path("/kaggle/input")
 KAGGLE_WORK = Path("/kaggle/working")
-KAGGLE_TEMP = Path("/kaggle/temp")
+
+BRANCH = "fix/eth-ucy-alignment"
+REPO_URL = "https://github.com/Disciple0fMarx/MoFlow.git"
+SUBSET = os.environ.get("SUBSET", "eth")
+VIDEO_MODES = os.environ.get("VIDEO_MODES", "off,static,full").split(",")
+EPOCHS = os.environ.get("EPOCHS", "80")
+BATCH_SIZE = os.environ.get("BATCH_SIZE", "64")
+RUN_M5 = os.environ.get("RUN_M5", "0") == "1"
+
 
 def run_cmd(cmd, cwd=None, check=True):
-    print(f"RUN: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
+    printable = " ".join(cmd) if isinstance(cmd, list) else cmd
+    print(f"RUN: {printable}", flush=True)
     result = subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str))
     if check and result.returncode != 0:
-        print(f"Command failed with return code {result.returncode}")
-        if check:
-            sys.exit(result.returncode)
+        print(f"Command failed with return code {result.returncode}", flush=True)
+        raise SystemExit(result.returncode)
     return result
+
+
+def find_processed_root(subset: str):
+    """Return a directory that contains original/<subset>/<subset>_train.pkl."""
+    rel = Path("original") / subset / f"{subset}_train.pkl"
+    candidates = [
+        KAGGLE_INPUT / "moflow-ethucy-processed",
+        KAGGLE_INPUT / "datasets" / "dhyaelbahri" / "moflow-ethucy-processed",
+        KAGGLE_INPUT / "datasets" / "moflow-ethucy-processed",
+        KAGGLE_INPUT / "ethucy" / "processed",
+        KAGGLE_INPUT / "ethucy-processed",
+    ]
+    if KAGGLE_INPUT.is_dir():
+        for item in sorted(KAGGLE_INPUT.iterdir()):
+            if not item.is_dir():
+                continue
+            candidates.append(item)
+            try:
+                children = sorted(p for p in item.iterdir() if p.is_dir())
+            except OSError:
+                children = []
+            candidates.extend(children)
+            for child in children:
+                try:
+                    candidates.extend(sorted(p for p in child.iterdir() if p.is_dir()))
+                except OSError:
+                    pass
+    for cand in candidates:
+        if (cand / rel).exists():
+            return cand
+    return None
+
+
+def find_video_features(root: Path):
+    cand = root / "features" / "resnet18"
+    if cand.is_dir():
+        return cand
+    for path in root.glob("**/features/resnet18"):
+        if path.is_dir():
+            return path
+    return None
+
+
+def clone_repo(repo_dir: Path):
+    if not repo_dir.exists():
+        run_cmd(["git", "clone", "-b", BRANCH, REPO_URL, str(repo_dir)])
+    else:
+        run_cmd(["git", "fetch", "origin"], cwd=str(repo_dir))
+        run_cmd(["git", "checkout", BRANCH], cwd=str(repo_dir))
+        run_cmd(["git", "pull", "origin", BRANCH], cwd=str(repo_dir))
+
+
+def copy_run_artifacts(repo_dir: Path, video_mode: str, data_dir: Path):
+    """Copy the checkpoint/metrics belonging to THIS run only."""
+    out_ckpt_dir = KAGGLE_WORK / "checkpoints"
+    out_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpts = sorted(
+        glob.glob(
+            str(repo_dir / "results_eth_ucy" / "cor_fm" / f"*_{SUBSET}_vm{video_mode}*" / "models" / "checkpoint_*.pt")
+        ),
+        key=os.path.getmtime,
+    )
+    for ckpt in ckpts:
+        name = Path(ckpt).name
+        if name == "checkpoint_best.pt":
+            shutil.copy2(ckpt, out_ckpt_dir / f"{SUBSET}_{video_mode}.pt")
+        elif name == "checkpoint_last.pt":
+            shutil.copy2(ckpt, out_ckpt_dir / f"{SUBSET}_{video_mode}_last.pt")
+    for pattern in ("metrics*.csv", "*eval*.csv", "*.log"):
+        for f in glob.glob(str(repo_dir / "results_eth_ucy" / "cor_fm" / f"*_{SUBSET}_vm{video_mode}*" / "**" / pattern), recursive=True):
+            try:
+                shutil.copy2(f, KAGGLE_WORK / f"{SUBSET}_{video_mode}_{Path(f).name}")
+            except OSError:
+                pass
+    found = sorted(p.name for p in out_ckpt_dir.glob(f"{SUBSET}_{video_mode}*.pt"))
+    print(f"[artifacts] {video_mode}: {found}", flush=True)
+
 
 def main():
     print("=" * 60)
-    print("MoFlow ETH/UCY TU-Clausthal Pipeline - Kaggle Execution")
-    print("=" * 60)
-    
-    # Step 1: Clone TU-Clausthal datasets
-    print("\n[STEP 1] Cloning TU-Clausthal datasets...")
-    datasets_dir = KAGGLE_WORK / "datasets"
-    datasets_dir.mkdir(parents=True, exist_ok=True)
-    
-    tu_repo = datasets_dir / "tu-clausthal"
-    if not tu_repo.exists():
-        run_cmd([
-            "git", "clone", "--depth", "1", "--filter=blob:none", "--sparse",
-            "https://gitlab.tu-clausthal.de/pka20/Trajectory-Prediction-Pedestrian.git",
-            str(tu_repo)
-        ])
-        run_cmd(["git", "sparse-checkout", "set", "datasets/ETH", "datasets/UCY"], cwd=str(tu_repo))
-    else:
-        print(f"TU-Clausthal repo already exists at {tu_repo}")
-    
-    # Step 2: Clone MoFlow repo
-    print("\n[STEP 2] Cloning MoFlow repository...")
+    print("MoFlow ETH/UCY Pipeline - Kaggle Execution")
+    print("=" * 60, flush=True)
+
     repo_dir = KAGGLE_WORK / "MoFlow"
-    if not repo_dir.exists():
-        run_cmd([
-            "git", "clone", "-b", "fix/eth-ucy-alignment",
-            "https://github.com/Disciple0fMarx/MoFlow.git",
-            str(repo_dir)
-        ])
-    else:
-        print(f"MoFlow repo already exists at {repo_dir}")
-        run_cmd(["git", "fetch", "origin"], cwd=str(repo_dir))
-        run_cmd(["git", "checkout", "fix/eth-ucy-alignment"], cwd=str(repo_dir))
-        run_cmd(["git", "pull", "origin", "fix/eth-ucy-alignment"], cwd=str(repo_dir))
-    
+    clone_repo(repo_dir)
     os.chdir(repo_dir)
-    
-    # Install dependencies
-    print("\n[STEP 3] Installing dependencies...")
-    run_cmd([sys.executable, "-m", "pip", "install", "-q", "easydict", "einops", "tensorboardX", "pyyaml", "GitPython", "ema-pytorch"], check=False)
-    
-    # Determine data root
-    data_root = None
-    for cand in [tu_repo / "datasets", KAGGLE_INPUT / "ethucy", KAGGLE_INPUT / "tu-clausthal"]:
-        if cand.exists():
-            data_root = str(cand)
-            break
-    if data_root is None:
-        # Try to find in kaggle input
-        for item in KAGGLE_INPUT.iterdir():
-            if item.is_dir():
-                if (item / "ETH").exists() or (item / "datasets").exists():
-                    data_root = str(item)
-                    break
-    
-    print(f"\nData root: {data_root}")
-    
-    # M1: Data & Alignment Verification
-    print("\n" + "=" * 60)
-    print("M1: Data & Homography Alignment Verification")
-    print("=" * 60)
-    run_cmd([sys.executable, "scripts/kaggle_dry_run_test.py", "--data_root", data_root] if data_root else [sys.executable, "scripts/kaggle_dry_run_test.py", "--create_mock"], check=False)
-    
-    # M2: Global Video Modes Training
-    print("\n" + "=" * 60)
-    print("M2: Global Video Encoder Training - off/static/full modes")
-    print("=" * 60)
-    os.makedirs(os.path.join(KAGGLE_WORK, 'checkpoints'), exist_ok=True)
-    for video_mode in ['off', 'static', 'full']:
-        print(f"\n--- Training with video_mode={video_mode} ---")
+    (KAGGLE_WORK / "checkpoints").mkdir(parents=True, exist_ok=True)
+
+    run_cmd(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "easydict", "einops", "tensorboardX", "pyyaml", "GitPython", "ema-pytorch"],
+        check=False,
+    )
+
+    data_dir = find_processed_root(SUBSET)
+    if data_dir is None:
+        raw_dir = KAGGLE_WORK / "datasets" / "tu-clausthal"
+        if not raw_dir.exists():
+            run_cmd([
+                "git", "clone", "--depth", "1", "--filter=blob:none", "--sparse",
+                "https://gitlab.tu-clausthal.de/pka20/Trajectory-Prediction-Pedestrian.git",
+                str(raw_dir),
+            ])
+            run_cmd(["git", "sparse-checkout", "set", "datasets/ETH", "datasets/UCY"], cwd=str(raw_dir))
+        raise SystemExit(
+            "No processed ETH/UCY dataset attached. Expected "
+            f"original/{SUBSET}/{SUBSET}_train.pkl under /kaggle/input. "
+            "Attach dhyaelbahri/moflow-ethucy-processed to this kernel."
+        )
+
+    features_root = find_video_features(data_dir)
+    print(f"[data] processed root: {data_dir}", flush=True)
+    print(f"[data] video features: {features_root}", flush=True)
+
+    for video_mode in VIDEO_MODES:
+        video_mode = video_mode.strip()
+        if not video_mode:
+            continue
+        print(f"\n--- Training subset={SUBSET} video_mode={video_mode} ---", flush=True)
         cmd = [
             sys.executable, "fm_eth.py",
             "--cfg", "cfg/eth_ucy/cor_fm.yml",
-            "--subset", "eth",
+            "--subset", SUBSET,
             "--video_mode", video_mode,
-            "--epochs", "50",
-            "--batch_size", "64"
+            "--epochs", EPOCHS,
+            "--batch_size", BATCH_SIZE,
+            "--data_dir", str(data_dir),
         ]
-        if data_root:
-            cmd.extend(["--data_root", data_root])
+        if features_root is not None:
+            cmd.extend(["--video_features_root", str(features_root)])
         run_cmd(cmd, check=False)
-        # Try to save checkpoints to common locations
-        try:
-            import glob, shutil
-            # look for checkpoints
-            for ckpt in glob.glob('results*/**/checkpoint_best.pt', recursive=True):
-                for target in [os.path.join(KAGGLE_WORK, 'checkpoints', f'eth_{video_mode}.pt'),
-                               os.path.join(KAGGLE_WORK, 'checkpoints', f'{video_mode}.pt')]:
-                    try:
-                        shutil.copy2(ckpt, target)
-                    except Exception:
-                        pass
-            for ckpt in glob.glob('results*/**/checkpoint_last.pt', recursive=True):
-                for target in [os.path.join(KAGGLE_WORK, 'checkpoints', f'eth_{video_mode}_last.pt')]:
-                    try:
-                        shutil.copy2(ckpt, target)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    
-    # M3: Grad-CAM
-    print("\n" + "=" * 60)
-    print("M3: Grad-CAM Spatial Attribution")
-    print("=" * 60)
-    if os.path.exists('tools/gradcam_eth.py'):
-        run_cmd([sys.executable, "tools/gradcam_eth.py", "--help"], check=False)
-    else:
-        print("tools/gradcam_eth.py not found, skipping")
-    
-    # M4: Latent Perturbation
-    print("\n" + "=" * 60)
-    print("M4: Latent Perturbation (baseline/zeroed/permuted)")
-    print("=" * 60)
-    run_cmd([sys.executable, "tools/attrib_video_conditioning.py", "--help"], check=False)
-    
-    # M5: Cross-Scene Transfer
-    print("\n" + "=" * 60)
-    print("M5: Cross-Scene Transfer Matrices")
-    print("=" * 60)
-    env = os.environ.copy()
-    env['DATASET'] = 'eth_ucy'
-    if data_root:
-        env['DATA_ROOT'] = data_root
-    env['REPO_ROOT'] = str(repo_dir)
-    result = subprocess.run(["bash", "scripts/research/03_transfer_matrix.sh"], cwd=repo_dir, env=env)
-    print(f"M5 exit code: {result.returncode}")
-    
-    # M6: Agent-Centric Fusion
-    print("\n" + "=" * 60)
-    print("M6: Agent-Centric Video Encoder & Tri-Modal Fusion")
-    print("=" * 60)
-    run_cmd([sys.executable, "-c", """
-# Test agent encoder
-import torch
-from video_encoder.agent_encoder import AgentVideoEncoder
-enc = AgentVideoEncoder()
-# AgentVideoEncoder expects [B, A, T, 3, H, W] based on usage in ETHEncoder
-x = torch.randn(2, 3, 8, 3, 64, 64)
-y = enc(x)
-print('Agent encoder output:', y.shape)
-"""], check=False)
-    
-    print("\n" + "=" * 60)
-    print("PIPELINE EXECUTION COMPLETE")
-    print("=" * 60)
+        copy_run_artifacts(repo_dir, video_mode, data_dir)
 
-if __name__ == '__main__':
+    if RUN_M5:
+        env = os.environ.copy()
+        env["DATASET"] = "eth_ucy"
+        env["DATA_ROOT"] = str(data_dir)
+        env["REPO_ROOT"] = str(repo_dir)
+        env["RESULTS_ROOT"] = str(repo_dir / "results_eth_ucy" / "cor_fm")
+        subprocess.run(["bash", "scripts/research/03_transfer_matrix.sh"], cwd=repo_dir, env=env)
+    else:
+        print("[q2] RUN_M5!=1, skipping transfer matrix", flush=True)
+
+    # Final sweep: make sure any CSV/report generated under the repo is visible.
+    for pattern in ("**/q2_transfer*.csv", "**/*transfer*matrix*.csv", "**/metrics*.csv"):
+        for f in glob.glob(pattern, recursive=True):
+            try:
+                shutil.copy2(f, KAGGLE_WORK / Path(f).name)
+            except OSError:
+                pass
+
+    print("DONE", flush=True)
+
+
+if __name__ == "__main__":
     main()

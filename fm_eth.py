@@ -318,15 +318,77 @@ def init_basics(args):
     return cfg, logger, tb_log
 
 
+def _looks_processed(root, subset):
+    return os.path.exists(os.path.join(root, 'original', subset, f'{subset}_train.pkl'))
+
+
+def resolve_data_dir(args):
+    """
+    Resolve the preprocessed ETH/UCY data directory.
+
+    Priority:
+      1. explicit --data_dir (must contain ``original/<subset>/<subset>_train.pkl``)
+      2. --data_root pointing at a processed root (same layout)
+      3. auto-detect a processed root under /kaggle/input
+      4. local repo default ``data/eth_ucy``
+
+    A raw TU-Clausthal root (``ETH/seq_eth/obsmat.txt``) is not enough to
+    train: the SocialGAN train/val/test split pickles must be present.
+    """
+    subset = args.subset
+    candidates = []
+    if args.data_dir:
+        candidates.append(args.data_dir)
+    if getattr(args, 'data_root', None):
+        candidates.append(args.data_root)
+        candidates.append(os.path.join(args.data_root, 'data', 'eth_ucy'))
+    # Local default
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, 'data', 'eth_ucy'))
+    # Kaggle mounts
+    kaggle_input = '/kaggle/input'
+    if os.path.isdir(kaggle_input):
+        for item in sorted(os.listdir(kaggle_input)):
+            item_path = os.path.join(kaggle_input, item)
+            if not os.path.isdir(item_path):
+                continue
+            candidates.append(item_path)
+            candidates.append(os.path.join(item_path, 'data', 'eth_ucy'))
+            try:
+                for sub in sorted(os.listdir(item_path)):
+                    sub_path = os.path.join(item_path, sub)
+                    if os.path.isdir(sub_path):
+                        candidates.append(sub_path)
+                        candidates.append(os.path.join(sub_path, 'data', 'eth_ucy'))
+            except OSError:
+                pass
+
+    for cand in candidates:
+        if cand and _looks_processed(cand, subset):
+            return os.path.abspath(cand)
+
+    hint = (
+        f"No processed data found for subset '{subset}'. Expected "
+        f"<root>/original/{subset}/{subset}_train.pkl. "
+        f"Checked: {candidates[:12]}{'...' if len(candidates) > 12 else ''}. "
+        "Attach the preprocessed ETH/UCY dataset or pass --data_dir."
+    )
+    raise FileNotFoundError(hint)
+
+
 def build_data_loader(cfg, args):
     """
     Build the data loader for the ETH dataset.
     """
     video_mode = getattr(args, 'video_mode', None) or getattr(cfg, 'VIDEO_MODE', None)
+    data_dir = resolve_data_dir(args)
+    cfg.data_root = data_dir
+    cfg.data_dir = data_dir
+    print(f"[fm_eth] data_dir: {data_dir}")
     train_dset = ETHDataset(
         cfg=cfg,
         training=True,
-        data_dir=args.data_dir,
+        data_dir=data_dir,
         subset=args.subset,
         rotate_time_frame=args.rotate_time_frame,
         type = args.data_source,
@@ -345,7 +407,7 @@ def build_data_loader(cfg, args):
     test_dset = ETHDataset(
         cfg=cfg,
         training=False,
-        data_dir=args.data_dir,
+        data_dir=data_dir,
         subset=args.subset,
         rotate_time_frame=args.rotate_time_frame,
         type = args.data_source,

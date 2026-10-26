@@ -155,6 +155,7 @@ else
         done
     done
 done
+fi
 
 log_to "$LOG" INFO "aggregating cells -> q2_transfer_ade.csv / q2_transfer_gain.csv"
 if [[ "${RESEARCH_DRY_RUN:-0}" != "1" ]]; then
