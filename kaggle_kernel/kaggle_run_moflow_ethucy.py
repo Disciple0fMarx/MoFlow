@@ -48,7 +48,8 @@ def find_processed_root(subset: str):
     rel = Path("original") / subset / f"{subset}_train.pkl"
     candidates = [
         KAGGLE_INPUT / "moflow-ethucy-processed",
-        KAGGLE_INPUT / f"moflow-ethucy-processed" / "data",
+        KAGGLE_INPUT / "datasets" / "dhyaelbahri" / "moflow-ethucy-processed",
+        KAGGLE_INPUT / "datasets" / "moflow-ethucy-processed",
         KAGGLE_INPUT / "ethucy" / "processed",
         KAGGLE_INPUT / "ethucy-processed",
     ]
@@ -57,7 +58,16 @@ def find_processed_root(subset: str):
             if not item.is_dir():
                 continue
             candidates.append(item)
-            candidates.extend(sorted(p for p in item.iterdir() if p.is_dir()))
+            try:
+                children = sorted(p for p in item.iterdir() if p.is_dir())
+            except OSError:
+                children = []
+            candidates.extend(children)
+            for child in children:
+                try:
+                    candidates.extend(sorted(p for p in child.iterdir() if p.is_dir()))
+                except OSError:
+                    pass
     for cand in candidates:
         if (cand / rel).exists():
             return cand
@@ -167,10 +177,18 @@ def main():
     if RUN_M5:
         env = os.environ.copy()
         env["DATASET"] = "eth_ucy"
+        env["ETH_DATA_ROOT"] = str(data_dir)
+        if features_root is not None:
+            env["ETH_FEATURES_ROOT"] = str(features_root)
         env["DATA_ROOT"] = str(data_dir)
         env["REPO_ROOT"] = str(repo_dir)
         env["RESULTS_ROOT"] = str(repo_dir / "results_eth_ucy" / "cor_fm")
-        subprocess.run(["bash", "scripts/research/03_transfer_matrix.sh"], cwd=repo_dir, env=env)
+        env["BATCH_SIZE"] = os.environ.get("M5_BATCH_SIZE", "128")
+        subprocess.run(
+            ["bash", "scripts/research/03_transfer_matrix.sh", "--n-batches", "0"],
+            cwd=repo_dir,
+            env=env,
+        )
     else:
         print("[q2] RUN_M5!=1, skipping transfer matrix", flush=True)
 

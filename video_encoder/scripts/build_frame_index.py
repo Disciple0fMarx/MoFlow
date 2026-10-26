@@ -103,6 +103,16 @@ def main():
     start_frame_ids = []
     matched_count = 0
 
+    if all_raw_windows:
+        from scipy.spatial import cKDTree
+
+        raw_matrix = np.stack(
+            [win["coords"].reshape(-1) for win in all_raw_windows], axis=0
+        )
+        tree = cKDTree(raw_matrix)
+    else:
+        tree = None
+
     for i in range(n_samples):
         sample_coords = traj_pkl[i]
         key = (round(sample_coords[0, 0], 3), round(sample_coords[0, 1], 3), 
@@ -122,16 +132,12 @@ def main():
                         best_mse = mse
                         match = cand
         
-        # Robust fallback fallback for floating-point variations
-        if match is None:
-            best_mse = float('inf')
-            for win in all_raw_windows:
-                mse = np.mean((win["coords"] - sample_coords) ** 2)
-                if mse < best_mse:
-                    best_mse = mse
-                    match = win
-            if best_mse > 1e-2:
-                match = None
+        # Robust fallback for floating-point variations (vectorised nearest neighbour)
+        if match is None and tree is not None:
+            _, nn_idx = tree.query(sample_coords.reshape(-1), k=1)
+            cand = all_raw_windows[int(nn_idx)]
+            if np.mean((cand["coords"] - sample_coords) ** 2) <= 1e-2:
+                match = cand
 
         if match is not None:
             start_frame_ids.append(match["start_frame_id"])

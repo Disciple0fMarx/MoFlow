@@ -57,69 +57,94 @@ LOG="${OUTDIR}/run.log"
 : > "$LOG"
 write_provenance "$OUTDIR" "scripts/research/03_transfer_matrix.sh"
 
-COL_SCENES="$(loso_scenes "$LABEL" "$SCENE")"
-ROW_SCENES="$(loso_scenes "$LABEL" "$TRAIN_SCENE")"
-ensure_feature_list ${COL_SCENES}
+if [[ "${DATASET:-sdd}" == "eth_ucy" ]]; then
+    ETH_UCY_SCENES=(eth hotel univ zara1 zara2)
+    is_eth_scene() {
+        local s="$1" c
+        for c in "${ETH_UCY_SCENES[@]}"; do
+            [[ "$s" == "$c" ]] && return 0
+        done
+        return 1
+    }
+    if [[ -n "$SCENE" ]] && ! is_eth_scene "$SCENE"; then
+        echo "[${LABEL}] ERROR: '${SCENE}' is not a valid ETH/UCY scene (${ETH_UCY_SCENES[*]})" >&2
+        exit 3
+    fi
+    if [[ -n "$TRAIN_SCENE" ]] && ! is_eth_scene "$TRAIN_SCENE"; then
+        echo "[${LABEL}] ERROR: '${TRAIN_SCENE}' is not a valid ETH/UCY scene (${ETH_UCY_SCENES[*]})" >&2
+        exit 3
+    fi
+    COL_SCENES="${SCENE:-${ETH_UCY_SCENES[*]}}"
+    ROW_SCENES="${TRAIN_SCENE:-eth}"
+else
+    COL_SCENES="$(loso_scenes "$LABEL" "$SCENE")"
+    ROW_SCENES="$(loso_scenes "$LABEL" "$TRAIN_SCENE")"
+    ensure_feature_list ${COL_SCENES}
+fi
 log_to "$LOG" INFO "Q2 starting. rows(train)=(${ROW_SCENES}) cols(eval)=(${COL_SCENES}) n_batches=${N_BATCHES:-all}"
 
 # Support both SDD and ETH/UCY
 if [[ "${DATASET:-sdd}" == "eth_ucy" ]]; then
     CFG="cfg/eth_ucy/cor_fm.yml"
-    # For ETH/UCY, look for checkpoints in multiple places
+    ETH_DATA_ROOT="${ETH_DATA_ROOT:-${REPO_ROOT}/data/eth_ucy}"
+    if [[ -z "${ETH_FEATURES_ROOT:-}" ]]; then
+        if [[ -f "${REPO_ROOT}/features/resnet18/eth.npy" ]]; then
+            ETH_FEATURES_ROOT="${REPO_ROOT}/features/resnet18"
+        else
+            ETH_FEATURES_ROOT="${ETH_DATA_ROOT}/features/resnet18"
+        fi
+    fi
     for train_scene in ${ROW_SCENES}; do
-        # Try various checkpoint locations
         CKPT_FULL_CANDIDATES=(
-            "/kaggle/working/checkpoints/eth_full.pt"
-            "/kaggle/working/checkpoints/eth_vmfull.pt"
-            "${REPO_ROOT}/checkpoints/eth_full.pt"
-            "${RESULTS_ROOT}/_FM_*_eth_vmfull*/models/checkpoint_best.pt"
-            "${RESULTS_ROOT}/**/eth_full/models/checkpoint_best.pt"
+            "/kaggle/working/checkpoints/${train_scene}_full.pt"
+            "/kaggle/working/checkpoints/${train_scene}_vmfull.pt"
+            "${REPO_ROOT}/checkpoints/${train_scene}_full.pt"
+            "${RESULTS_ROOT}/_FM_*_${train_scene}_vmfull*/models/checkpoint_best.pt"
+            "${RESULTS_ROOT}/**/${train_scene}_full/models/checkpoint_best.pt"
         )
-        CKPT_NOVID_CANDIDATES=(
-            "/kaggle/working/checkpoints/eth_off.pt"
-            "/kaggle/working/checkpoints/eth_novid.pt"
-            "${REPO_ROOT}/checkpoints/eth_off.pt"
-            "${RESULTS_ROOT}/_FM_*_eth_novid*/models/checkpoint_best.pt"
+        CKPT_OFF_CANDIDATES=(
+            "/kaggle/working/checkpoints/${train_scene}_off.pt"
+            "/kaggle/working/checkpoints/${train_scene}_novid.pt"
+            "${REPO_ROOT}/checkpoints/${train_scene}_off.pt"
+            "${RESULTS_ROOT}/_FM_*_${train_scene}_novid*/models/checkpoint_best.pt"
         )
         CKPT_FULL=""
         for c in "${CKPT_FULL_CANDIDATES[@]}"; do
-            # glob expansion
             for g in $c; do
                 if [[ -f "$g" ]]; then CKPT_FULL="$g"; break 2; fi
             done
         done
-        CKPT_NOVID=""
-        for c in "${CKPT_NOVID_CANDIDATES[@]}"; do
+        CKPT_OFF=""
+        for c in "${CKPT_OFF_CANDIDATES[@]}"; do
             for g in $c; do
-                if [[ -f "$g" ]]; then CKPT_NOVID="$g"; break 2; fi
+                if [[ -f "$g" ]]; then CKPT_OFF="$g"; break 2; fi
             done
         done
-        if [[ -z "$CKPT_FULL" ]] || [[ -z "$CKPT_NOVID" ]]; then
-            echo "[${LABEL}] WARNING: checkpoints missing for ETH/UCY; trying to proceed with any found" >&2
-        fi
         [[ -n "$CKPT_FULL" ]] && require_ckpt "$CKPT_FULL" "$LABEL" || true
-        [[ -n "$CKPT_NOVID" ]] && require_ckpt "$CKPT_NOVID" "$LABEL" || true
+        [[ -n "$CKPT_OFF" ]] && require_ckpt "$CKPT_OFF" "$LABEL" || true
+        if [[ -z "$CKPT_FULL" ]] || [[ -z "$CKPT_OFF" ]]; then
+            echo "[${LABEL}] WARNING: missing ETH/UCY checkpoints for ${train_scene} (full=${CKPT_FULL:-none}, off=${CKPT_OFF:-none})" >&2
+        fi
         for eval_scene in ${COL_SCENES}; do
             log_to "$LOG" INFO "[train=${train_scene} → eval=${eval_scene}]"
-            for variant in full novid; do
+            for variant in full off; do
                 if [[ "$variant" == "full" ]]; then
                     CKPT="$CKPT_FULL"
                 else
-                    CKPT="$CKPT_NOVID"
+                    CKPT="$CKPT_OFF"
                 fi
                 [[ -z "$CKPT" ]] && continue
-                ARGS=(tools/attrib_video_conditioning.py
+                ARGS=(tools/eval_eth_transfer.py
                     --cfg "$CFG"
                     --ckpt "$CKPT"
-                    --data-root "${DATA_ROOT:-}"
-                    --held-out-scene "$eval_scene"
+                    --data-dir "$ETH_DATA_ROOT"
+                    --features-root "$ETH_FEATURES_ROOT"
                     --norm-scene "$train_scene"
+                    --eval-scene "$eval_scene"
                     --split test
-                    --conditions baseline
                     --batch-size "$BATCH_SIZE"
                     --out "$OUTDIR/${train_scene}__eval_${eval_scene}__${variant}${OUTSUF}")
                 [[ -n "${N_BATCHES}" && "${N_BATCHES}" != "0" ]] && ARGS+=(--n-batches "$N_BATCHES")
-                ARGS+=( "${video_args[@]}" )
                 run_py "transfer:${train_scene}->${eval_scene}:${variant}" "$LOG" "${ARGS[@]}"
             done
         done
@@ -198,6 +223,8 @@ with open(os.path.join(os.environ["RESEARCH_ROOT"], "q2", f"q2_transfer_gain{out
         gains = []
         for c in cols:
             a = cell(t, c, "novid")
+            if a is None:
+                a = cell(t, c, "off")
             b = cell(t, c, "full")
             gains.append("" if (a is None or b is None) else f"{a - b:+.4f}")
         w.writerow([t] + gains)
