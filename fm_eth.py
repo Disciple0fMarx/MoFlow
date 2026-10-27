@@ -1,18 +1,18 @@
-import os
-import torch
 import argparse
 import copy
-from torch.utils.data import DataLoader, random_split
+import os
+
+import torch
 from tensorboardX import SummaryWriter
+from torch.utils.data import DataLoader, random_split
 
 from data.dataloader_eth_ucy import ETHDataset, seq_collate_eth
-
-from utils.config import Config
-from utils.utils import back_up_code_git, set_random_seed, log_config_to_file
-
-from models.flow_matching import FlowMatcher
+from data.tu_clausthal_eth_ucy_parser import find_tu_clausthal_root
 from models.backbone_eth_ucy import ETHMotionTransformer
+from models.flow_matching import FlowMatcher
 from trainer.denoising_model_trainers import Trainer
+from utils.config import Config
+from utils.utils import back_up_code_git, log_config_to_file, set_random_seed
 
 
 def parse_config():
@@ -23,78 +23,285 @@ def parse_config():
     parser = argparse.ArgumentParser()
 
     # Basic configuration
-    parser.add_argument('--cfg', default='cfg/eth_ucy/cor_fm.yml', type=str, help="Config file path")
-    parser.add_argument('--exp', default='', type=str, help='Experiment description for each run, name of the saving folder.')
+    parser.add_argument(
+        "--cfg", default="cfg/eth_ucy/cor_fm.yml", type=str, help="Config file path"
+    )
+    parser.add_argument(
+        "--exp",
+        default="",
+        type=str,
+        help="Experiment description for each run, name of the saving folder.",
+    )
 
     # Data configuration
-    parser.add_argument('--data_source', default='original', type=str, help='Data source for the experiment. Either be original or preprocessed ones from LED.')
-    parser.add_argument('--epochs', default=None, type=int, help='Override the number of epochs in the config file.')
-    parser.add_argument('--batch_size', default=None, type=int, help='Override the batch size in the config file.')
-    parser.add_argument('--data_dir', type=str, default=None, help='Directory where the data is stored. For Kaggle/TU-Clausthal, leave None to auto-detect /kaggle/input or use --data_root.')
-    parser.add_argument('--n_train', type=int, default=None, help='Override the number training scenes used.')
-    parser.add_argument('--n_test', type=int, default=None, help='Override the number testing scenes used.')
-    parser.add_argument('--checkpt_freq', default=5, type=int, help='Override the checkpt_freq in the config file.')
-    parser.add_argument('--max_num_ckpts', default=5, type=int, help='Override the max_num_ckpts in the config file.')
-    parser.add_argument('--data_norm', default='min_max', choices=['min_max', 'original', 'sqrt'], help='Normalization method for the data.')
-    parser.add_argument('--subset', type=str, required=True, choices=['eth', 'hotel', 'univ', 'zara1', 'zara2'], help='Trajectory subset to run experiment')
-    parser.add_argument('--rotate', default=False, action='store_true', help="Whether to rotate the trajectories in the dataset")
-    parser.add_argument('--rotate_time_frame', type=int, default=0, help='Index of time frames to rotate the trajectories.')
-    parser.add_argument('--rotate_aug', default=False, action='store_true', help='Whether to use rotation as data augmentation.')
+    parser.add_argument(
+        "--data_source",
+        default="original",
+        type=str,
+        help="Data source for the experiment. Either be original or preprocessed ones from LED.",
+    )
+    parser.add_argument(
+        "--epochs",
+        default=None,
+        type=int,
+        help="Override the number of epochs in the config file.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        default=None,
+        type=int,
+        help="Override the batch size in the config file.",
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="Strict TU-Clausthal raw root containing ETH/ and UCY/ (no .pkl).",
+    )
+    parser.add_argument(
+        "--n_train",
+        type=int,
+        default=None,
+        help="Override the number training scenes used.",
+    )
+    parser.add_argument(
+        "--n_test",
+        type=int,
+        default=None,
+        help="Override the number testing scenes used.",
+    )
+    parser.add_argument(
+        "--checkpt_freq",
+        default=5,
+        type=int,
+        help="Override the checkpt_freq in the config file.",
+    )
+    parser.add_argument(
+        "--max_num_ckpts",
+        default=5,
+        type=int,
+        help="Override the max_num_ckpts in the config file.",
+    )
+    parser.add_argument(
+        "--data_norm",
+        default="min_max",
+        choices=["min_max", "original", "sqrt"],
+        help="Normalization method for the data.",
+    )
+    parser.add_argument(
+        "--subset",
+        type=str,
+        required=True,
+        choices=["eth", "hotel", "univ", "zara1", "zara2"],
+        help="Trajectory subset to run experiment",
+    )
+    parser.add_argument(
+        "--rotate",
+        default=False,
+        action="store_true",
+        help="Whether to rotate the trajectories in the dataset",
+    )
+    parser.add_argument(
+        "--rotate_time_frame",
+        type=int,
+        default=0,
+        help="Index of time frames to rotate the trajectories.",
+    )
+    parser.add_argument(
+        "--rotate_aug",
+        default=False,
+        action="store_true",
+        help="Whether to use rotation as data augmentation.",
+    )
 
     # Reproducibility configuration
-    parser.add_argument('--fix_random_seed', action='store_true', default=False, help='fix random seed for reproducibility')
-    parser.add_argument('--seed', type=int, default=42, help='Set the random seed.')
+    parser.add_argument(
+        "--fix_random_seed",
+        action="store_true",
+        default=False,
+        help="fix random seed for reproducibility",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Set the random seed.")
 
     ### FM parameters ###
-    parser.add_argument('--sampling_steps', type=int, default=10, help='Number of sampling timesteps for the FlowMatcher.')
+    parser.add_argument(
+        "--sampling_steps",
+        type=int,
+        default=10,
+        help="Number of sampling timesteps for the FlowMatcher.",
+    )
 
     # time scheduler during training
-    parser.add_argument('--t_schedule', type=str, choices=['uniform', 'logit_normal'], default='logit_normal', help='Time schedule for the FlowMatcher.')
-    parser.add_argument('--fm_skewed_t', default=None, type=str, help='Skewed time schedule for the FlowMatcher.')
-    parser.add_argument('--logit_norm_mean', default=-0.5, type=float, help='Mean for the logit normal distribution.')
-    parser.add_argument('--logit_norm_std', default=1.5, type=float, help='Standard deviation for the logit normal distribution.')
+    parser.add_argument(
+        "--t_schedule",
+        type=str,
+        choices=["uniform", "logit_normal"],
+        default="logit_normal",
+        help="Time schedule for the FlowMatcher.",
+    )
+    parser.add_argument(
+        "--fm_skewed_t",
+        default=None,
+        type=str,
+        help="Skewed time schedule for the FlowMatcher.",
+    )
+    parser.add_argument(
+        "--logit_norm_mean",
+        default=-0.5,
+        type=float,
+        help="Mean for the logit normal distribution.",
+    )
+    parser.add_argument(
+        "--logit_norm_std",
+        default=1.5,
+        type=float,
+        help="Standard deviation for the logit normal distribution.",
+    )
 
-    parser.add_argument('--fm_wrapper', type=str, default='direct', choices=['direct', 'velocity', 'precond'], help='Wrapper for the FlowMatcher.')
-    parser.add_argument('--fm_rew_sqrt', default=False, action='store_true', help='Whether to apply square root to the reweighting factor.')
-    parser.add_argument('--fm_in_scaling', default=False, action='store_true', help='Whether to scale the input to the FlowMatcher.')
-    parser.add_argument('--sigma_data', type=float, default=0.13, help='Standard deviation for the data.')
+    parser.add_argument(
+        "--fm_wrapper",
+        type=str,
+        default="direct",
+        choices=["direct", "velocity", "precond"],
+        help="Wrapper for the FlowMatcher.",
+    )
+    parser.add_argument(
+        "--fm_rew_sqrt",
+        default=False,
+        action="store_true",
+        help="Whether to apply square root to the reweighting factor.",
+    )
+    parser.add_argument(
+        "--fm_in_scaling",
+        default=False,
+        action="store_true",
+        help="Whether to scale the input to the FlowMatcher.",
+    )
+    parser.add_argument(
+        "--sigma_data",
+        type=float,
+        default=0.13,
+        help="Standard deviation for the data.",
+    )
     # input dropout / masking rate
-    parser.add_argument('--drop_method', default='emb', type=str, choices=['None', 'input', 'emb'], help='Dropout method for the FlowMatcher.')
-    parser.add_argument('--drop_logi_k', default=20.0, type=float, help='Logistic growth rate for masking rate at different timesteps.')
-    parser.add_argument('--drop_logi_m', default=0.5, type=float, help='Logistic midpoint for masking rate at different timesteps.')
+    parser.add_argument(
+        "--drop_method",
+        default="emb",
+        type=str,
+        choices=["None", "input", "emb"],
+        help="Dropout method for the FlowMatcher.",
+    )
+    parser.add_argument(
+        "--drop_logi_k",
+        default=20.0,
+        type=float,
+        help="Logistic growth rate for masking rate at different timesteps.",
+    )
+    parser.add_argument(
+        "--drop_logi_m",
+        default=0.5,
+        type=float,
+        help="Logistic midpoint for masking rate at different timesteps.",
+    )
     ### FM parameters ###
 
     ### Architecture configuration ###
-    parser.add_argument('--use_pre_norm', default=False, action='store_true', help='Where to normalize the input trajectories in the Transformer Encoders.')
-    parser.add_argument('--num_layers', type=int, default=None, help='Overwrite the number of layers in the config file.')
-    parser.add_argument('--dropout', default=None, type=float, help='Overwrite the dropout rate in the config file.')
+    parser.add_argument(
+        "--use_pre_norm",
+        default=False,
+        action="store_true",
+        help="Where to normalize the input trajectories in the Transformer Encoders.",
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        default=None,
+        help="Overwrite the number of layers in the config file.",
+    )
+    parser.add_argument(
+        "--dropout",
+        default=None,
+        type=float,
+        help="Overwrite the dropout rate in the config file.",
+    )
     ### Architecture configuration ###
 
     ### General denoising objective configuration ###
-    parser.add_argument('--tied_noise', default=False, action='store_true', help='Whether to use tied noise for the denoiser.')
+    parser.add_argument(
+        "--tied_noise",
+        default=False,
+        action="store_true",
+        help="Whether to use tied noise for the denoiser.",
+    )
     ### General denoising objective configuration ###
 
     ### Regression loss configuration ###
-    parser.add_argument('--loss_nn_mode', type=str, default='agent', choices=['agent', 'scene'], help='Whether to use the agent-wise or scene-wise NN loss.')
-    parser.add_argument('--loss_reg_reduction', type=str, default='sum', choices=['mean', 'sum'], help='Reduction method for the regression loss.')
-    parser.add_argument('--loss_reg_squared', default=False, action='store_true', help='Whether to use the squared regression loss.')
-    parser.add_argument('--loss_velocity', default=False, action='store_true', help='Whether to use the regression loss for velocity.')
+    parser.add_argument(
+        "--loss_nn_mode",
+        type=str,
+        default="agent",
+        choices=["agent", "scene"],
+        help="Whether to use the agent-wise or scene-wise NN loss.",
+    )
+    parser.add_argument(
+        "--loss_reg_reduction",
+        type=str,
+        default="sum",
+        choices=["mean", "sum"],
+        help="Reduction method for the regression loss.",
+    )
+    parser.add_argument(
+        "--loss_reg_squared",
+        default=False,
+        action="store_true",
+        help="Whether to use the squared regression loss.",
+    )
+    parser.add_argument(
+        "--loss_velocity",
+        default=False,
+        action="store_true",
+        help="Whether to use the regression loss for velocity.",
+    )
     ### Regression loss configuration ###
 
     ### Classification loss configuration ###
-    parser.add_argument('--loss_cls_weight', type=float, default=1.0, help='Weight for the classification loss.')
+    parser.add_argument(
+        "--loss_cls_weight",
+        type=float,
+        default=1.0,
+        help="Weight for the classification loss.",
+    )
     ### Classification loss configuration ###
 
-
     ### Optimization configuration ###
-    parser.add_argument('--init_lr', type=float, default=None, help='Override the peak learning rate in the config file.')
-    parser.add_argument('--weight_decay', type=float, default=None, help='Override the weight decay in the config file.')
+    parser.add_argument(
+        "--init_lr",
+        type=float,
+        default=None,
+        help="Override the peak learning rate in the config file.",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=None,
+        help="Override the weight decay in the config file.",
+    )
     ### Optimization configuration ###
 
-    parser.add_argument('--video_mode', default=None, choices=['off', 'static', 'full'], help='Video mode ablation: off/static/full')
-    parser.add_argument('--video_features_root', default=None, type=str)
-    parser.add_argument('--data_root', type=str, default=None, help='TU-Clausthal dataset root (Kaggle /kaggle/input/...). Overrides data_dir.')
-    parser.add_argument('--no_video', action='store_true')
+    parser.add_argument(
+        "--video_mode",
+        default=None,
+        choices=["off", "static", "full"],
+        help="Video mode ablation: off/static/full",
+    )
+    parser.add_argument("--video_features_root", default=None, type=str)
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default=None,
+        help="Strict TU-Clausthal raw root; takes precedence over --data_dir.",
+    )
+    parser.add_argument("--no_video", action="store_true")
 
     return parser.parse_args()
 
@@ -105,22 +312,22 @@ def init_basics(args):
     """
 
     """Load the config file"""
-    cfg = Config(args.cfg, f'{args.exp}')
+    cfg = Config(args.cfg, f"{args.exp}")
 
-    tag = '_'
+    tag = "_"
 
     ### Update FM parameters ###
     def _update_fm_params(args, cfg, tag):
-        if cfg.denoising_method == 'fm':
+        if cfg.denoising_method == "fm":
             cfg.sigma_data = args.sigma_data
             cfg.sampling_steps = args.sampling_steps
-            
+
             if args.fm_skewed_t is not None:
                 cfg.t_schedule = args.fm_skewed_t
             else:
                 cfg.t_schedule = args.t_schedule
 
-            if args.t_schedule == 'logit_normal':
+            if args.t_schedule == "logit_normal":
                 cfg.logit_norm_mean = args.logit_norm_mean
                 cfg.logit_norm_std = args.logit_norm_std
 
@@ -129,40 +336,43 @@ def init_basics(args):
             cfg.fm_in_scaling = args.fm_in_scaling
 
             if args.fm_skewed_t is not None:
-                tag += f'FM_S{cfg.sampling_steps}_{cfg.t_schedule}_{cfg.fm_wrapper[:4]}'
-            elif args.t_schedule == 'logit_normal':
-                tag += f'FM_S{cfg.sampling_steps}_{cfg.t_schedule[:3]}_m{cfg.logit_norm_mean}_s{cfg.logit_norm_std}_{cfg.fm_wrapper[:4]}'
-            elif args.t_schedule == 'uniform':
-                tag += f'FM_S{cfg.sampling_steps}_{cfg.t_schedule[:3]}_{cfg.fm_wrapper[:4]}'
+                tag += f"FM_S{cfg.sampling_steps}_{cfg.t_schedule}_{cfg.fm_wrapper[:4]}"
+            elif args.t_schedule == "logit_normal":
+                tag += f"FM_S{cfg.sampling_steps}_{cfg.t_schedule[:3]}_m{cfg.logit_norm_mean}_s{cfg.logit_norm_std}_{cfg.fm_wrapper[:4]}"
+            elif args.t_schedule == "uniform":
+                tag += f"FM_S{cfg.sampling_steps}_{cfg.t_schedule[:3]}_{cfg.fm_wrapper[:4]}"
 
-            if args.drop_method is not None and args.drop_logi_k is not None and args.drop_logi_m is not None:
+            if (
+                args.drop_method is not None
+                and args.drop_logi_k is not None
+                and args.drop_logi_m is not None
+            ):
                 cfg.drop_method = args.drop_method
                 cfg.drop_logi_k = args.drop_logi_k
                 cfg.drop_logi_m = args.drop_logi_m
-                tag += f'_drop_{cfg.drop_method}_m{cfg.drop_logi_m}_k{cfg.drop_logi_k}'
+                tag += f"_drop_{cfg.drop_method}_m{cfg.drop_logi_m}_k{cfg.drop_logi_k}"
 
             if cfg.fm_rew_sqrt:
-                tag += '_RESQ'
+                tag += "_RESQ"
             if cfg.fm_in_scaling:
-                tag += '_IS'
+                tag += "_IS"
         return cfg, tag
 
     cfg, tag = _update_fm_params(args, cfg, tag)
-
 
     ### Architecture configuration ###
     def _update_architecture_params(args, cfg, tag):
         cfg.MODEL.USE_PRE_NORM = args.use_pre_norm
         cfg.MODEL.NUM_LAYERS = args.num_layers
         cfg.MODEL.DROPOUT = args.dropout
-        
+
         if args.num_layers is not None:
-            tag += f'_L{args.num_layers}'
+            tag += f"_L{args.num_layers}"
             cfg.MODEL.CONTEXT_ENCODER.NUM_ATTN_LAYERS = args.num_layers
             cfg.MODEL.MOTION_DECODER.NUM_DECODER_BLOCKS = args.num_layers
 
         if args.dropout is not None:
-            tag += f'_DO{args.dropout}'
+            tag += f"_DO{args.dropout}"
             cfg.MODEL.CONTEXT_ENCODER.DROPOUT_OF_ATTN = args.dropout
             cfg.MODEL.MOTION_DECODER.DROPOUT_OF_ATTN = args.dropout
         return cfg, tag
@@ -173,11 +383,10 @@ def init_basics(args):
     def _update_general_denoising_params(args, cfg, tag):
         cfg.tied_noise = args.tied_noise
         if args.tied_noise:
-            tag += '_TN'
+            tag += "_TN"
         return cfg, tag
 
     cfg, tag = _update_general_denoising_params(args, cfg, tag)
-
 
     ### Regression loss configuration ###
     def _update_regression_loss_params(args, cfg, tag):
@@ -186,25 +395,24 @@ def init_basics(args):
         cfg.LOSS_REG_SQUARED = args.loss_reg_squared
         cfg.LOSS_VELOCITY = args.loss_velocity
 
-        tag += f'_NN_{cfg.LOSS_NN_MODE[:1].upper()}'
-        tag += f'_REG_{cfg.LOSS_REG_REDUCTION[:1].upper()}'
+        tag += f"_NN_{cfg.LOSS_NN_MODE[:1].upper()}"
+        tag += f"_REG_{cfg.LOSS_REG_REDUCTION[:1].upper()}"
 
         if args.loss_reg_squared:
-            tag += '_SQ'
+            tag += "_SQ"
         if args.loss_velocity:
-            tag += '_VEL'
+            tag += "_VEL"
             cfg.MODEL.REGRESSION_MLPS[-1] += cfg.MODEL.MODEL_OUT_DIM
 
         return cfg, tag
 
     cfg, tag = _update_regression_loss_params(args, cfg, tag)
 
-
     ### Update data configuration ###
     def _update_data_params(args, cfg, tag):
 
         cfg.subset = args.subset
-        tag += f'_{cfg.subset}'
+        tag += f"_{cfg.subset}"
 
         # video mode ablation
         if args.video_mode is not None:
@@ -213,7 +421,7 @@ def init_basics(args):
                 cfg.MODEL.CONTEXT_ENCODER.VIDEO_MODE = args.video_mode
             except Exception:
                 pass
-            if args.video_mode == 'off' or args.no_video:
+            if args.video_mode == "off" or args.no_video:
                 try:
                     cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = False
                 except Exception:
@@ -223,13 +431,13 @@ def init_basics(args):
                     cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = True
                 except Exception:
                     pass
-            tag += f'_vm{args.video_mode}'
+            tag += f"_vm{args.video_mode}"
         elif args.no_video:
             try:
                 cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = False
             except Exception:
                 pass
-            tag += '_novid'
+            tag += "_novid"
 
         if args.video_features_root is not None:
             try:
@@ -241,23 +449,22 @@ def init_basics(args):
         if args.rotate:
             cfg.rotate_time_frame = args.rotate_time_frame
             cfg.rotate_aug = args.rotate_aug
-            tag += f'_rot_{cfg.rotate_time_frame}'
+            tag += f"_rot_{cfg.rotate_time_frame}"
             if cfg.rotate_aug:
-                tag += '_aug'
+                tag += "_aug"
 
         if args.n_train is not None:
-            tag += f'_subset_train_{args.n_train}'
+            tag += f"_subset_train_{args.n_train}"
 
         if args.n_test is not None:
-            tag += f'_test{args.n_test}'
+            tag += f"_test{args.n_test}"
 
         cfg.data_norm = args.data_norm
-        tag += f'_{args.data_norm}'
+        tag += f"_{args.data_norm}"
 
         return cfg, tag
 
     cfg, tag = _update_data_params(args, cfg, tag)
-
 
     ### Update optimization configs ###
     def _update_optimization_params(args, cfg, tag):
@@ -267,9 +474,9 @@ def init_basics(args):
         if args.weight_decay is not None:
             cfg.OPTIMIZATION.WEIGHT_DECAY = args.weight_decay
 
-        cfg.OPTIMIZATION.LOSS_WEIGHTS['cls'] = args.loss_cls_weight
+        cfg.OPTIMIZATION.LOSS_WEIGHTS["cls"] = args.loss_cls_weight
 
-        tag += f'_LR{cfg.OPTIMIZATION.LR}_WD{cfg.OPTIMIZATION.WEIGHT_DECAY}_CLS_{args.loss_cls_weight}'
+        tag += f"_LR{cfg.OPTIMIZATION.LR}_WD{cfg.OPTIMIZATION.WEIGHT_DECAY}_CLS_{args.loss_cls_weight}"
 
         if args.epochs is not None:
             # override the number of epochs
@@ -278,109 +485,95 @@ def init_basics(args):
         if args.batch_size is not None:
             # override the batch size
             cfg.train_batch_size = args.batch_size
-            cfg.test_batch_size = args.batch_size * 2  # larger BS for during-training evaluation
+            cfg.test_batch_size = (
+                args.batch_size * 2
+            )  # larger BS for during-training evaluation
 
         if args.checkpt_freq is not None:
             # override the checkpt_freq
             cfg.checkpt_freq = args.checkpt_freq
-        
+
         cfg.max_num_ckpts = args.max_num_ckpts
 
-        tag += f'_BS{cfg.train_batch_size}_EP{cfg.OPTIMIZATION.NUM_EPOCHS}'
+        tag += f"_BS{cfg.train_batch_size}_EP{cfg.OPTIMIZATION.NUM_EPOCHS}"
 
         return cfg, tag
 
     cfg, tag = _update_optimization_params(args, cfg, tag)
-        
 
     ### viola, create the saving directory ###
-    tag = tag.replace('__', '_')
-    cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    tag = tag.replace("__", "_")
+    cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
     logger = cfg.create_dirs(tag_suffix=tag)
-
 
     """fix random seed"""
     if args.fix_random_seed:
         set_random_seed(args.seed)
 
-
     """set up tensorboard and text log"""
-    tb_dir = os.path.abspath(os.path.join(cfg.log_dir, '../tb'))
+    tb_dir = os.path.abspath(os.path.join(cfg.log_dir, "../tb"))
     os.makedirs(tb_dir, exist_ok=True)
     tb_log = SummaryWriter(log_dir=tb_dir)
 
-        
     """back up the code"""
     back_up_code_git(cfg, logger=logger)
-    
+
     """print the config file"""
     log_config_to_file(cfg.yml_dict, logger=logger)
     return cfg, logger, tb_log
 
 
-def _looks_processed(root, subset):
-    return os.path.exists(os.path.join(root, 'original', subset, f'{subset}_train.pkl'))
-
-
 def resolve_data_dir(args):
-    """
-    Resolve the preprocessed ETH/UCY data directory.
+    """Resolve the strict TU-Clausthal raw ETH/UCY root.
 
-    Priority:
-      1. explicit --data_dir (must contain ``original/<subset>/<subset>_train.pkl``)
-      2. --data_root pointing at a processed root (same layout)
-      3. auto-detect a processed root under /kaggle/input
-      4. local repo default ``data/eth_ucy``
-
-    A raw TU-Clausthal root (``ETH/seq_eth/obsmat.txt``) is not enough to
-    train: the SocialGAN train/val/test split pickles must be present.
+    No processed/pickle layout is accepted. The returned directory must contain
+    ``ETH/seq_eth``, ``ETH/seq_hotel``, ``UCY/students03``, ``UCY/zara01`` and
+    ``UCY/zara02``, each with ``obsmat.txt`` and ``H.txt``.
     """
-    subset = args.subset
-    candidates = []
-    if args.data_dir:
-        candidates.append(args.data_dir)
-    if getattr(args, 'data_root', None):
-        candidates.append(args.data_root)
-        candidates.append(os.path.join(args.data_root, 'data', 'eth_ucy'))
-    # Local default
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.join(here, 'data', 'eth_ucy'))
-    # Kaggle mounts
-    kaggle_input = '/kaggle/input'
-    if os.path.isdir(kaggle_input):
-        for item in sorted(os.listdir(kaggle_input)):
-            item_path = os.path.join(kaggle_input, item)
-            if not os.path.isdir(item_path):
-                continue
-            candidates.append(item_path)
-            candidates.append(os.path.join(item_path, 'data', 'eth_ucy'))
-            try:
-                for sub in sorted(os.listdir(item_path)):
-                    sub_path = os.path.join(item_path, sub)
-                    if os.path.isdir(sub_path):
-                        candidates.append(sub_path)
-                        candidates.append(os.path.join(sub_path, 'data', 'eth_ucy'))
-            except OSError:
-                pass
+    candidates = []
+    for value in (
+        getattr(args, "data_root", None),
+        getattr(args, "data_dir", None),
+        os.environ.get("TU_CLAUSTHAL_ROOT"),
+        os.environ.get("ETHUCY_ROOT"),
+        os.path.join(here, "data", "tu-clausthal", "datasets"),
+        os.path.join(here, "data", "Trajectory-Prediction-Pedestrian", "datasets"),
+        os.path.join(
+            here, "third_party", "Trajectory-Prediction-Pedestrian", "datasets"
+        ),
+        here,
+    ):
+        if value:
+            candidates.append(value)
 
+    checked = []
     for cand in candidates:
-        if cand and _looks_processed(cand, subset):
-            return os.path.abspath(cand)
+        checked.append(cand)
+        if not cand or not os.path.exists(cand):
+            continue
+        try:
+            return str(find_tu_clausthal_root(cand))
+        except FileNotFoundError:
+            continue
 
-    hint = (
-        f"No processed data found for subset '{subset}'. Expected "
-        f"<root>/original/{subset}/{subset}_train.pkl. "
-        f"Checked: {candidates[:12]}{'...' if len(candidates) > 12 else ''}. "
-        "Attach the preprocessed ETH/UCY dataset or pass --data_dir."
-    )
-    raise FileNotFoundError(hint)
+    # Let the parser scan Kaggle mounts and common clone locations.
+    try:
+        return str(find_tu_clausthal_root(None))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "No strict TU-Clausthal raw ETH/UCY root found. Expected "
+            "ETH/seq_eth, ETH/seq_hotel, UCY/students03, UCY/zara01, UCY/zara02 "
+            "with obsmat.txt and H.txt. Pass --data_root/--data_dir or set "
+            f"TU_CLAUSTHAL_ROOT. Checked: {checked}. {exc}"
+        ) from exc
 
 
 def build_data_loader(cfg, args):
     """
     Build the data loader for the ETH dataset.
     """
-    video_mode = getattr(args, 'video_mode', None) or getattr(cfg, 'VIDEO_MODE', None)
+    video_mode = getattr(args, "video_mode", None) or getattr(cfg, "VIDEO_MODE", None)
     data_dir = resolve_data_dir(args)
     cfg.data_root = data_dir
     cfg.data_dir = data_dir
@@ -391,9 +584,9 @@ def build_data_loader(cfg, args):
         data_dir=data_dir,
         subset=args.subset,
         rotate_time_frame=args.rotate_time_frame,
-        type = args.data_source,
-        video_mode=video_mode)
-
+        type=args.data_source,
+        video_mode=video_mode,
+    )
 
     train_loader = DataLoader(
         train_dset,
@@ -401,8 +594,8 @@ def build_data_loader(cfg, args):
         shuffle=True,
         num_workers=4,
         collate_fn=seq_collate_eth,
-        pin_memory=True)
-
+        pin_memory=True,
+    )
 
     test_dset = ETHDataset(
         cfg=cfg,
@@ -410,16 +603,18 @@ def build_data_loader(cfg, args):
         data_dir=data_dir,
         subset=args.subset,
         rotate_time_frame=args.rotate_time_frame,
-        type = args.data_source,
-        video_mode=video_mode)
+        type=args.data_source,
+        video_mode=video_mode,
+    )
 
     test_loader = DataLoader(
         test_dset,
-        batch_size=cfg.test_batch_size, ### change it from 500
+        batch_size=cfg.test_batch_size,  ### change it from 500
         shuffle=False,
         num_workers=4,
         collate_fn=seq_collate_eth,
-        pin_memory=True)
+        pin_memory=True,
+    )
 
     return train_loader, test_loader
 
@@ -434,14 +629,16 @@ def build_network(cfg, args, logger):
         config=cfg,
     )
 
-    if cfg.denoising_method == 'fm':
+    if cfg.denoising_method == "fm":
         denoiser = FlowMatcher(
             cfg,
             model,
             logger=logger,
         )
     else:
-        raise NotImplementedError(f'Denoising method [{cfg.denoising_method}] is not implemented yet.')
+        raise NotImplementedError(
+            f"Denoising method [{cfg.denoising_method}] is not implemented yet."
+        )
 
     return denoiser
 
@@ -463,55 +660,70 @@ def main():
     """Train the model"""
     trainer = Trainer(
         cfg,
-        denoiser, 
-        train_loader, 
-        test_loader, 
+        denoiser,
+        train_loader,
+        test_loader,
         tb_log=tb_log,
         logger=logger,
         gradient_accumulate_every=1,
-        ema_decay = 0.995,
-        ema_update_every = 1,
-        ) 
+        ema_decay=0.995,
+        ema_update_every=1,
+    )
 
     trainer.train()
     # Export checkpoints to common locations
     try:
-        import glob, os, shutil
-        os.makedirs('/kaggle/working/checkpoints', exist_ok=True)
-        os.makedirs(os.path.join(os.getcwd(), 'checkpoints'), exist_ok=True)
-        subset = getattr(cfg, 'subset', 'eth')
-        video_mode = getattr(cfg, 'VIDEO_MODE', None)
-        if not video_mode and hasattr(cfg, 'MODEL') and hasattr(cfg.MODEL, 'CONTEXT_ENCODER'):
+        import glob
+        import os
+        import shutil
+
+        os.makedirs("/kaggle/working/checkpoints", exist_ok=True)
+        os.makedirs(os.path.join(os.getcwd(), "checkpoints"), exist_ok=True)
+        subset = getattr(cfg, "subset", "eth")
+        video_mode = getattr(cfg, "VIDEO_MODE", None)
+        if (
+            not video_mode
+            and hasattr(cfg, "MODEL")
+            and hasattr(cfg.MODEL, "CONTEXT_ENCODER")
+        ):
             try:
-                vm = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_MODE', None)
+                vm = getattr(cfg.MODEL.CONTEXT_ENCODER, "VIDEO_MODE", None)
                 if vm:
                     video_mode = vm
-                elif getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', True) == False:
-                    video_mode = 'off'
+                elif getattr(cfg.MODEL.CONTEXT_ENCODER, "USE_VIDEO", True) == False:
+                    video_mode = "off"
                 else:
-                    video_mode = 'full'
+                    video_mode = "full"
             except Exception:
                 pass
         if not video_mode:
-            video_mode = 'full'
+            video_mode = "full"
         # look for best/last
-        for pattern in [os.path.join(cfg.model_dir, 'checkpoint_best.pt'), os.path.join(cfg.model_dir, 'checkpoint_last.pt')]:
+        for pattern in [
+            os.path.join(cfg.model_dir, "checkpoint_best.pt"),
+            os.path.join(cfg.model_dir, "checkpoint_last.pt"),
+        ]:
             if os.path.exists(pattern):
                 for target in [
-                    f'/kaggle/working/checkpoints/{subset}_{video_mode}.pt',
-                    f'/kaggle/working/checkpoints/eth_{video_mode}.pt',
-                    f'/kaggle/working/checkpoints/{video_mode}.pt',
-                    os.path.join('checkpoints', f'{subset}_{video_mode}.pt'),
+                    f"/kaggle/working/checkpoints/{subset}_{video_mode}.pt",
+                    f"/kaggle/working/checkpoints/eth_{video_mode}.pt",
+                    f"/kaggle/working/checkpoints/{video_mode}.pt",
+                    os.path.join("checkpoints", f"{subset}_{video_mode}.pt"),
                 ]:
                     try:
                         shutil.copy2(pattern, target)
                     except Exception:
                         pass
         # also copy any ckpt in models dir
-        for ckpt in glob.glob(os.path.join(cfg.model_dir, '*.pt')):
-            for target_base in ['/kaggle/working/checkpoints', os.path.join(os.getcwd(), 'checkpoints')]:
+        for ckpt in glob.glob(os.path.join(cfg.model_dir, "*.pt")):
+            for target_base in [
+                "/kaggle/working/checkpoints",
+                os.path.join(os.getcwd(), "checkpoints"),
+            ]:
                 try:
-                    shutil.copy2(ckpt, os.path.join(target_base, os.path.basename(ckpt)))
+                    shutil.copy2(
+                        ckpt, os.path.join(target_base, os.path.basename(ckpt))
+                    )
                 except Exception:
                     pass
     except Exception:

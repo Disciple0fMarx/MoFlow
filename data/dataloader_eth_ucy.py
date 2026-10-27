@@ -1,31 +1,51 @@
-import os
-import pickle
-import glob
-import numpy as np
 import math
-from einops import rearrange
-import torch
+import os
+import sys
+
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from einops import rearrange
+
 from utils.normalization import normalize_min_max
-import os, sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from video_encoder.moflow_adapter import FrameFeatureLookup
 
 # TU-Clausthal raw parser (Kaggle-ready, no local pickle dependency)
 try:
-    from data.tu_clausthal_eth_ucy_parser import find_tu_clausthal_root, load_scene_data, TU_CLAUSTHAL_MAP
+    from data.tu_clausthal_eth_ucy_parser import (
+        TU_CLAUSTHAL_MAP,
+        find_tu_clausthal_root,
+        load_loso_windows,
+        load_scene_data,
+    )
 except Exception:
     try:
-        from tu_clausthal_eth_ucy_parser import find_tu_clausthal_root, load_scene_data, TU_CLAUSTHAL_MAP
+        from tu_clausthal_eth_ucy_parser import (
+            TU_CLAUSTHAL_MAP,
+            find_tu_clausthal_root,
+            load_loso_windows,
+            load_scene_data,
+        )
     except Exception:
         find_tu_clausthal_root = None
         load_scene_data = None
+        load_loso_windows = None
         TU_CLAUSTHAL_MAP = {}
 
 
 def seq_collate_eth(batch):
-    (index, past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, z_video, agent_crops) = zip(*batch)
+    (
+        index,
+        past_traj,
+        fut_traj,
+        past_traj_orig,
+        fut_traj_orig,
+        traj_vel,
+        z_video,
+        agent_crops,
+    ) = zip(*batch)
     pre_motion_3D = torch.stack(past_traj, dim=0)
     fut_motion_3D = torch.stack(fut_traj, dim=0)
     pre_motion_3D_orig = torch.stack(past_traj_orig, dim=0)
@@ -53,32 +73,41 @@ def seq_collate_eth(batch):
         agent_crops_stack = None
 
     data_dict = {
-        'batch_size': torch.tensor(pre_motion_3D.shape[0]),
-        'index': torch.cat(index, dim=0),
-        'past_traj': pre_motion_3D,
-        'fut_traj': fut_motion_3D,
-        'past_traj_original_scale': pre_motion_3D_orig,
-        'fut_traj_original_scale': fut_motion_3D_orig,
-        'fut_traj_vel': fut_traj_vel_stack,
+        "batch_size": torch.tensor(pre_motion_3D.shape[0]),
+        "index": torch.cat(index, dim=0),
+        "past_traj": pre_motion_3D,
+        "fut_traj": fut_motion_3D,
+        "past_traj_original_scale": pre_motion_3D_orig,
+        "fut_traj_original_scale": fut_motion_3D_orig,
+        "fut_traj_vel": fut_traj_vel_stack,
     }
     if z_video_stack is not None:
-        data_dict['z_video_global'] = z_video_stack
+        data_dict["z_video_global"] = z_video_stack
     if agent_crops_stack is not None:
-        data_dict['agent_crops'] = agent_crops_stack
+        data_dict["agent_crops"] = agent_crops_stack
     return data_dict
 
 
 def seq_collate_imle_train(batch):
     # Removed video_frames unpacking to reflect the optimized lightweight pipeline
-    (past_traj, fut_traj, past_traj_orig, fut_traj_orig, traj_vel, y_t, y_pred_data, agent_crops) = zip(*batch)
+    (
+        past_traj,
+        fut_traj,
+        past_traj_orig,
+        fut_traj_orig,
+        traj_vel,
+        y_t,
+        y_pred_data,
+        agent_crops,
+    ) = zip(*batch)
 
-    pre_motion_3D = torch.stack(past_traj,dim=0)
-    fut_motion_3D = torch.stack(fut_traj,dim=0)
+    pre_motion_3D = torch.stack(past_traj, dim=0)
+    fut_motion_3D = torch.stack(fut_traj, dim=0)
     pre_motion_3D_orig = torch.stack(past_traj_orig, dim=0)
     fut_motion_3D_orig = torch.stack(fut_traj_orig, dim=0)
     fut_traj_vel = torch.stack(traj_vel, dim=0)
     y_t = torch.stack(y_t, dim=0)
-    y_pred_data = torch.stack(y_pred_data,dim=0)
+    y_pred_data = torch.stack(y_pred_data, dim=0)
 
     # agent_crops may be a degenerate `torch.zeros(1)` when USE_AGENT_VIDEO=False — detect.
     if agent_crops[0].dim() == 4:  # [A, P, 3, h, w] -> 4 dimensions
@@ -86,156 +115,213 @@ def seq_collate_imle_train(batch):
     else:
         agent_crops_stack = None
 
-    batch_size = torch.tensor(pre_motion_3D.shape[0]) ### bt
+    batch_size = torch.tensor(pre_motion_3D.shape[0])  ### bt
     data = {
-        'batch_size': batch_size,
-        'past_traj': pre_motion_3D,
-        'fut_traj': fut_motion_3D,
-        'past_traj_original_scale': pre_motion_3D_orig,
-        'fut_traj_original_scale': fut_motion_3D_orig,
-        'fut_traj_vel': fut_traj_vel,
-        'y_t': y_t,
-        'y_pred_data': y_pred_data,
+        "batch_size": batch_size,
+        "past_traj": pre_motion_3D,
+        "fut_traj": fut_motion_3D,
+        "past_traj_original_scale": pre_motion_3D_orig,
+        "fut_traj_original_scale": fut_motion_3D_orig,
+        "fut_traj_vel": fut_traj_vel,
+        "y_t": y_t,
+        "y_pred_data": y_pred_data,
     }
     if agent_crops_stack is not None:
-        data['agent_crops'] = agent_crops_stack
+        data["agent_crops"] = agent_crops_stack
 
     return data
 
 
-def rotate_traj(past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, subset='eth'):
-    past_rel = rearrange(past_rel, 'b a p d -> (b a) p d')
-    past_abs = rearrange(past_abs, 'b a p d -> (b a) p d')
-    future_rel = rearrange(future_rel, 'b a f d -> (b a) f d')
+def rotate_traj(
+    past_rel, future_rel, past_abs, agents=2, rotate_time_frame=0, subset="eth"
+):
+    past_rel = rearrange(past_rel, "b a p d -> (b a) p d")
+    past_abs = rearrange(past_abs, "b a p d -> (b a) p d")
+    future_rel = rearrange(future_rel, "b a f d -> (b a) f d")
     past_diff = past_rel[:, rotate_time_frame]
-    
-    past_theta = torch.atan(torch.div(past_diff[:, 1], past_diff[:, 0]+1e-5))
-    past_theta = torch.where((past_diff[:, 0]<0), past_theta+math.pi, past_theta)
-    
+
+    past_theta = torch.atan(torch.div(past_diff[:, 1], past_diff[:, 0] + 1e-5))
+    past_theta = torch.where((past_diff[:, 0] < 0), past_theta + math.pi, past_theta)
+
     rotate_matrix = torch.zeros((past_theta.size(0), 2, 2)).to(past_theta.device)
     rotate_matrix[:, 0, 0] = torch.cos(past_theta)
     rotate_matrix[:, 0, 1] = torch.sin(past_theta)
-    rotate_matrix[:, 1, 0] = - torch.sin(past_theta)
+    rotate_matrix[:, 1, 0] = -torch.sin(past_theta)
     rotate_matrix[:, 1, 1] = torch.cos(past_theta)
 
     past_after = torch.matmul(rotate_matrix, past_rel.transpose(1, 2)).transpose(1, 2)
-    future_after = torch.matmul(rotate_matrix, future_rel.transpose(1, 2)).transpose(1, 2)
-    past_abs_after = torch.matmul(rotate_matrix, past_abs.transpose(1, 2)).transpose(1, 2)
-    past_after = rearrange(past_after, '(b a) p d -> b a p d', a=agents)
-    future_after = rearrange(future_after, '(b a) f d -> b a f d', a=agents)
-    past_abs_after = rearrange(past_abs_after, '(b a) p d -> b a p d', a=agents)
+    future_after = torch.matmul(rotate_matrix, future_rel.transpose(1, 2)).transpose(
+        1, 2
+    )
+    past_abs_after = torch.matmul(rotate_matrix, past_abs.transpose(1, 2)).transpose(
+        1, 2
+    )
+    past_after = rearrange(past_after, "(b a) p d -> b a p d", a=agents)
+    future_after = rearrange(future_after, "(b a) f d -> b a f d", a=agents)
+    past_abs_after = rearrange(past_abs_after, "(b a) p d -> b a p d", a=agents)
 
     return past_after, future_after, past_abs_after
 
 
 class ETHDataset(object):
-    def __init__(self, cfg, training=True, data_dir=None, subset=None, rotate_time_frame=0, imle=False, type='original', video_mode=None):
+    def __init__(
+        self,
+        cfg,
+        training=True,
+        data_dir=None,
+        subset=None,
+        rotate_time_frame=0,
+        imle=False,
+        type="original",
+        video_mode=None,
+    ):
         self.type = type
         self.imle = imle
+        self.data_dir = data_dir
+        self.subset = subset
         self.frame_ids = []
-        self.video_mode = video_mode if video_mode is not None else getattr(cfg, 'VIDEO_MODE', None)
-        if self.video_mode is None and hasattr(cfg, 'MODEL') and hasattr(cfg.MODEL, 'CONTEXT_ENCODER'):
-            self.video_mode = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_MODE', None)
+        self.video_mode = (
+            video_mode if video_mode is not None else getattr(cfg, "VIDEO_MODE", None)
+        )
+        if (
+            self.video_mode is None
+            and hasattr(cfg, "MODEL")
+            and hasattr(cfg.MODEL, "CONTEXT_ENCODER")
+        ):
+            self.video_mode = getattr(cfg.MODEL.CONTEXT_ENCODER, "VIDEO_MODE", None)
         if self.video_mode is None:
-            self.video_mode = 'full' if bool(getattr(getattr(cfg, 'MODEL', object()), 'CONTEXT_ENCODER', object()) and getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False)) else 'off'
+            self.video_mode = (
+                "full"
+                if bool(
+                    getattr(
+                        getattr(cfg, "MODEL", object()), "CONTEXT_ENCODER", object()
+                    )
+                    and getattr(cfg.MODEL.CONTEXT_ENCODER, "USE_VIDEO", False)
+                )
+                else "off"
+            )
         # Ensure common cfg attrs expected by some trainers/tools
-        if not hasattr(cfg, 'rotate'):
+        if not hasattr(cfg, "rotate"):
             cfg.rotate = False
-        if not hasattr(cfg, 'data_norm'):
-            cfg.data_norm = 'min_max'
-        if not hasattr(cfg, 'past_frames'):
+        if not hasattr(cfg, "data_norm"):
+            cfg.data_norm = "min_max"
+        if not hasattr(cfg, "past_frames"):
             cfg.past_frames = 8
-        if not hasattr(cfg, 'future_frames'):
+        if not hasattr(cfg, "future_frames"):
             cfg.future_frames = 12
-        if not hasattr(cfg, 'agents'):
+        if not hasattr(cfg, "agents"):
             cfg.agents = 1
-        if not hasattr(cfg, 'past_traj_min'):
+        if not hasattr(cfg, "past_traj_min"):
             cfg.past_traj_min = -1.0
-        if not hasattr(cfg, 'past_traj_max'):
+        if not hasattr(cfg, "past_traj_max"):
             cfg.past_traj_max = 1.0
-        if not hasattr(cfg, 'fut_traj_min'):
+        if not hasattr(cfg, "fut_traj_min"):
             cfg.fut_traj_min = -1.0
-        if not hasattr(cfg, 'fut_traj_max'):
+        if not hasattr(cfg, "fut_traj_max"):
             cfg.fut_traj_max = 1.0
-        if not hasattr(cfg, 'MODEL'):
+        if not hasattr(cfg, "MODEL"):
+
             class _Dummy:
                 pass
+
             cfg.MODEL = _Dummy()
-        if not hasattr(cfg.MODEL, 'CONTEXT_ENCODER'):
+        if not hasattr(cfg.MODEL, "CONTEXT_ENCODER"):
+
             class _Dummy2:
                 pass
+
             cfg.MODEL.CONTEXT_ENCODER = _Dummy2()
-        if not hasattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENTS'):
-            cfg.MODEL.CONTEXT_ENCODER.AGENTS = getattr(cfg, 'agents', 1)
+        if not hasattr(cfg.MODEL.CONTEXT_ENCODER, "AGENTS"):
+            cfg.MODEL.CONTEXT_ENCODER.AGENTS = getattr(cfg, "agents", 1)
         cfg.VIDEO_MODE = self.video_mode
         try:
             cfg.MODEL.CONTEXT_ENCODER.VIDEO_MODE = self.video_mode
         except Exception:
             pass
 
-
         ### LED version of preprocessed data
-        if self.type == 'LED':
-            data_file_path = os.path.join(data_dir, self.type, '{:s}_data_{:s}.npy'.format(subset, 'train' if training else 'test'))
-            num_file_path = os.path.join(data_dir, self.type, '{:s}_num_{:s}.npy'.format(subset, 'train' if training else 'test'))
+        if self.type == "LED":
+            data_file_path = os.path.join(
+                data_dir,
+                self.type,
+                "{:s}_data_{:s}.npy".format(subset, "train" if training else "test"),
+            )
+            num_file_path = os.path.join(
+                data_dir,
+                self.type,
+                "{:s}_num_{:s}.npy".format(subset, "train" if training else "test"),
+            )
 
             all_data = np.load(data_file_path)
             all_num = np.load(num_file_path)
-            
+
             # === SET self.frame_ids FOR LED ===
-            self.frame_ids = all_num[:, 0, 0] 
-            
-            self.all_data = torch.Tensor(all_data)
-            self.all_num = torch.Tensor(all_num) 
-        elif self.type == 'original':
-            ### Original version of preprocessed data
-            data_file_path = os.path.join(data_dir, self.type, subset, f'{subset}_{"train" if training else "test"}.pkl')
-            
-            with open(data_file_path, 'rb') as f:
-                data_dict = pickle.load(f)
-            
-            # --- CRITICAL FIX: Extract scalar count ---
-            all_data = data_dict['traj']
-            num_peds = all_data.shape[0] 
-            
-            # Metadata for temporal synchronization
-            frame_list = np.array(data_dict['frame_list'])
-            seq_start_end = data_dict['seq_start_end']
-            
-            # Create a 1D FLAT array
-            full_frame_ids = np.zeros(num_peds, dtype=int)
-            for i, (start, end) in enumerate(seq_start_end):
-                full_frame_ids[start:end] = frame_list[i]
-                
-            self.frame_ids = full_frame_ids 
-            # ----------------------------------------------------------------
+            self.frame_ids = all_num[:, 0, 0]
 
-            # Load the trajectory coordinates as tensors
             self.all_data = torch.Tensor(all_data)
-            self.all_data = self.all_data[:, None, :, :] # Shape: [A, 1, T, 2]
-
+            self.all_num = torch.Tensor(all_num)
+        elif self.type == "original":
+            if load_loso_windows is None:
+                raise ImportError(
+                    "Raw TU-Clausthal parser is unavailable; cannot load ETH/UCY."
+                )
+            raw = load_loso_windows(
+                data_root=data_dir,
+                held_out=subset,
+                past_frames=int(cfg.past_frames),
+                future_frames=int(cfg.future_frames),
+            )
+            split = raw["train"] if training else raw["test"]
+            all_data = split["windows"]
+            if all_data.size == 0:
+                raise ValueError(
+                    f"No raw windows for subset={subset}, training={training}"
+                )
+            self.frame_ids = np.asarray(split["start_frames"], dtype=np.int64)
+            self.ped_ids = np.asarray(split["ped_ids"], dtype=np.int64)
+            self.scene_by_sample = np.asarray(split["scenes"], dtype=object)
+            self.all_data = torch.Tensor(all_data)
+            self.all_data = self.all_data[:, None, :, :]  # [N, A=1, T, 2]
         else:
-            raise ValueError('Invalid type')
-
+            raise ValueError("Invalid type")
 
         self.cfg = cfg
         self.rotate_time_frame = rotate_time_frame
         self.imle = imle
-        
+
         ### set the agent_num in the cfg
         cfg.agents = self.all_data.shape[1]
         cfg.MODEL.CONTEXT_ENCODER.AGENTS = cfg.agents
-        
+
         ### compute past and future trajectories
-        past_traj_abs = self.all_data[:,:,:cfg.past_frames]
+        past_traj_abs = self.all_data[:, :, : cfg.past_frames]
         initial_pos = past_traj_abs[:, :, -1:]
         past_traj_rel = (past_traj_abs - initial_pos).contiguous()
-        fut_traj = (self.all_data[:,:,cfg.past_frames:] - initial_pos).contiguous()
+        fut_traj = (self.all_data[:, :, cfg.past_frames :] - initial_pos).contiguous()
         if cfg.rotate:
-            past_traj_rel, fut_traj, past_traj_abs = rotate_traj(past_traj_rel, fut_traj, past_traj_abs, cfg.agents, rotate_time_frame, subset)
-        past_traj_vel = torch.cat((past_traj_rel[:, :, 1:] - past_traj_rel[:, :, :-1], torch.zeros_like(past_traj_rel[:,:, -1:])), dim=2)
+            past_traj_rel, fut_traj, past_traj_abs = rotate_traj(
+                past_traj_rel,
+                fut_traj,
+                past_traj_abs,
+                cfg.agents,
+                rotate_time_frame,
+                subset,
+            )
+        past_traj_vel = torch.cat(
+            (
+                past_traj_rel[:, :, 1:] - past_traj_rel[:, :, :-1],
+                torch.zeros_like(past_traj_rel[:, :, -1:]),
+            ),
+            dim=2,
+        )
         past_traj = torch.cat((past_traj_abs, past_traj_rel, past_traj_vel), dim=-1)
-        self.fut_traj_vel = torch.cat((fut_traj[:, :, 1:] - fut_traj[:,:, :-1], torch.zeros_like(fut_traj[:, :, -1:])), dim=2)
+        self.fut_traj_vel = torch.cat(
+            (
+                fut_traj[:, :, 1:] - fut_traj[:, :, :-1],
+                torch.zeros_like(fut_traj[:, :, -1:]),
+            ),
+            dim=2,
+        )
 
         self.rotate_aug = cfg.rotate and training
 
@@ -244,231 +330,265 @@ class ETHDataset(object):
             cfg.fut_traj_min = fut_traj.min()
             cfg.past_traj_max = past_traj.max()
             cfg.past_traj_min = past_traj.min()
-        
+
         ### record the original to avoid numerical errors
         self.past_traj_original_scale = past_traj
         self.fut_traj_original_scale = fut_traj
 
-        self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_VIDEO', False))
-        if self.video_mode == 'off':
+        self.use_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, "USE_VIDEO", False))
+        if self.video_mode == "off":
             self.use_video = False
-        elif self.video_mode in {'static', 'full'}:
+        elif self.video_mode in {"static", "full"}:
             self.use_video = True
         try:
             cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = self.use_video
         except Exception:
             pass
-        self.use_agent_video = bool(getattr(cfg.MODEL.CONTEXT_ENCODER, 'USE_AGENT_VIDEO', False))
-        self.agent_crop_size = getattr(cfg.MODEL.CONTEXT_ENCODER, 'AGENT_CROP_SIZE', [64, 64])
+        self.use_agent_video = bool(
+            getattr(cfg.MODEL.CONTEXT_ENCODER, "USE_AGENT_VIDEO", False)
+        )
+        self.agent_crop_size = getattr(
+            cfg.MODEL.CONTEXT_ENCODER, "AGENT_CROP_SIZE", [64, 64]
+        )
         self.z_video_global = None
         if self.use_video:
-            split = 'train' if training else 'test'
-            frame_idx_path = os.path.join(
-                data_dir, 'original', subset,
-                f'{subset}_{split}_frame_index.pkl'
-            )
-            if not os.path.exists(frame_idx_path):
-                raise FileNotFoundError(
-                    f"USE_VIDEO=True but {frame_idx_path} is missing. "
-                    f"Run: python -m video_encoder.scripts.build_frame_index "
-                    f"--data-root <raw_root> --pkl-dir {os.path.join(data_dir, 'original')} "
-                    f"--scene {subset} --split {split}"
+            if not hasattr(self, "scene_by_sample") or self.scene_by_sample is None:
+                self.scene_by_sample = np.asarray(
+                    [subset] * self.all_data.shape[0], dtype=object
                 )
-            with open(frame_idx_path, 'rb') as f:
-                frame_index = pickle.load(f)
+            scenes = np.asarray(self.scene_by_sample, dtype=object)
+            if len(scenes) != self.all_data.shape[0]:
+                raise ValueError(
+                    f"scene_by_sample length {len(scenes)} != dataset length "
+                    f"{self.all_data.shape[0]}"
+                )
+            start_fids = np.asarray(self.frame_ids, dtype=np.int64)
+            if len(start_fids) != self.all_data.shape[0]:
+                raise ValueError(
+                    f"frame_ids length {len(start_fids)} != dataset length "
+                    f"{self.all_data.shape[0]}"
+                )
 
-            start_fids = np.asarray(frame_index['start_frame_id'], dtype=np.int64)
-            stride = int(frame_index.get('stride', 10))
-            if start_fids.shape[0] != self.all_data.shape[0]:
-                # try to align if mismatch
-                if start_fids.shape[0] < self.all_data.shape[0]:
-                    start_fids = np.pad(start_fids, (0, self.all_data.shape[0] - start_fids.shape[0]), constant_values=start_fids[-1] if len(start_fids)>0 else 0)
-                else:
-                    start_fids = start_fids[:self.all_data.shape[0]]
-            features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT',
-                                    'features/resnet18')
-            scene_name = frame_index.get('scene', subset)
-            try:
-                lookup = FrameFeatureLookup.from_root(features_root, scene=scene_name)
-            except Exception as e:
-                print(f"[ETHDataset] Warning: failed to load video features for {scene_name}: {e}")
-                self.z_video_global = None
-                self.use_video = False
-            else:
-                T_obs = int(cfg.past_frames)
-                D = lookup.features.shape[1]
-                if self.video_mode == 'static':
-                    # compute scene-level static vector from a sample
-                    static = None
-                    try:
-                        ids = lookup.sorted_frame_ids
-                        if ids.size:
-                            sample = ids[:: max(1, ids.size // 8)][:8]
-                            z_sample = lookup.window(int(sample[0]), n_frames=len(sample), stride=int(np.diff(sample)[0]) if len(sample)>1 else 1, policy='nearest')
-                            static = z_sample.mean(axis=0).astype(np.float32)
-                    except Exception:
-                        static = None
-                    if static is None:
-                        static = np.zeros(D, dtype=np.float32)
-                    z = np.tile(static[None, None, :], (self.all_data.shape[0], T_obs, 1))
-                    self.z_video_global = torch.from_numpy(z.astype(np.float32))
-                else:  # full
-                    z = np.zeros((self.all_data.shape[0], T_obs, D), dtype=np.float32)
-                    for i, fid in enumerate(start_fids):
-                        z[i] = lookup.window(int(fid), n_frames=T_obs, stride=stride,
-                                             policy='nearest')
-                    self.z_video_global = torch.from_numpy(z)
-        elif self.video_mode in {'static', 'full'}:
-            # try to build static from features anyway
-            try:
-                features_root = getattr(cfg.MODEL.CONTEXT_ENCODER, 'VIDEO_FEATURES_ROOT', 'features/resnet18')
-                lookup = FrameFeatureLookup.from_root(features_root, scene=subset)
-                D = lookup.features.shape[1]
-                T_obs = int(cfg.past_frames)
-                if self.video_mode == 'static':
-                    ids = lookup.sorted_frame_ids
+            features_root = getattr(
+                cfg.MODEL.CONTEXT_ENCODER, "VIDEO_FEATURES_ROOT", "features/resnet18"
+            )
+            lookups = {}
+            for scene_name in np.unique(scenes):
+                scene_name = str(scene_name)
+                try:
+                    lookups[scene_name] = FrameFeatureLookup.from_root(
+                        features_root, scene=scene_name
+                    )
+                except Exception as e:
+                    raise FileNotFoundError(
+                        f"USE_VIDEO=True but video features are missing for scene "
+                        f"'{scene_name}' under {features_root}: {e}. "
+                        "Build the per-scene feature cache before training."
+                    ) from e
+
+            T_obs = int(cfg.past_frames)
+            stride = 10
+            D = next(iter(lookups.values())).features.shape[1]
+            z = np.zeros((self.all_data.shape[0], T_obs, D), dtype=np.float32)
+            if self.video_mode == "static":
+                static_by_scene = {}
+                for scene_name, lookup in lookups.items():
                     static = np.zeros(D, dtype=np.float32)
+                    ids = lookup.sorted_frame_ids
                     if ids.size:
                         sample = ids[:: max(1, ids.size // 8)][:8]
                         try:
-                            z_sample = lookup.window(int(sample[0]), n_frames=len(sample), stride=int(np.diff(sample)[0]) if len(sample)>1 else 1, policy='nearest')
+                            z_sample = lookup.window(
+                                int(sample[0]),
+                                n_frames=len(sample),
+                                stride=(
+                                    int(np.diff(sample)[0]) if len(sample) > 1 else 1
+                                ),
+                                policy="nearest",
+                            )
                             static = z_sample.mean(axis=0).astype(np.float32)
                         except Exception:
                             pass
-                    z = np.tile(static[None, None, :], (self.all_data.shape[0], T_obs, 1))
-                    self.z_video_global = torch.from_numpy(z.astype(np.float32))
-                    self.use_video = True
-            except Exception:
-                pass
+                    static_by_scene[scene_name] = static
+                for i, scene_name in enumerate(scenes):
+                    z[i] = np.tile(
+                        static_by_scene[str(scene_name)][None, :], (T_obs, 1)
+                    )
+            else:
+                coverage = {}
+                for scene_name, lookup in lookups.items():
+                    available = set(int(x) for x in lookup.sorted_frame_ids)
+                    scene_mask = scenes == scene_name
+                    required = np.unique(
+                        (
+                            start_fids[scene_mask, None]
+                            + np.arange(T_obs)[None, :] * stride
+                        ).ravel()
+                    )
+                    missing = np.asarray(
+                        [f for f in required if int(f) not in available],
+                        dtype=np.int64,
+                    )
+                    if missing.size:
+                        coverage[scene_name] = (
+                            int(missing.size),
+                            int(missing.min()),
+                            int(missing.max()),
+                        )
+                if coverage:
+                    raise FileNotFoundError(
+                        "Video feature cache does not cover every raw frame "
+                        f"needed by this split under '{features_root}'. "
+                        f"Missing per scene (count,min,max): {coverage}. "
+                        "Rebuild features for the full raw frame range; the "
+                        "current cache may only contain the validation segment."
+                    )
+                for i, (fid, scene_name) in enumerate(zip(start_fids, scenes)):
+                    z[i] = lookups[str(scene_name)].window(
+                        int(fid), n_frames=T_obs, stride=stride, policy="nearest"
+                    )
+            self.z_video_global = torch.from_numpy(z)
 
-   
         ### min-max linear normalization
-        if cfg.data_norm == 'min_max':
-            self.past_traj = normalize_min_max(past_traj, cfg.past_traj_min, cfg.past_traj_max, -1, 1).contiguous()
-            self.fut_traj = normalize_min_max(fut_traj, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1).contiguous()
-        elif cfg.data_norm == 'original':
+        if cfg.data_norm == "min_max":
+            self.past_traj = normalize_min_max(
+                past_traj, cfg.past_traj_min, cfg.past_traj_max, -1, 1
+            ).contiguous()
+            self.fut_traj = normalize_min_max(
+                fut_traj, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1
+            ).contiguous()
+        elif cfg.data_norm == "original":
             self.past_traj = past_traj
             self.fut_traj = fut_traj
 
-
-        """load distillation target"""
+        """IMLE distillation targets are disabled with the raw-only loader."""
         if imle:
-            os.makedirs(os.path.join(data_dir, f'imle/{subset}'), exist_ok=True)
-            pkl_ls = sorted(glob.glob(os.path.join(data_dir, f'imle/{subset}/*train*.pkl')))
+            raise NotImplementedError(
+                "IMLE pkl distillation targets are disabled. The ETH/UCY loader "
+                "is raw-only; no .pkl files are read."
+            )
 
-            keys_ls = ['past_traj', 'fut_traj', 'past_traj_original_scale', 'fut_traj_original_scale', 'fut_traj_vel', 'y_t', 'y_pred_data', 'start_frame']
-            imle_data_dict = {}
-            total_scenes_loaded_ = 0
-            for i_pkl, cur_pkl in enumerate(pkl_ls):
-                data = pickle.load(open(cur_pkl, 'rb'))
-
-                if i_pkl == 0:
-                    self.imle_meta_data = data['meta_data']
-                
-                for key in keys_ls:
-                    if key not in imle_data_dict:
-                        imle_data_dict[key] = []
-                    if key == 'y_t':
-                        imle_data_dict[key].append(data[key][:, -1])
-                    else:
-                        imle_data_dict[key].append(data[key])
-
-                total_scenes_loaded_ += data['past_traj'].shape[0]
-
-                if total_scenes_loaded_ >= len(self.past_traj):
-                    break
-
-            # concat the data
-            for key in keys_ls:
-                imle_data_dict[key] = torch.from_numpy(np.concatenate(imle_data_dict[key], axis=0))[:len(self.past_traj)]
-
-            self.imle_data_dict = imle_data_dict
-        
         self.subset = subset
 
         self.SCENE_RESOLUTIONS = {
-            'eth':   (640, 480),
-            'hotel': (720, 576),
-            'univ':  (720, 576),
-            'zara1': (720, 576),
-            'zara2': (720, 576),
+            "eth": (640, 480),
+            "hotel": (720, 576),
+            "univ": (720, 576),
+            "zara1": (720, 576),
+            "zara2": (720, 576),
         }
-        
-        self.SCENE_WORLD_BOUNDS = {
-            'eth':   (-7.69, 13.89,  -1.81, 12.67),             
-            'hotel': (-10.31, 4.31, -2.77,  4.04),
-            'univ':  (-0.46, 15.47,  -0.32, 13.89),
-            'zara1': (-0.14, 15.48,  -0.37, 12.39),
-            'zara2': (-0.36, 15.56,  -0.19, 13.48),
-        }
-        
-        self.SCENE_FLIP = {
-            'eth':   (False, False),  
-            'hotel': (False, False),    
-            'univ':  (True,  False),  
-            'zara1': (False, False),  
-            'zara2': (False, False),  
-        }
-        
-        self.SCENE_SWAP_XY = {'hotel': True}
-        self.SCENE_FLIP_X = {'hotel': True}
 
-        # Load scene-specific homography matrix
-        h_path = os.path.join(data_dir, 'homography', f'{subset}_H.txt')
-        if os.path.exists(h_path):
-            self.H = np.loadtxt(h_path)
-        else:
-            print(f"Warning: Homography for {subset} not found at {h_path}. Using identity.")
-            self.H = np.eye(3) 
+        self.SCENE_WORLD_BOUNDS = {
+            "eth": (-7.69, 13.89, -1.81, 12.67),
+            "hotel": (-10.31, 4.31, -2.77, 4.04),
+            "univ": (-0.46, 15.47, -0.32, 13.89),
+            "zara1": (-0.14, 15.48, -0.37, 12.39),
+            "zara2": (-0.36, 15.56, -0.19, 13.48),
+        }
+
+        self.SCENE_FLIP = {
+            "eth": (False, False),
+            "hotel": (False, False),
+            "univ": (True, False),
+            "zara1": (False, False),
+            "zara2": (False, False),
+        }
+
+        self.SCENE_SWAP_XY = {"hotel": True}
+        self.SCENE_FLIP_X = {"hotel": True}
+
+        # Load raw H.txt directly from every scene present in this dataset.
+        if load_scene_data is None:
+            raise ImportError(
+                "Raw TU-Clausthal parser is unavailable; cannot load H.txt."
+            )
+        self.scene_H = {}
+        scene_names = getattr(self, "scene_by_sample", None)
+        if scene_names is None:
+            scene_names = np.asarray([subset] * self.all_data.shape[0], dtype=object)
+        for scene_name in np.unique(scene_names):
+            scene_name = str(scene_name)
+            self.scene_H[scene_name] = load_scene_data(data_dir, scene_name)["H"]
+        if subset not in self.scene_H:
+            self.scene_H[subset] = load_scene_data(data_dir, subset)["H"]
+        self.H = self.scene_H[subset]
         self.H_inv = np.linalg.inv(self.H)
         self.orig_res = self.SCENE_RESOLUTIONS.get(subset, (720, 576))
-        
+
     def __len__(self):
         return self.all_data.shape[0]
 
     def __getitem__(self, item):
         if self.imle:
             out = [
-                    self.imle_data_dict['past_traj'][item], 
-                    self.imle_data_dict['fut_traj'][item],
-                    self.imle_data_dict['past_traj_original_scale'][item],
-                    self.imle_data_dict['fut_traj_original_scale'][item],
-                    self.imle_data_dict['fut_traj_vel'][item],
-                    self.imle_data_dict['y_t'][item],
-                    self.imle_data_dict['y_pred_data'][item]
-                ]
-            start_frame = int(self.imle_data_dict['start_frame'][item])
+                self.imle_data_dict["past_traj"][item],
+                self.imle_data_dict["fut_traj"][item],
+                self.imle_data_dict["past_traj_original_scale"][item],
+                self.imle_data_dict["fut_traj_original_scale"][item],
+                self.imle_data_dict["fut_traj_vel"][item],
+                self.imle_data_dict["y_t"][item],
+                self.imle_data_dict["y_pred_data"][item],
+            ]
+            start_frame = int(self.imle_data_dict["start_frame"][item])
         else:
-            past_traj_norm_scale = self.past_traj[item]                             # [A, P, 6]
-            fut_traj_norm_scale = self.fut_traj[item]                               # [A, F, 2] 
-            past_traj_original_scale = self.past_traj_original_scale[item]          # [A, P, 6]
-            fut_traj_original_scale = self.fut_traj_original_scale[item]            # [A, F, 2]
-            fut_traj_vel = self.fut_traj_vel[item]                                  # [A, F, 2]   
+            past_traj_norm_scale = self.past_traj[item]  # [A, P, 6]
+            fut_traj_norm_scale = self.fut_traj[item]  # [A, F, 2]
+            past_traj_original_scale = self.past_traj_original_scale[item]  # [A, P, 6]
+            fut_traj_original_scale = self.fut_traj_original_scale[item]  # [A, F, 2]
+            fut_traj_vel = self.fut_traj_vel[item]  # [A, F, 2]
 
             if self.rotate_aug:
                 A = past_traj_norm_scale.size(0)
                 rot_angle = torch.rand(A) * 2 * math.pi
 
-                past_traj_abs_o, past_traj_rel_o, past_traj_vel_o = past_traj_original_scale.chunk(3, dim=-1)   # [A, P, 2] * 3
+                past_traj_abs_o, past_traj_rel_o, past_traj_vel_o = (
+                    past_traj_original_scale.chunk(3, dim=-1)
+                )  # [A, P, 2] * 3
 
-                rotate_matrix = torch.zeros((rot_angle.size(0), 2, 2)).to(past_traj_norm_scale.device)          # [A, 2, 2]
+                rotate_matrix = torch.zeros((rot_angle.size(0), 2, 2)).to(
+                    past_traj_norm_scale.device
+                )  # [A, 2, 2]
                 rotate_matrix[:, 0, 0] = torch.cos(rot_angle)
                 rotate_matrix[:, 0, 1] = torch.sin(rot_angle)
-                rotate_matrix[:, 1, 0] = - torch.sin(rot_angle)
+                rotate_matrix[:, 1, 0] = -torch.sin(rot_angle)
                 rotate_matrix[:, 1, 1] = torch.cos(rot_angle)
 
-                past_traj_abs_o_rot = torch.matmul(rotate_matrix, past_traj_abs_o.transpose(1, 2)).transpose(1, 2)
-                past_traj_rel_o_rot = torch.matmul(rotate_matrix, past_traj_rel_o.transpose(1, 2)).transpose(1, 2)
-                fut_traj_o_rot = torch.matmul(rotate_matrix, fut_traj_original_scale.transpose(1, 2)).transpose(1, 2)
+                past_traj_abs_o_rot = torch.matmul(
+                    rotate_matrix, past_traj_abs_o.transpose(1, 2)
+                ).transpose(1, 2)
+                past_traj_rel_o_rot = torch.matmul(
+                    rotate_matrix, past_traj_rel_o.transpose(1, 2)
+                ).transpose(1, 2)
+                fut_traj_o_rot = torch.matmul(
+                    rotate_matrix, fut_traj_original_scale.transpose(1, 2)
+                ).transpose(1, 2)
 
-                past_traj_vel_o_rot = torch.cat((past_traj_rel_o_rot[:, :, 1:] - past_traj_rel_o_rot[:, :, :-1], torch.zeros_like(past_traj_rel_o_rot[:,:, -1:])), dim=2)
-                past_traj_rot = torch.cat((past_traj_abs_o_rot, past_traj_rel_o_rot, past_traj_vel_o_rot), dim=-1)
-                
-                fut_traj_vel_o = torch.cat((fut_traj_o_rot[:, :, 1:] - fut_traj_o_rot[:,:, :-1], torch.zeros_like(fut_traj_o_rot[:, :, -1:])), dim=2)
+                past_traj_vel_o_rot = torch.cat(
+                    (
+                        past_traj_rel_o_rot[:, :, 1:] - past_traj_rel_o_rot[:, :, :-1],
+                        torch.zeros_like(past_traj_rel_o_rot[:, :, -1:]),
+                    ),
+                    dim=2,
+                )
+                past_traj_rot = torch.cat(
+                    (past_traj_abs_o_rot, past_traj_rel_o_rot, past_traj_vel_o_rot),
+                    dim=-1,
+                )
 
-                
-                past_traj_norm_scale = normalize_min_max(past_traj_rot, self.cfg.past_traj_min, self.cfg.past_traj_max, -1, 1).contiguous()
-                fut_traj_norm_scale = normalize_min_max(fut_traj_o_rot, self.cfg.fut_traj_min, self.cfg.fut_traj_max, -1, 1).contiguous()
+                fut_traj_vel_o = torch.cat(
+                    (
+                        fut_traj_o_rot[:, :, 1:] - fut_traj_o_rot[:, :, :-1],
+                        torch.zeros_like(fut_traj_o_rot[:, :, -1:]),
+                    ),
+                    dim=2,
+                )
+
+                past_traj_norm_scale = normalize_min_max(
+                    past_traj_rot, self.cfg.past_traj_min, self.cfg.past_traj_max, -1, 1
+                ).contiguous()
+                fut_traj_norm_scale = normalize_min_max(
+                    fut_traj_o_rot, self.cfg.fut_traj_min, self.cfg.fut_traj_max, -1, 1
+                ).contiguous()
                 past_traj_original_scale = past_traj_rot
                 fut_traj_original_scale = fut_traj_o_rot
                 fut_traj_vel = fut_traj_vel_o
@@ -476,16 +596,15 @@ class ETHDataset(object):
             # Extract agent-centric video crops if enabled
             agent_crops = None
             if self.use_agent_video:
+                if hasattr(self, "scene_by_sample"):
+                    self.current_scene = str(self.scene_by_sample[item])
                 agent_crops = self._extract_agent_crops(past_traj_original_scale)
 
-            # Extract agent-centric video crops if enabled
-            agent_crops = None
-            if self.use_agent_video:
-                agent_crops = self._extract_agent_crops(past_traj_original_scale)
-
-            z_video = (self.z_video_global[item]
-                   if self.z_video_global is not None
-                   else torch.zeros(1))
+            z_video = (
+                self.z_video_global[item]
+                if self.z_video_global is not None
+                else torch.zeros(1)
+            )
             out = [
                 torch.Tensor([item]).to(torch.int32),
                 past_traj_norm_scale,
@@ -499,19 +618,27 @@ class ETHDataset(object):
 
         return out
 
-    def world_to_pixel(self, traj_pts, target_res=(224, 224)):
+    def world_to_pixel(self, traj_pts, target_res=(224, 224), scene=None):
         traj_w = np.array(traj_pts, dtype=np.float64)
-        orig_w, orig_h = self.orig_res
+        scene = scene or self.subset
+        orig_w, orig_h = self.SCENE_RESOLUTIONS.get(scene, self.orig_res)
+        H_inv = (
+            np.linalg.inv(self.scene_H[scene])
+            if hasattr(self, "scene_H")
+            else self.H_inv
+        )
 
         # Use validated homography: inv(H) maps world (meters) -> pixel coordinates
         h = np.hstack((traj_w, np.ones((len(traj_w), 1)))).T
-        c = self.H_inv @ h
+        c = H_inv @ h
         img_pts = (c / c[2]).T[:, :2].copy()
 
         # Apply scene-specific coordinate conventions per notebook alignment
-        if self.subset in ('univ', 'zara1', 'zara2'):
-            img_pts = np.column_stack([img_pts[:, 0] + orig_w / 2.0, orig_h / 2.0 - img_pts[:, 1]])
-        elif self.subset == 'hotel':
+        if scene in ("univ", "zara1", "zara2"):
+            img_pts = np.column_stack(
+                [img_pts[:, 0] + orig_w / 2.0, orig_h / 2.0 - img_pts[:, 1]]
+            )
+        elif scene == "hotel":
             img_pts = img_pts.copy()
         else:  # eth
             img_pts = img_pts.copy()
@@ -553,11 +680,16 @@ class ETHDataset(object):
         h, w = self.agent_crop_size
         crops = torch.zeros(A, P, 3, h, w, dtype=torch.float32)
 
-        orig_w, orig_h = self.orig_res
+        scene = getattr(self, "current_scene", self.subset)
+        orig_w, orig_h = self.SCENE_RESOLUTIONS.get(scene, self.orig_res)
         try:
-            import cv2
             import os
-            vis_dir = os.path.join(getattr(self, 'data_dir', 'data/eth_ucy'), self.subset, 'visual_data')
+
+            import cv2
+
+            vis_dir = os.path.join(
+                getattr(self, "data_dir", "data/eth_ucy"), scene, "visual_data"
+            )
         except Exception:
             vis_dir = None
             cv2 = None
@@ -565,7 +697,7 @@ class ETHDataset(object):
         # Try to determine base frame id for this sample if available
         base_fid = None
         try:
-            if hasattr(self, 'frame_ids') and len(self.frame_ids) > 0:
+            if hasattr(self, "frame_ids") and len(self.frame_ids) > 0:
                 # This method is called per-item via __getitem__; we need item index
                 # but it's not passed - we'll rely on cached frame mapping if set
                 pass
@@ -576,8 +708,12 @@ class ETHDataset(object):
             for p in range(P):
                 world_xy = past_traj_original_scale[a, p, :2].detach().cpu().numpy()
                 try:
-                    pixel_xy = self.world_to_pixel(world_xy.reshape(1, 2))[0]
-                    pixel_x, pixel_y = int(round(float(pixel_xy[0]))), int(round(float(pixel_xy[1])))
+                    pixel_xy = self.world_to_pixel(world_xy.reshape(1, 2), scene=scene)[
+                        0
+                    ]
+                    pixel_x, pixel_y = int(round(float(pixel_xy[0]))), int(
+                        round(float(pixel_xy[1]))
+                    )
                 except Exception:
                     continue
 
@@ -591,14 +727,20 @@ class ETHDataset(object):
                 x2_clip = min(orig_w, x2)
                 y2_clip = min(orig_h, y2)
 
-                if vis_dir is not None and cv2 is not None and x2_clip > x1_clip and y2_clip > y1_clip:
+                if (
+                    vis_dir is not None
+                    and cv2 is not None
+                    and x2_clip > x1_clip
+                    and y2_clip > y1_clip
+                ):
                     # attempt to load a nearby frame (stride 10 as per data)
                     fid = base_fid if base_fid is not None else 0
-                    fpath = os.path.join(vis_dir, f'frame{int(fid):06d}.jpg')
+                    fpath = os.path.join(vis_dir, f"frame{int(fid):06d}.jpg")
                     if not os.path.exists(fpath):
                         # try to find any frame
                         import glob
-                        cands = sorted(glob.glob(os.path.join(vis_dir, 'frame*.jpg')))
+
+                        cands = sorted(glob.glob(os.path.join(vis_dir, "frame*.jpg")))
                         if cands:
                             fpath = cands[0]
                     try:
@@ -610,7 +752,7 @@ class ETHDataset(object):
                                 if crop.shape[0] != h or crop.shape[1] != w:
                                     crop = cv2.resize(crop, (w, h))
                                 # pad if needed
-                                if (x1 < 0 or y1 < 0 or x2 > orig_w or y2 > orig_h):
+                                if x1 < 0 or y1 < 0 or x2 > orig_w or y2 > orig_h:
                                     pad_img = np.zeros((h, w, 3), dtype=crop.dtype)
                                     py1 = max(0, -y1)
                                     px1 = max(0, -x1)
@@ -618,7 +760,10 @@ class ETHDataset(object):
                                     px2 = px1 + crop.shape[1]
                                     pad_img[py1:py2, px1:px2] = crop
                                     crop = pad_img
-                                crop_t = torch.from_numpy(crop).permute(2, 0, 1).float() / 255.0
+                                crop_t = (
+                                    torch.from_numpy(crop).permute(2, 0, 1).float()
+                                    / 255.0
+                                )
                                 crops[a, p] = crop_t
                                 continue
                     except Exception:
@@ -627,88 +772,16 @@ class ETHDataset(object):
 
         return crops
 
+
 class ETHDatasetSocialGAN:
-    '''
-    For the purpose of saving pickle files for train/val/test data for ETH-UCY dataset
-    '''
-    def __init__(self, data_dir, obs_len=8, pred_len=12, skip=1, min_ped=1, delim='\t', subset='eth'):
-        super(ETHDatasetSocialGAN, self).__init__()
+    """Removed: pickle generation is disabled.
 
-        self.max_peds_in_frame = 0
-        self.data_dir = data_dir
-        self.obs_len = obs_len
-        self.pred_len = pred_len
-        self.skip = skip
-        self.seq_len = self.obs_len + self.pred_len
-        self.delim = delim
-        self.cur_frame_no = 0
+    The ETH/UCY pipeline now reads raw TU-Clausthal files exclusively. This
+    stub exists only so old imports fail with an actionable message.
+    """
 
-        all_files_train = sorted(os.listdir(self.data_dir + '/train/'))
-        all_files_test = sorted(os.listdir(self.data_dir + '/test/'))
-        all_files_val = sorted(os.listdir(self.data_dir + '/val/'))
-        all_files_train = [os.path.join(self.data_dir + '/train/', path) for path in all_files_train]
-        all_files_test = [os.path.join(self.data_dir + '/test/', path) for path in all_files_test]
-        all_files_val = [os.path.join(self.data_dir + '/val/', path) for path in all_files_val]
-        data_dict = {'train': all_files_train, 'test': all_files_test, 'val': all_files_val}
-        
-        
-        for type, all_files in data_dict.items():
-
-            ### init the frame, seq_list and num_peds_in_seq while storing the train/val/test data
-            num_peds_in_seq = []
-            seq_list = []
-            frame_list = []
-            for path in all_files:    
-                data = self.read_file(path, delim)
-                frames = np.unique(data[:, 0]).tolist()
-                frame_data = []
-                for frame in frames:
-                    frame_data.append(data[frame == data[:, 0], :])
-                num_sequences = int(math.ceil((len(frames) - self.seq_len + 1) / skip))
-
-                for idx in range(0, num_sequences * self.skip + 1, skip):
-                    curr_seq_data = np.concatenate(frame_data[idx:idx + self.seq_len], axis=0)
-                    peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
-                    self.max_peds_in_frame = max(self.max_peds_in_frame, len(peds_in_curr_seq))
-                    curr_seq = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
-
-                    num_peds_considered = 0
-                    for _, ped_id in enumerate(peds_in_curr_seq):
-                        curr_ped_seq = curr_seq_data[curr_seq_data[:, 1] == ped_id, :]
-                        curr_ped_seq = np.around(curr_ped_seq, decimals=4)
-                        pad_front = frames.index(curr_ped_seq[0, 0]) - idx
-                        pad_end = frames.index(curr_ped_seq[-1, 0]) - idx + 1
-                        if pad_end - pad_front != self.seq_len:
-                            continue
-                        curr_ped_seq = np.transpose(curr_ped_seq[:, 2:])
-                        _idx = num_peds_considered
-                        curr_seq[_idx, :, pad_front:pad_end] = curr_ped_seq
-                        num_peds_considered += 1
-                    if num_peds_considered > min_ped:
-                        num_peds_in_seq.append(num_peds_considered)
-                        seq_list.append(curr_seq[:num_peds_considered])
-                        frame_list.append(frames[idx])
-
-            self.num_seq = len(seq_list)
-            self.trajs = np.concatenate(seq_list, axis=0).transpose(0, 2, 1)
-            cum_start_idx = [0] + np.cumsum(num_peds_in_seq).tolist()
-            self.seq_start_end = [(start, end) for start, end in zip(cum_start_idx, cum_start_idx[1:])]
-            self.frame_list = np.array(frame_list, dtype=np.int32)
-            traj_data = {
-                'traj': self.trajs,
-                'frame_list': self.frame_list,
-                'num_peds_in_seq': num_peds_in_seq,
-                'seq_start_end': self.seq_start_end
-            }
-            pickle.dump(traj_data, open(self.data_dir + '/{:s}_{:s}.pkl'.format(subset, type), 'wb'))
-
-
-    def read_file(self, _path, delim):
-        delim = delim if delim else self.delim
-        data = []
-        with open(_path, 'r') as f:
-            for line in f:
-                line = line.strip().split(delim)
-                line = [float(i) for i in line]
-                data.append(line)
-        return np.asarray(data)
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "ETHDatasetSocialGAN is disabled. The ETH/UCY pipeline no longer "
+            "creates or reads .pkl files; use ETHDataset with raw data."
+        )

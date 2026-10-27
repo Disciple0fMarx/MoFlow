@@ -14,7 +14,7 @@ Example::
     python tools/eval_eth_transfer.py \
         --cfg cfg/eth_ucy/cor_fm.yml \
         --ckpt checkpoints/eth_full.pt \
-        --data-dir /kaggle/input/moflow-ethucy-processed \
+        --data-dir /kaggle/working/tu-clausthal/datasets \
         --features-root /kaggle/input/moflow-ethucy-processed/features/resnet18 \
         --norm-scene eth --eval-scene hotel \
         --out q2/eth__eval_hotel__full
@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import pickle
 import sys
 from pathlib import Path
 
@@ -53,28 +52,6 @@ class _NullLogger:
 
     def debug(self, *args, **kwargs):
         pass
-
-
-def _load_norm_stats(data_dir: Path, scene: str, past_frames: int):
-    """Replicate ETHDataset's train-split min/max statistics."""
-    with open(data_dir / "original" / scene / f"{scene}_train.pkl", "rb") as f:
-        pkl = pickle.load(f)
-    traj = torch.tensor(pkl["traj"], dtype=torch.float32)[:, None, :, :]
-    past_abs = traj[:, :, :past_frames]
-    initial_pos = past_abs[:, :, -1:]
-    past_rel = past_abs - initial_pos
-    fut = traj[:, :, past_frames:] - initial_pos
-    past_vel = torch.cat(
-        (past_rel[:, :, 1:] - past_rel[:, :, :-1], torch.zeros_like(past_rel[:, :, -1:])),
-        dim=2,
-    )
-    past = torch.cat((past_abs, past_rel, past_vel), dim=-1)
-    return (
-        float(past.min()),
-        float(past.max()),
-        float(fut.min()),
-        float(fut.max()),
-    )
 
 
 def main():
@@ -119,28 +96,36 @@ def main():
     cfg.LOSS_REG_SQUARED = False
     cfg.LOSS_VELOCITY = False
 
-    past_min, past_max, fut_min, fut_max = _load_norm_stats(
-        data_dir, args.norm_scene, int(cfg.past_frames)
-    )
-    cfg.past_traj_min, cfg.past_traj_max = past_min, past_max
-    cfg.fut_traj_min, cfg.fut_traj_max = fut_min, fut_max
-    print(
-        f"[eth-transfer] norm={args.norm_scene} eval={args.eval_scene} "
-        f"past=[{past_min:.3f},{past_max:.3f}] fut=[{fut_min:.3f},{fut_max:.3f}]",
-        flush=True,
-    )
-
     state = load_checkpoint_state(Path(args.ckpt), use_ema=args.use_ema)
     has_video = any(
         isinstance(k, str) and k.startswith("model.context_encoder.video_proj.")
         for k in state
     )
     video_mode = "full" if has_video else "off"
+    if args.features_root:
+        cfg.MODEL.CONTEXT_ENCODER.VIDEO_FEATURES_ROOT = args.features_root
+
+    # Compute LOSO train-split statistics from raw data (no pickle).
+    _ = ETHDataset(
+        cfg=cfg,
+        training=True,
+        data_dir=str(data_dir),
+        subset=args.norm_scene,
+        type="original",
+        video_mode="off",
+    )
+    past_min, past_max = float(cfg.past_traj_min), float(cfg.past_traj_max)
+    fut_min, fut_max = float(cfg.fut_traj_min), float(cfg.fut_traj_max)
+
+    # Restore the checkpoint's video mode after the stats-only dataset.
     cfg.VIDEO_MODE = video_mode
     cfg.MODEL.CONTEXT_ENCODER.VIDEO_MODE = video_mode
     cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = has_video
-    if args.features_root:
-        cfg.MODEL.CONTEXT_ENCODER.VIDEO_FEATURES_ROOT = args.features_root
+    print(
+        f"[eth-transfer] norm={args.norm_scene} eval={args.eval_scene} "
+        f"past=[{past_min:.3f},{past_max:.3f}] fut=[{fut_min:.3f},{fut_max:.3f}]",
+        flush=True,
+    )
     print(f"[eth-transfer] video_mode={video_mode} ckpt={args.ckpt}", flush=True)
 
     if has_video:
@@ -153,18 +138,6 @@ def main():
                 f"'{args.eval_scene}': expected {npy} and {man}. "
                 "Pass --features-root or disable the full checkpoint."
             )
-        frame_idx = (
-            data_dir
-            / "original"
-            / args.eval_scene
-            / f"{args.eval_scene}_{args.split}_frame_index.pkl"
-        )
-        if not frame_idx.exists():
-            raise SystemExit(
-                f"[eth-transfer] frame index missing: {frame_idx}. "
-                "Build it with video_encoder.scripts.build_frame_index."
-            )
-
     dset = ETHDataset(
         cfg=cfg,
         training=False,
@@ -183,7 +156,9 @@ def main():
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ETHMotionTransformer(model_config=cfg.MODEL, logger=_NullLogger(), config=cfg)
+    model = ETHMotionTransformer(
+        model_config=cfg.MODEL, logger=_NullLogger(), config=cfg
+    )
     denoiser = FlowMatcher(cfg, model, logger=_NullLogger())
     denoiser.load_state_dict(state)
     denoiser.to(device)
@@ -195,19 +170,19 @@ def main():
     for i, batch in enumerate(loader):
         if args.n_batches and i >= args.n_batches:
             break
-        batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        batch = {
+            k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
+        }
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         with torch.no_grad():
             pred, *_ = denoiser.sample(
                 batch, num_trajs=int(cfg.denoising_head_preds), return_all_states=False
             )
-        pred = rearrange(
-            pred, "b k a (f d) -> (b a) k f d", f=int(cfg.future_frames)
-        )[..., :2]
-        pred = unnormalize_min_max(
-            pred, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1
-        )
+        pred = rearrange(pred, "b k a (f d) -> (b a) k f d", f=int(cfg.future_frames))[
+            ..., :2
+        ]
+        pred = unnormalize_min_max(pred, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1)
         gt = rearrange(batch["fut_traj_original_scale"], "b a f d -> (b a) f d")
         dist = torch.linalg.norm(pred - gt[:, None], dim=-1)  # [BA, K, F]
         ade_sum += dist.mean(dim=-1).min(dim=-1).values.sum().item()

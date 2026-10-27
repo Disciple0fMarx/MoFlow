@@ -2,18 +2,25 @@
 """
 Kaggle Kernel Runner for MoFlow ETH/UCY M1-M6 pipeline.
 
-The heavy lifting (data parsing / homography / video features) is expected to
-be precomputed and attached as a Kaggle dataset with this layout:
+Trajectories and homographies come from the strict TU-Clausthal repository
+layout (cloned at runtime if needed):
 
-    <root>/original/<subset>/<subset>_{train,val,test}.pkl
-    <root>/original/<subset>/<subset>_{train,test}_frame_index.pkl
-    <root>/homography/<subset>_H.txt
-    <root>/features/resnet18/<subset>.npy
+    <raw>/ETH/seq_eth/{obsmat.txt,H.txt}
+    <raw>/ETH/seq_hotel/{obsmat.txt,H.txt}
+    <raw>/UCY/{students03,zara01,zara02}/{obsmat.txt,H.txt,annotation.vsp}
 
-If no processed dataset is attached we fall back to cloning the raw
-TU-Clausthal repository, but training requires the processed pickles, so the
-run is skipped with an explicit error instead of silently "succeeding".
+Video features are the only precomputed artifact and may be attached as:
+
+    <features-root>/<subset>.npy
+    <features-root>/<subset>.manifest.parquet
+
+No ETH/UCY pickle files are read.
+
+Set ``BUILD_FEATURES=1`` to fetch raw videos and rebuild full-range global
+features (default when ``full`` is in ``VIDEO_MODES``). Set ``BUILD_FEATURES=0``
+to reuse an attached full-range feature cache.
 """
+
 import glob
 import os
 import shutil
@@ -31,6 +38,7 @@ VIDEO_MODES = os.environ.get("VIDEO_MODES", "off,static,full").split(",")
 EPOCHS = os.environ.get("EPOCHS", "80")
 BATCH_SIZE = os.environ.get("BATCH_SIZE", "64")
 RUN_M5 = os.environ.get("RUN_M5", "0") == "1"
+BUILD_FEATURES = os.environ.get("BUILD_FEATURES", "").strip().lower()
 
 
 def run_cmd(cmd, cwd=None, check=True):
@@ -43,9 +51,7 @@ def run_cmd(cmd, cwd=None, check=True):
     return result
 
 
-def find_processed_root(subset: str):
-    """Return a directory that contains original/<subset>/<subset>_train.pkl."""
-    rel = Path("original") / subset / f"{subset}_train.pkl"
+def _input_candidates():
     candidates = [
         KAGGLE_INPUT / "moflow-ethucy-processed",
         KAGGLE_INPUT / "datasets" / "dhyaelbahri" / "moflow-ethucy-processed",
@@ -68,20 +74,82 @@ def find_processed_root(subset: str):
                     candidates.extend(sorted(p for p in child.iterdir() if p.is_dir()))
                 except OSError:
                     pass
-    for cand in candidates:
-        if (cand / rel).exists():
-            return cand
+    return candidates
+
+
+def find_features_root():
+    """Return the attached resnet18 feature directory, if present."""
+    for cand in _input_candidates():
+        feat = cand / "features" / "resnet18"
+        if feat.is_dir() and any(feat.glob("*.npy")):
+            return feat
     return None
 
 
-def find_video_features(root: Path):
-    cand = root / "features" / "resnet18"
-    if cand.is_dir():
-        return cand
-    for path in root.glob("**/features/resnet18"):
-        if path.is_dir():
-            return path
-    return None
+RAW_REPO_URL = (
+    "https://gitlab.tu-clausthal.de/pka20/Trajectory-Prediction-Pedestrian.git"
+)
+RAW_SPARSE_PATTERNS = [
+    "/datasets/ETH/seq_eth/obsmat.txt",
+    "/datasets/ETH/seq_eth/H.txt",
+    "/datasets/ETH/seq_hotel/obsmat.txt",
+    "/datasets/ETH/seq_hotel/H.txt",
+    "/datasets/UCY/students03/obsmat.txt",
+    "/datasets/UCY/students03/H.txt",
+    "/datasets/UCY/students03/annotation.vsp",
+    "/datasets/UCY/zara01/obsmat.txt",
+    "/datasets/UCY/zara01/H.txt",
+    "/datasets/UCY/zara01/annotation.vsp",
+    "/datasets/UCY/zara02/obsmat.txt",
+    "/datasets/UCY/zara02/H.txt",
+    "/datasets/UCY/zara02/annotation.vsp",
+]
+
+RAW_VIDEO_PATTERNS = [
+    "/datasets/ETH/seq_eth/video.avi",
+    "/datasets/ETH/seq_hotel/video.avi",
+    "/datasets/UCY/students03/video.avi",
+    "/datasets/UCY/zara01/video.avi",
+    "/datasets/UCY/zara02/video.avi",
+]
+
+
+def ensure_raw_data_root(include_videos: bool = False):
+    """Clone/fetch the strict TU-Clausthal layout and return its datasets dir."""
+    raw_repo = KAGGLE_WORK / "tu-clausthal"
+    data_root = raw_repo / "datasets"
+    required = [
+        data_root / "ETH" / "seq_eth" / "obsmat.txt",
+        data_root / "ETH" / "seq_hotel" / "obsmat.txt",
+        data_root / "UCY" / "students03" / "annotation.vsp",
+        data_root / "UCY" / "zara01" / "annotation.vsp",
+        data_root / "UCY" / "zara02" / "annotation.vsp",
+    ]
+    if not all(p.exists() for p in required):
+        if not raw_repo.exists():
+            run_cmd(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--filter=blob:none",
+                    "--sparse",
+                    RAW_REPO_URL,
+                    str(raw_repo),
+                ]
+            )
+        run_cmd(
+            ["git", "sparse-checkout", "set", "--no-cone", *RAW_SPARSE_PATTERNS],
+            cwd=str(raw_repo),
+        )
+        run_cmd(["git", "checkout"], cwd=str(raw_repo))
+    missing = [str(p) for p in required if not p.exists() or p.stat().st_size == 0]
+    if missing:
+        raise SystemExit(
+            "Strict raw TU-Clausthal data incomplete; missing: " + ", ".join(missing)
+        )
+    return data_root
 
 
 def clone_repo(repo_dir: Path):
@@ -99,7 +167,14 @@ def copy_run_artifacts(repo_dir: Path, video_mode: str, data_dir: Path):
     out_ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpts = sorted(
         glob.glob(
-            str(repo_dir / "results_eth_ucy" / "cor_fm" / f"*_{SUBSET}_vm{video_mode}*" / "models" / "checkpoint_*.pt")
+            str(
+                repo_dir
+                / "results_eth_ucy"
+                / "cor_fm"
+                / f"*_{SUBSET}_vm{video_mode}*"
+                / "models"
+                / "checkpoint_*.pt"
+            )
         ),
         key=os.path.getmtime,
     )
@@ -110,7 +185,17 @@ def copy_run_artifacts(repo_dir: Path, video_mode: str, data_dir: Path):
         elif name == "checkpoint_last.pt":
             shutil.copy2(ckpt, out_ckpt_dir / f"{SUBSET}_{video_mode}_last.pt")
     for pattern in ("metrics*.csv", "*eval*.csv", "*.log"):
-        for f in glob.glob(str(repo_dir / "results_eth_ucy" / "cor_fm" / f"*_{SUBSET}_vm{video_mode}*" / "**" / pattern), recursive=True):
+        for f in glob.glob(
+            str(
+                repo_dir
+                / "results_eth_ucy"
+                / "cor_fm"
+                / f"*_{SUBSET}_vm{video_mode}*"
+                / "**"
+                / pattern
+            ),
+            recursive=True,
+        ):
             try:
                 shutil.copy2(f, KAGGLE_WORK / f"{SUBSET}_{video_mode}_{Path(f).name}")
             except OSError:
@@ -130,29 +215,53 @@ def main():
     (KAGGLE_WORK / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     run_cmd(
-        [sys.executable, "-m", "pip", "install", "-q",
-         "easydict", "einops", "tensorboardX", "pyyaml", "GitPython", "ema-pytorch"],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "easydict",
+            "einops",
+            "tensorboardX",
+            "pyyaml",
+            "GitPython",
+            "ema-pytorch",
+        ],
         check=False,
     )
 
-    data_dir = find_processed_root(SUBSET)
-    if data_dir is None:
-        raw_dir = KAGGLE_WORK / "datasets" / "tu-clausthal"
-        if not raw_dir.exists():
-            run_cmd([
-                "git", "clone", "--depth", "1", "--filter=blob:none", "--sparse",
-                "https://gitlab.tu-clausthal.de/pka20/Trajectory-Prediction-Pedestrian.git",
-                str(raw_dir),
-            ])
-            run_cmd(["git", "sparse-checkout", "set", "datasets/ETH", "datasets/UCY"], cwd=str(raw_dir))
-        raise SystemExit(
-            "No processed ETH/UCY dataset attached. Expected "
-            f"original/{SUBSET}/{SUBSET}_train.pkl under /kaggle/input. "
-            "Attach dhyaelbahri/moflow-ethucy-processed to this kernel."
+    modes = {m.strip() for m in VIDEO_MODES if m.strip()}
+    needs_features = any(m != "off" for m in modes)
+    if BUILD_FEATURES == "":
+        # The attached feature cache is validation-only; rebuild for full mode.
+        build_features = "full" in modes
+    else:
+        build_features = BUILD_FEATURES in {"1", "true", "yes", "on"}
+    data_dir = ensure_raw_data_root(include_videos=build_features)
+    features_root = find_features_root()
+    if build_features:
+        features_root = KAGGLE_WORK / "features" / "resnet18"
+        run_cmd(
+            [
+                sys.executable,
+                "-m",
+                "video_encoder.scripts.build_ethucy_features",
+                "--data-root",
+                str(data_dir),
+                "--out",
+                str(features_root),
+                "--stride",
+                "10",
+            ]
         )
-
-    features_root = find_video_features(data_dir)
-    print(f"[data] processed root: {data_dir}", flush=True)
+    elif needs_features and features_root is None:
+        raise SystemExit(
+            "Video modes requested but no features/resnet18/*.npy found under "
+            "/kaggle/input. Attach the features artifact, set BUILD_FEATURES=1, "
+            "or use VIDEO_MODES=off."
+        )
+    print(f"[data] raw root: {data_dir}", flush=True)
     print(f"[data] video features: {features_root}", flush=True)
 
     for video_mode in VIDEO_MODES:
@@ -161,13 +270,20 @@ def main():
             continue
         print(f"\n--- Training subset={SUBSET} video_mode={video_mode} ---", flush=True)
         cmd = [
-            sys.executable, "fm_eth.py",
-            "--cfg", "cfg/eth_ucy/cor_fm.yml",
-            "--subset", SUBSET,
-            "--video_mode", video_mode,
-            "--epochs", EPOCHS,
-            "--batch_size", BATCH_SIZE,
-            "--data_dir", str(data_dir),
+            sys.executable,
+            "fm_eth.py",
+            "--cfg",
+            "cfg/eth_ucy/cor_fm.yml",
+            "--subset",
+            SUBSET,
+            "--video_mode",
+            video_mode,
+            "--epochs",
+            EPOCHS,
+            "--batch_size",
+            BATCH_SIZE,
+            "--data_dir",
+            str(data_dir),
         ]
         if features_root is not None:
             cmd.extend(["--video_features_root", str(features_root)])
@@ -193,7 +309,11 @@ def main():
         print("[q2] RUN_M5!=1, skipping transfer matrix", flush=True)
 
     # Final sweep: make sure any CSV/report generated under the repo is visible.
-    for pattern in ("**/q2_transfer*.csv", "**/*transfer*matrix*.csv", "**/metrics*.csv"):
+    for pattern in (
+        "**/q2_transfer*.csv",
+        "**/*transfer*matrix*.csv",
+        "**/metrics*.csv",
+    ):
         for f in glob.glob(pattern, recursive=True):
             try:
                 shutil.copy2(f, KAGGLE_WORK / Path(f).name)

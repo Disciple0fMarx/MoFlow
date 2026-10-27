@@ -17,6 +17,7 @@ GET  /api/scenes/{scene}/stats            -> density-over-time, speed-distributi
 GET  /api/loso/{held_out}                 -> train/val row counts per training scene, cutoffs
 POST /api/features                        -> body: {npy_path}; returns 2-D PCA + indices
 """
+
 from __future__ import annotations
 
 import io
@@ -29,13 +30,21 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel
 from PIL import Image
+from pydantic import BaseModel
 
-from .scenes import CANONICAL_SCENES, scene_to_folder, others
-from .trajectories import load_raw_trajectories
+from .frames import (detect_stride, frame_path, list_available_frames,
+                     snap_frame_id)
+from .scenes import CANONICAL_SCENES, others, scene_to_folder
 from .splits import temporal_split
-from .frames import list_available_frames, detect_stride, snap_frame_id, frame_path
+from .trajectories import load_raw_trajectories
+
+try:
+    from data.tu_clausthal_eth_ucy_parser import (find_tu_clausthal_root,
+                                                  load_scene_data)
+except Exception:  # pragma: no cover
+    find_tu_clausthal_root = None
+    load_scene_data = None
 
 
 DATA_ROOT = Path(os.environ.get("VE_DATA_ROOT", "./data_trajpred")).resolve()
@@ -51,10 +60,12 @@ app.add_middleware(
 # ---------- caches ----------
 _traj_cache: dict[str, pd.DataFrame] = {}
 
+
 def _traj(scene: str) -> pd.DataFrame:
     if scene not in _traj_cache:
         _traj_cache[scene] = load_raw_trajectories(DATA_ROOT, scene)
     return _traj_cache[scene]
+
 
 def _scene_exists(scene: str) -> bool:
     try:
@@ -63,67 +74,87 @@ def _scene_exists(scene: str) -> bool:
         return False
     return True
 
+
 # Scene-specific constants (copied from dataloader_eth_ucy.py)
 SCENE_RESOLUTIONS = {
-    'eth':   (640, 480),
-    'hotel': (720, 576),
-    'univ':  (720, 576),
-    'zara1': (720, 576),
-    'zara2': (720, 576),
+    "eth": (640, 480),
+    "hotel": (720, 576),
+    "univ": (720, 576),
+    "zara1": (720, 576),
+    "zara2": (720, 576),
     # SDD scenes - SDD videos are typically 1280x720 (720p)
-    'bookstore': (1280, 720),
-    'coupa': (1280, 720),
-    'deathCircle': (1280, 720),
-    'gates': (1280, 720),
-    'hyang': (1280, 720),
-    'little': (1280, 720),
-    'nexus': (1280, 720),
-    'quad': (1280, 720),
+    "bookstore": (1280, 720),
+    "coupa": (1280, 720),
+    "deathCircle": (1280, 720),
+    "gates": (1280, 720),
+    "hyang": (1280, 720),
+    "little": (1280, 720),
+    "nexus": (1280, 720),
+    "quad": (1280, 720),
 }
 
 SCENE_WORLD_BOUNDS = {
-    'eth':   (-7.69, 13.89,  -1.81, 12.67),
-    'hotel': (-10.31, 4.31, -2.77,  4.04),
-    'univ':  (-0.46, 15.47,  -0.32, 13.89),
-    'zara1': (-0.14, 15.48,  -0.37, 12.39),
-    'zara2': (-0.36, 15.56,  -0.19, 13.48),
+    "eth": (-7.69, 13.89, -1.81, 12.67),
+    "hotel": (-10.31, 4.31, -2.77, 4.04),
+    "univ": (-0.46, 15.47, -0.32, 13.89),
+    "zara1": (-0.14, 15.48, -0.37, 12.39),
+    "zara2": (-0.36, 15.56, -0.19, 13.48),
     # SDD scenes - set to make world_to_pixel approximately identity for visualization
     # Derived from: xmin=pad, xmax=width-pad, ymin=height-pad, ymax=pad (with pad=10)
     # This ensures that when trajectory data is in pixel coordinates matching the video,
     # the world_to_pixel function returns approximately the same coordinates for visualization
-    'bookstore': (10, 1270, 710, 10),
-    'coupa': (10, 1270, 710, 10),
-    'deathCircle': (10, 1270, 710, 10),
-    'gates': (10, 1270, 710, 10),
-    'hyang': (10, 1270, 710, 10),
-    'little': (10, 1270, 710, 10),
-    'nexus': (10, 1270, 710, 10),
-    'quad': (10, 1270, 710, 10),
+    "bookstore": (10, 1270, 710, 10),
+    "coupa": (10, 1270, 710, 10),
+    "deathCircle": (10, 1270, 710, 10),
+    "gates": (10, 1270, 710, 10),
+    "hyang": (10, 1270, 710, 10),
+    "little": (10, 1270, 710, 10),
+    "nexus": (10, 1270, 710, 10),
+    "quad": (10, 1270, 710, 10),
 }
 
-def world_to_pixel(traj_pts, scene: str, target_res=(64, 64)):
-    """Convert world coordinates to pixel coordinates using scene homography.
-    Uses inv(H) mapping validated against ETH/UCY (world meters -> pixels).
-    """
-    import os
+ETH_UCY_SCENES = {"eth", "hotel", "univ", "zara1", "zara2"}
 
+
+def world_to_pixel(
+    traj_pts, scene: str, target_res=(64, 64), data_root: Optional[str] = None
+):
+    """Convert world coordinates to pixels using raw TU-Clausthal ``H.txt``.
+
+    ETH/UCY scenes require the strict raw root. No cached/processed homography
+    fallback is used for these scenes. SDD visualization keeps its existing
+    affine fallback.
+    """
     traj_w = np.array(traj_pts, dtype=np.float64)
     orig_w, orig_h = SCENE_RESOLUTIONS.get(scene, (720, 576))
 
-    h_path = os.path.join("data/eth_ucy/homography", f"{scene}_H.txt")
-    if os.path.exists(h_path):
-        H = np.loadtxt(h_path)
-        H_inv = np.linalg.inv(H)
+    if scene in ETH_UCY_SCENES:
+        if find_tu_clausthal_root is None or load_scene_data is None:
+            raise ImportError("Raw TU-Clausthal parser is unavailable.")
+        root = (
+            data_root
+            or os.environ.get("TU_CLAUSTHAL_ROOT")
+            or os.environ.get("ETHUCY_ROOT")
+        )
+        raw = load_scene_data(root, scene)
+        H_inv = raw["H_inv"]
         h = np.hstack((traj_w, np.ones((len(traj_w), 1)))).T
         c = H_inv @ h
         img_pts = (c / c[2]).T[:, :2].copy()
+        if scene in ("univ", "zara1", "zara2"):
+            img_pts = np.column_stack(
+                [img_pts[:, 0] + orig_w / 2.0, orig_h / 2.0 - img_pts[:, 1]]
+            )
     else:
-        # Fallback for SDD or missing homography (identity-like)
         x_min, x_max, y_min, y_max = SCENE_WORLD_BOUNDS.get(scene, (0, 1280, 720, 0))
         pad = 10
         img_pts = np.zeros_like(traj_w)
-        img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min + 1e-12) * (orig_w - 2 * pad) + pad
-        img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min + 1e-12) * (orig_h - 2 * pad) + pad
+        img_pts[:, 0] = (traj_w[:, 0] - x_min) / (x_max - x_min + 1e-12) * (
+            orig_w - 2 * pad
+        ) + pad
+        img_pts[:, 1] = (traj_w[:, 1] - y_min) / (y_max - y_min + 1e-12) * (
+            orig_h - 2 * pad
+        ) + pad
         img_pts[:, 1] = orig_h - img_pts[:, 1]
 
     if (orig_w, orig_h) != target_res:
@@ -131,6 +162,7 @@ def world_to_pixel(traj_pts, scene: str, target_res=(64, 64)):
         img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
         img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
     return img_pts
+
 
 # ---------- routes ----------
 @app.get("/api/health")
@@ -151,14 +183,16 @@ def scenes():
             except FileNotFoundError:
                 has_frames = False
                 n_frames = 0
-            out.append({
-                "scene": s,
-                "folder": scene_to_folder(s),
-                "rows": int(len(df)),
-                "pedestrians": int(df["ped_id"].nunique()),
-                "frames_on_disk": n_frames,
-                "has_frames": has_frames,
-            })
+            out.append(
+                {
+                    "scene": s,
+                    "folder": scene_to_folder(s),
+                    "rows": int(len(df)),
+                    "pedestrians": int(df["ped_id"].nunique()),
+                    "frames_on_disk": n_frames,
+                    "has_frames": has_frames,
+                }
+            )
         except FileNotFoundError:
             out.append({"scene": s, "folder": scene_to_folder(s), "missing": True})
     return {"scenes": out, "data_root": str(DATA_ROOT)}
@@ -208,12 +242,14 @@ def trajectories(scene: str):
     if scene not in CANONICAL_SCENES:
         raise HTTPException(404, "unknown scene")
     df = _traj(scene)[["frame_id", "ped_id", "x", "y"]]
-    return JSONResponse({
-        "frame_ids": df["frame_id"].astype(int).tolist(),
-        "ped_ids": df["ped_id"].astype(int).tolist(),
-        "xs": df["x"].astype(float).round(4).tolist(),
-        "ys": df["y"].astype(float).round(4).tolist(),
-    })
+    return JSONResponse(
+        {
+            "frame_ids": df["frame_id"].astype(int).tolist(),
+            "ped_ids": df["ped_id"].astype(int).tolist(),
+            "xs": df["x"].astype(float).round(4).tolist(),
+            "ys": df["y"].astype(float).round(4).tolist(),
+        }
+    )
 
 
 @app.get("/api/scenes/{scene}/frames")
@@ -309,18 +345,23 @@ def agent_crops(
         crop_img.save(buffer, format="JPEG")
         jpeg_bytes = buffer.getvalue()
         import base64
+
         b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-        crops_b64.append({
-            "ped_id": int(row["ped_id"]),
-            "crop_base64": b64,
-        })
-    return JSONResponse({
-        "scene": scene,
-        "frame_id": snapped,
-        "requested_frame_id": fid,
-        "size": size,
-        "crops": crops_b64,
-    })
+        crops_b64.append(
+            {
+                "ped_id": int(row["ped_id"]),
+                "crop_base64": b64,
+            }
+        )
+    return JSONResponse(
+        {
+            "scene": scene,
+            "frame_id": snapped,
+            "requested_frame_id": fid,
+            "size": size,
+            "crops": crops_b64,
+        }
+    )
 
 
 @app.get("/api/scenes/{scene}/stats")
@@ -381,15 +422,17 @@ def loso(held_out: str):
         except FileNotFoundError:
             continue
         sp = temporal_split(df)
-        train_info.append({
-            "scene": s,
-            "rows": int(len(df)),
-            "train_rows": int(len(sp.train)),
-            "val_rows": int(len(sp.val)),
-            "cutoff": int(sp.cutoff_frame_id),
-            "frame_min": int(df["frame_id"].min()),
-            "frame_max": int(df["frame_id"].max()),
-        })
+        train_info.append(
+            {
+                "scene": s,
+                "rows": int(len(df)),
+                "train_rows": int(len(sp.train)),
+                "val_rows": int(len(sp.val)),
+                "cutoff": int(sp.cutoff_frame_id),
+                "frame_min": int(df["frame_id"].min()),
+                "frame_max": int(df["frame_id"].max()),
+            }
+        )
         total_train += len(sp.train)
         total_val += len(sp.val)
     try:
@@ -431,8 +474,8 @@ def features(req: FeatureReq):
     x = arr - arr.mean(axis=0, keepdims=True)
     # truncate to first 2 components
     u, s, vt = np.linalg.svd(x, full_matrices=False)
-    proj = (u[:, :2] * s[:2])
-    explained = (s[:2] ** 2) / (s ** 2).sum()
+    proj = u[:, :2] * s[:2]
+    explained = (s[:2] ** 2) / (s**2).sum()
     return {
         "n": int(n),
         "n_used": int(arr.shape[0]),
@@ -446,6 +489,7 @@ def features(req: FeatureReq):
 
 def main():
     import uvicorn
+
     uvicorn.run("video_encoder.api:app", host="0.0.0.0", port=8000, reload=False)
 
 

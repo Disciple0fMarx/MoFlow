@@ -101,6 +101,7 @@ def main():
     # 4. Perform deterministic 1:1 matching for each pickle entry
     print("[*] Re-aligning pickle indexes to video frame IDs...")
     start_frame_ids = []
+    sample_scenes = []
     matched_count = 0
 
     if all_raw_windows:
@@ -119,6 +120,7 @@ def main():
                round(sample_coords[-1, 0], 3), round(sample_coords[-1, 1], 3))
         
         match = None
+        sample_scene = args.scene
         if key in lookup:
             candidates = lookup[key]
             if len(candidates) == 1:
@@ -141,10 +143,12 @@ def main():
 
         if match is not None:
             start_frame_ids.append(match["start_frame_id"])
+            sample_scene = match.get("scene", args.scene)
             matched_count += 1
         else:
             # Fallback to zero to guarantee array stability without hard-crashing the training routine
             start_frame_ids.append(0)
+        sample_scenes.append(sample_scene)
 
     print(f"[+] Complete. Successfully matched {matched_count}/{n_samples} samples.")
 
@@ -153,6 +157,7 @@ def main():
         "scene": args.scene,
         "stride": stride,
         "start_frame_id": np.asarray(start_frame_ids, dtype=np.int64),
+        "scene_by_sample": np.asarray(sample_scenes, dtype=object),
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
