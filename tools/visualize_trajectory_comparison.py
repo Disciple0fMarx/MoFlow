@@ -51,6 +51,7 @@ Usage::
 Figures are written to ``visualizations/<scene>_trajectory_comparison.png``
 at 300 DPI with serif fonts sized for print readability.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -129,19 +130,40 @@ FRAME_CACHE_DIR = Path(
 
 # Bundled samples: low-alpha lines exposing the multimodal distribution;
 # best hypotheses: thick highlight lines, one colour per model.
-SAMPLE_STYLE_BASE = {"linestyle": "-", "linewidth": 0.9, "marker": "o",
-                     "markersize": 2}
+SAMPLE_STYLE_BASE = {"linestyle": "-", "linewidth": 0.9, "marker": "o", "markersize": 2}
 STYLE = {
-    "history": {"color": "black", "linestyle": "--", "linewidth": 1.6,
-                "marker": "o", "markersize": 3, "label": "History"},
-    "gt": {"color": "green", "linestyle": "-", "linewidth": 1.8,
-           "marker": "o", "markersize": 3, "label": "Ground truth"},
-    "baseline_best": {"color": "blue", "linewidth": 2.4, "alpha": 0.85,
-                      "marker": "o", "markersize": 3,
-                      "label": "Best-of-K (min-ADE)"},
-    "ours_best": {"color": "red", "linewidth": 2.4, "alpha": 0.85,
-                  "marker": "o", "markersize": 3,
-                  "label": "Best-of-K (min-ADE)"},
+    "history": {
+        "color": "black",
+        "linestyle": "--",
+        "linewidth": 1.6,
+        "marker": "o",
+        "markersize": 3,
+        "label": "History",
+    },
+    "gt": {
+        "color": "green",
+        "linestyle": "-",
+        "linewidth": 1.8,
+        "marker": "o",
+        "markersize": 3,
+        "label": "Ground truth",
+    },
+    "baseline_best": {
+        "color": "blue",
+        "linewidth": 2.4,
+        "alpha": 0.85,
+        "marker": "o",
+        "markersize": 3,
+        "label": "Best-of-K (min-ADE)",
+    },
+    "ours_best": {
+        "color": "red",
+        "linewidth": 2.4,
+        "alpha": 0.85,
+        "marker": "o",
+        "markersize": 3,
+        "label": "Best-of-K (min-ADE)",
+    },
 }
 
 logger = logging.getLogger("viz")
@@ -215,22 +237,35 @@ def plot_trajectory_comparison(
     # ---- background FIRST: imshow before any trajectory is plotted --------
     if background is not None:
         if extent is None:  # default: full image, origin top-left (y down)
-            extent = (0.0, float(background.shape[1]),
-                      float(background.shape[0]), 0.0)
+            extent = (0.0, float(background.shape[1]), float(background.shape[0]), 0.0)
         for ax_ in axes:
-            ax_.imshow(background, extent=extent, origin="upper", zorder=0,
-                       interpolation="bilinear", aspect="equal")
+            ax_.imshow(
+                background,
+                extent=extent,
+                origin="upper",
+                zorder=0,
+                interpolation="bilinear",
+                aspect="equal",
+            )
 
     _, labels_r = _draw_panel(
-        axes[0], obs, gt, base_all,
+        axes[0],
+        obs,
+        gt,
+        base_all,
         best=_as_xy(baseline_best) if baseline_best is not None else None,
-        best_style=STYLE["baseline_best"], panel_title=panel_titles[0],
+        best_style=STYLE["baseline_best"],
+        panel_title=panel_titles[0],
         units=units,
     )
     handles_r, _ = _draw_panel(
-        axes[1], obs, gt, ours_all,
+        axes[1],
+        obs,
+        gt,
+        ours_all,
         best=_as_xy(ours_best) if ours_best is not None else None,
-        best_style=STYLE["ours_best"], panel_title=panel_titles[1],
+        best_style=STYLE["ours_best"],
+        panel_title=panel_titles[1],
         units=units,
     )
 
@@ -262,8 +297,14 @@ def plot_trajectory_comparison(
     axes[1].set_ylabel("")
     fig.suptitle(title if title is not None else "Trajectory Comparison")
     if handles_r:
-        fig.legend(handles_r, labels_r, loc="lower center", ncol=4,
-                   frameon=True, framealpha=0.9)
+        fig.legend(
+            handles_r,
+            labels_r,
+            loc="lower center",
+            ncol=4,
+            frameon=True,
+            framealpha=0.9,
+        )
 
     if save_path is not None:
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -278,16 +319,21 @@ def _draw_panel(ax, obs, gt, samples, best, best_style, panel_title, units):
     """
     ax.set_title(panel_title)
     (h_hist,) = ax.plot(obs[:, 0], obs[:, 1], zorder=4, **STYLE["history"])
-    ax.scatter(obs[-1, 0], obs[-1, 1], color="black", marker="s", s=70,
-               zorder=5)
+    ax.scatter(obs[-1, 0], obs[-1, 1], color="black", marker="s", s=70, zorder=5)
     (h_gt,) = ax.plot(gt[:, 0], gt[:, 1], zorder=4, **STYLE["gt"])
 
     h_sample = None
     for i, hyp in enumerate(np.asarray(samples)):
         kwargs = {"label": "Predicted samples" if i == 0 else "_nolegend_"}
-        (artist,) = ax.plot(hyp[:, 0], hyp[:, 1],
-                            color=best_style["color"], alpha=0.15,
-                            zorder=2, **kwargs, **SAMPLE_STYLE_BASE)
+        (artist,) = ax.plot(
+            hyp[:, 0],
+            hyp[:, 1],
+            color=best_style["color"],
+            alpha=0.15,
+            zorder=2,
+            **kwargs,
+            **SAMPLE_STYLE_BASE,
+        )
         if h_sample is None:
             h_sample = artist
 
@@ -351,9 +397,9 @@ def select_best_of_k(
         hypothesis with the lowest mean L2 distance to ``gt[n]``.
     """
     distances = np.linalg.norm(preds - gt[:, None, :, :], axis=-1)  # [N, K, F]
-    ade = distances.mean(axis=-1)                                   # [N, K]
-    idx = ade.argmin(axis=-1)                                       # [N]
-    best = preds[np.arange(preds.shape[0]), idx]                    # [N, F, 2]
+    ade = distances.mean(axis=-1)  # [N, K]
+    idx = ade.argmin(axis=-1)  # [N]
+    best = preds[np.arange(preds.shape[0]), idx]  # [N, F, 2]
     return best, idx
 
 
@@ -368,7 +414,7 @@ def load_checkpoint_state(ckpt_path: Path, use_ema: bool = False) -> dict:
     the exponential-moving-average weights (smoother, preferred for visual
     comparisons when available).
     """
-    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict) and ("model" in ckpt or "ema" in ckpt):
         if use_ema and ckpt.get("ema") is not None:
             return ckpt["ema"]
@@ -432,7 +478,9 @@ def _build_cfg(scene: str, vid_status: str, args: argparse.Namespace) -> Config:
     return cfg
 
 
-def _save_norm_stats_cache(cache: Path, stats: tuple[float, float, float, float]) -> None:
+def _save_norm_stats_cache(
+    cache: Path, stats: tuple[float, float, float, float]
+) -> None:
     """Atomically persist norm stats: write a temp sibling then rename it over
     the destination, so a crash mid-write can never leave a truncated cache.
 
@@ -442,7 +490,13 @@ def _save_norm_stats_cache(cache: Path, stats: tuple[float, float, float, float]
     """
     cache.parent.mkdir(parents=True, exist_ok=True)
     tmp_cache = cache.with_name(f"{cache.stem}.tmp{cache.suffix}")  # ..._stats.tmp.npz
-    np.savez(tmp_cache, past_min=stats[0], past_max=stats[1], fut_min=stats[2], fut_max=stats[3])
+    np.savez(
+        tmp_cache,
+        past_min=stats[0],
+        past_max=stats[1],
+        fut_min=stats[2],
+        fut_max=stats[3],
+    )
     os.replace(tmp_cache, cache)
 
 
@@ -459,24 +513,31 @@ def _load_norm_stats_cache(cache: Path) -> dict[str, float] | None:
     except (EOFError, ValueError, OSError, zipfile.BadZipFile) as exc:
         logger.warning(
             "[norm-stats] corrupt cache %s (%s: %s); deleting and recomputing",
-            cache, type(exc).__name__, exc,
+            cache,
+            type(exc).__name__,
+            exc,
         )
         cache.unlink(missing_ok=True)
         return None
     try:
         return {
-            key: float(data[key]) for key in ("past_min", "past_max", "fut_min", "fut_max")
+            key: float(data[key])
+            for key in ("past_min", "past_max", "fut_min", "fut_max")
         }
     except (KeyError, TypeError, ValueError) as exc:
         logger.warning(
             "[norm-stats] malformed cache %s (%s: %s); deleting and recomputing",
-            cache, type(exc).__name__, exc,
+            cache,
+            type(exc).__name__,
+            exc,
         )
         cache.unlink(missing_ok=True)
         return None
 
 
-def _ensure_norm_stats(scene: str, args: argparse.Namespace) -> tuple[float, float, float, float]:
+def _ensure_norm_stats(
+    scene: str, args: argparse.Namespace
+) -> tuple[float, float, float, float]:
     """Return ``(past_min, past_max, fut_min, fut_max)`` for the LOSO split.
 
     Statistics are derived from the training windows exactly as in production
@@ -489,11 +550,18 @@ def _ensure_norm_stats(scene: str, args: argparse.Namespace) -> tuple[float, flo
     is detected, deleted, and transparently recomputed.
     """
     vid_suffix = getattr(args, "video_id", None) or ""
-    cache = RESULTS_DIR / f"_norm_stats_ho{scene}{'_'+vid_suffix if vid_suffix else ''}.npz"
+    cache = (
+        RESULTS_DIR / f"_norm_stats_ho{scene}{'_'+vid_suffix if vid_suffix else ''}.npz"
+    )
     if cache.exists():
         stats = _load_norm_stats_cache(cache)
         if stats is not None:
-            return stats["past_min"], stats["past_max"], stats["fut_min"], stats["fut_max"]
+            return (
+                stats["past_min"],
+                stats["past_max"],
+                stats["fut_min"],
+                stats["fut_max"],
+            )
 
     logger.info("[%s] computing norm stats from train split (one-time)...", scene)
     cfg_stats = Config(str(CFG_PATH), tag="viz-stats")
@@ -703,7 +771,11 @@ def load_anchor_frame(
     _console(
         f"[{scene}/{video_id}] background 'video-decode' @frame {a}: "
         f"{video} ({w}x{h}px)"
-        + (f" — cached at {cached}" if cached is not None else " — (cache write skipped)")
+        + (
+            f" — cached at {cached}"
+            if cached is not None
+            else " — (cache write skipped)"
+        )
     )
     return img, (0.0, float(w), float(h), 0.0), "video-decode"
 
@@ -721,7 +793,12 @@ def _checkpoint_path(scene: str, vid_status: str, video_id: str | None) -> Path:
     """
     variant = "vmfull" if vid_status == "vid" else "novid"
     out_suf = f"_vid{video_id}" if video_id else ""
-    return RESULTS_DIR / f"_SDD_ho{scene}_{variant}{out_suf}" / "models" / "checkpoint_best.pt"
+    return (
+        RESULTS_DIR
+        / f"_SDD_ho{scene}_{variant}{out_suf}"
+        / "models"
+        / "checkpoint_best.pt"
+    )
 
 
 def build_model_and_cfg(scene: str, vid_status: str, args: argparse.Namespace):
@@ -799,10 +876,7 @@ def get_batch_for_scene(scene: str, args: argparse.Namespace) -> dict:
 
 def _move_to_device(batch: dict, device: str) -> dict:
     """Transfer tensors only; lists/strings/None pass through untouched."""
-    return {
-        k: v.to(device) if hasattr(v, "to") else v
-        for k, v in batch.items()
-    }
+    return {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
 
 
 def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict[str, np.ndarray]:
@@ -821,19 +895,15 @@ def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict[str, np.nd
         sample_out = denoiser.sample(x_gpu, num_trajs=cfg.denoising_head_preds)
         pred = sample_out[0]
 
-        pred = rearrange(
-            pred, "b k a (f d) -> b k a f d", f=cfg.future_frames
-        )[..., :2]  # [B, K, A, F, 2]
+        pred = rearrange(pred, "b k a (f d) -> b k a f d", f=cfg.future_frames)[
+            ..., :2
+        ]  # [B, K, A, F, 2]
 
         if cfg.get("data_norm", "min_max") == "min_max":
-            pred = unnormalize_min_max(
-                pred, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1
-            )
+            pred = unnormalize_min_max(pred, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1)
 
         # detach + offload to host RAM immediately: [N=(b a), K, F, 2]
-        preds_np = rearrange(
-            pred.detach().cpu().numpy(), "b k a f d -> (b a) k f d"
-        )
+        preds_np = rearrange(pred.detach().cpu().numpy(), "b k a f d -> (b a) k f d")
 
         del x_gpu, sample_out, pred
 
@@ -846,7 +916,9 @@ def sample_prediction(denoiser, cfg: Config, batch_cpu: dict) -> dict[str, np.nd
     # GT/predictions, while cols 0:2 give the absolute pixel anchor.
     past_full = batch_cpu["past_traj_original_scale"].numpy()
     obs_np = rearrange(past_full[..., 2:4], "b a p d -> (b a) p d").astype(np.float64)
-    obs_abs = rearrange(past_full[..., 0:2], "b a p d -> (b a) p d")[0].astype(np.float64)
+    obs_abs = rearrange(past_full[..., 0:2], "b a p d -> (b a) p d")[0].astype(
+        np.float64
+    )
 
     best, _ = select_best_of_k(preds_np, gt_np)
     return {
@@ -894,7 +966,10 @@ def run_scene(scene: str, args: argparse.Namespace) -> Path | None:
             # would skip every lookup and silently yield a white background.
             resolved_root = expand_sdd_root(args.sdd_root)
             loaded = load_anchor_frame(
-                resolved_root, scene, video_id, anchor_frame,
+                resolved_root,
+                scene,
+                video_id,
+                anchor_frame,
                 override=getattr(args, "background", None),
             )
             if loaded is not None:
@@ -953,33 +1028,60 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     p.add_argument("--sdd-root", default=None)
     p.add_argument("--video_features_root", dest="video_features_root", default=None)
-    p.add_argument("--video-id", default=None,
-                   help="Restrict LOSO-selected windows to a single video "
-                        "folder name (e.g. 'video0'). Must match the window "
-                        "space of the per-window gain CSV when rendering "
-                        "ranked windows.")
+    p.add_argument(
+        "--video-id",
+        default=None,
+        help="Restrict LOSO-selected windows to a single video "
+        "folder name (e.g. 'video0'). Must match the window "
+        "space of the per-window gain CSV when rendering "
+        "ranked windows.",
+    )
     p.add_argument("--sampling_steps", type=int, default=10)
-    p.add_argument("--use-ema", action="store_true",
-                   help="prefer the EMA weights over the raw model weights")
-    p.add_argument("--background", default=None,
-                   help="explicit path to a background image (overrides the "
-                        "automatic anchor-frame lookup)")
-    p.add_argument("--no-background", action="store_true",
-                   help="skip frame lookup and plot on white")
-    p.add_argument("--num-workers", type=int, default=None,
-                   help="DataLoader workers, clamped to [0, %d] (default 0: the "
-                        "window index and feature mapping are not duplicated "
-                        "per worker)" % MAX_NUM_WORKERS)
-    p.add_argument("--zoom-margin", type=float, default=150.0,
-                   help="contextual margin in pixels added around the union "
-                        "bounding box of all plotted trajectories when a "
-                        "video frame background is shown (default: 150)")
-    p.add_argument("--window-index", type=int, default=0,
-                   help="0-based index of the test-split window to render "
-                        "(default: 0). Use with the per-window gain CSV to "
-                        "render specific high/low-gain windows.")
-    p.add_argument("--demo", action="store_true",
-                   help="render a synthetic styling demo (no checkpoints needed)")
+    p.add_argument(
+        "--use-ema",
+        action="store_true",
+        help="prefer the EMA weights over the raw model weights",
+    )
+    p.add_argument(
+        "--background",
+        default=None,
+        help="explicit path to a background image (overrides the "
+        "automatic anchor-frame lookup)",
+    )
+    p.add_argument(
+        "--no-background",
+        action="store_true",
+        help="skip frame lookup and plot on white",
+    )
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="DataLoader workers, clamped to [0, %d] (default 0: the "
+        "window index and feature mapping are not duplicated "
+        "per worker)" % MAX_NUM_WORKERS,
+    )
+    p.add_argument(
+        "--zoom-margin",
+        type=float,
+        default=150.0,
+        help="contextual margin in pixels added around the union "
+        "bounding box of all plotted trajectories when a "
+        "video frame background is shown (default: 150)",
+    )
+    p.add_argument(
+        "--window-index",
+        type=int,
+        default=0,
+        help="0-based index of the test-split window to render "
+        "(default: 0). Use with the per-window gain CSV to "
+        "render specific high/low-gain windows.",
+    )
+    p.add_argument(
+        "--demo",
+        action="store_true",
+        help="render a synthetic styling demo (no checkpoints needed)",
+    )
     return p.parse_args(argv)
 
 
@@ -1008,11 +1110,16 @@ def run_demo(out_dir: str | Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     save_path = out / "demo_trajectory_comparison.png"
     plot_trajectory_comparison(
-        obs, gt, bundle(0.35), bundle(0.35),
+        obs,
+        gt,
+        bundle(0.35),
+        bundle(0.35),
         baseline_best=bundle(0.35)[rng.integers(20)],
         ours_best=bundle(0.35)[rng.integers(20)],
         title="Demo — No Video vs Global VE",
-        save_path=save_path, background=background, units="px",
+        save_path=save_path,
+        background=background,
+        units="px",
     )
     return save_path
 

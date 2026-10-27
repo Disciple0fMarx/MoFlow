@@ -66,6 +66,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--n-batches", type=int, default=0)
     p.add_argument("--sampling-steps", type=int, default=None)
+    p.add_argument("--video-mode", choices=["off", "static", "full"], default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--use-ema", action="store_true")
     p.add_argument("--out", required=True)
@@ -101,7 +102,24 @@ def main():
         isinstance(k, str) and k.startswith("model.context_encoder.video_proj.")
         for k in state
     )
-    video_mode = "full" if has_video else "off"
+    ckpt_video_mode = None
+    try:
+        raw_ckpt = torch.load(Path(args.ckpt), map_location="cpu", weights_only=False)
+        if isinstance(raw_ckpt, dict):
+            ckpt_cfg = raw_ckpt.get("cfg")
+            if ckpt_cfg is not None:
+                ckpt_video_mode = getattr(ckpt_cfg, "VIDEO_MODE", None) or getattr(
+                    getattr(ckpt_cfg, "MODEL", None), "VIDEO_MODE", None
+                )
+    except Exception:
+        ckpt_video_mode = None
+    video_mode = args.video_mode or ckpt_video_mode or ("full" if has_video else "off")
+    if video_mode not in {"off", "static", "full"}:
+        video_mode = "full" if has_video else "off"
+    if video_mode != "off" and not has_video:
+        raise SystemExit(
+            f"Checkpoint has no video_proj weights but video_mode={video_mode}"
+        )
     if args.features_root:
         cfg.MODEL.CONTEXT_ENCODER.VIDEO_FEATURES_ROOT = args.features_root
 
@@ -120,7 +138,7 @@ def main():
     # Restore the checkpoint's video mode after the stats-only dataset.
     cfg.VIDEO_MODE = video_mode
     cfg.MODEL.CONTEXT_ENCODER.VIDEO_MODE = video_mode
-    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = has_video
+    cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = video_mode != "off"
     print(
         f"[eth-transfer] norm={args.norm_scene} eval={args.eval_scene} "
         f"past=[{past_min:.3f},{past_max:.3f}] fut=[{fut_min:.3f},{fut_max:.3f}]",
