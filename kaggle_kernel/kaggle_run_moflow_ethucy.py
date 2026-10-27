@@ -16,9 +16,10 @@ Video features are the only precomputed artifact and may be attached as:
 
 No ETH/UCY pickle files are read.
 
-Set ``BUILD_FEATURES=1`` to fetch raw videos and rebuild full-range global
-features (default when ``full`` is in ``VIDEO_MODES``). Set ``BUILD_FEATURES=0``
-to reuse an attached full-range feature cache.
+Set ``BUILD_FEATURES=1`` to rebuild full-range global features from the repo's
+``data/eth_ucy/*/visual_data`` frames (default when ``full`` is in
+``VIDEO_MODES``). Set ``BUILD_FEATURES=0`` to reuse an attached full-range
+feature cache.
 """
 
 import glob
@@ -105,16 +106,8 @@ RAW_SPARSE_PATTERNS = [
     "/datasets/UCY/zara02/annotation.vsp",
 ]
 
-RAW_VIDEO_PATTERNS = [
-    "/datasets/ETH/seq_eth/video.avi",
-    "/datasets/ETH/seq_hotel/video.avi",
-    "/datasets/UCY/students03/video.avi",
-    "/datasets/UCY/zara01/video.avi",
-    "/datasets/UCY/zara02/video.avi",
-]
 
-
-def ensure_raw_data_root(include_videos: bool = False):
+def ensure_raw_data_root():
     """Clone/fetch the strict TU-Clausthal layout and return its datasets dir."""
     raw_repo = KAGGLE_WORK / "tu-clausthal"
     data_root = raw_repo / "datasets"
@@ -238,7 +231,7 @@ def main():
         build_features = "full" in modes
     else:
         build_features = BUILD_FEATURES in {"1", "true", "yes", "on"}
-    data_dir = ensure_raw_data_root(include_videos=build_features)
+    data_dir = ensure_raw_data_root()
     features_root = find_features_root()
     if build_features:
         features_root = KAGGLE_WORK / "features" / "resnet18"
@@ -247,8 +240,8 @@ def main():
                 sys.executable,
                 "-m",
                 "video_encoder.scripts.build_ethucy_features",
-                "--data-root",
-                str(data_dir),
+                "--frames-root",
+                str(repo_dir / "data" / "eth_ucy"),
                 "--out",
                 str(features_root),
                 "--stride",
