@@ -332,11 +332,35 @@ def main():
     print(f"[data] video features: {features_root}", flush=True)
 
     results_dir = KAGGLE_WORK / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
     results = []
+    metrics_path = results_dir / "loso_5x5_metrics.csv"
+    if metrics_path.exists():
+        with open(metrics_path, newline="") as f:
+            import csv as _csv
+
+            for row in _csv.DictReader(f):
+                if row.get("status") == "ok":
+                    results.append(dict(row))
+        print(
+            f"[resume] loaded {len(results)} completed runs from {metrics_path}",
+            flush=True,
+        )
     eval_batch_size = os.environ.get("EVAL_BATCH_SIZE", "64")
+    done = {
+        (r["held_out_scene"], r["video_mode"])
+        for r in results
+        if r.get("status") == "ok"
+    }
 
     for subset in SUBSETS:
         for video_mode in VIDEO_MODES:
+            if (subset, video_mode) in done:
+                print(
+                    f"\n--- Skipping held_out={subset} video_mode={video_mode} (already complete) ---",
+                    flush=True,
+                )
+                continue
             print(
                 f"\n--- Training held_out={subset} video_mode={video_mode} ---",
                 flush=True,
