@@ -1,0 +1,3 @@
+held_out_scene,video_mode,split,ade_min,fde_min,ade_avg,fde_avg,n_agents,status,checkpoint
+zara2,static,test,0.160300,0.257800,0.874800,1.901600,5616,ok,/kaggle/working/checkpoints/zara2_static.pt
+zara2,full,test,0.183900,0.303900,0.776600,1.674200,5616,ok,/kaggle/working/checkpoints/zara2_full.pt
