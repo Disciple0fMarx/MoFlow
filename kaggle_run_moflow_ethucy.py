@@ -16,12 +16,18 @@ Video features are the only precomputed artifact and may be attached as:
 
 No ETH/UCY pickle files are read.
 
+By default this runs the full 5x5 leave-one-scene-out matrix: every scene in
+``SUBSETS`` (default: eth,hotel,univ,zara1,zara2) is held out and trained in
+each mode in ``VIDEO_MODES`` (default: off,static,full), then evaluated on that
+scene's test split with LOSO normalization statistics.
+
 Set ``BUILD_FEATURES=1`` to rebuild full-range global features from the repo's
 ``data/eth_ucy/*/visual_data`` frames (default when ``full`` is in
 ``VIDEO_MODES``). Set ``BUILD_FEATURES=0`` to reuse an attached full-range
 feature cache.
 """
 
+import csv
 import glob
 import os
 import shutil
@@ -34,8 +40,17 @@ KAGGLE_WORK = Path("/kaggle/working")
 
 BRANCH = "fix/eth-ucy-alignment"
 REPO_URL = "https://github.com/Disciple0fMarx/MoFlow.git"
-SUBSET = os.environ.get("SUBSET", "eth")
-VIDEO_MODES = os.environ.get("VIDEO_MODES", "off,static,full").split(",")
+DEFAULT_SUBSETS = "eth,hotel,univ,zara1,zara2"
+_subsets_env = os.environ.get("SUBSETS")
+if _subsets_env is None:
+    _subsets_env = os.environ.get("SUBSET", DEFAULT_SUBSETS)
+SUBSETS = [s.strip() for s in _subsets_env.split(",") if s.strip()]
+VIDEO_MODES = [
+    m.strip()
+    for m in os.environ.get("VIDEO_MODES", "off,static,full").split(",")
+    if m.strip()
+]
+RUN_EVAL = os.environ.get("RUN_EVAL", "1") == "1"
 EPOCHS = os.environ.get("EPOCHS", "80")
 BATCH_SIZE = os.environ.get("BATCH_SIZE", "64")
 RUN_M5 = os.environ.get("RUN_M5", "0") == "1"
@@ -154,47 +169,106 @@ def clone_repo(repo_dir: Path):
         run_cmd(["git", "pull", "origin", BRANCH], cwd=str(repo_dir))
 
 
-def copy_run_artifacts(repo_dir: Path, video_mode: str, data_dir: Path):
-    """Copy the checkpoint/metrics belonging to THIS run only."""
+def copy_run_artifacts(repo_dir: Path, subset: str, video_mode: str):
+    """Copy the checkpoint/metrics belonging to THIS scene/mode run only."""
     out_ckpt_dir = KAGGLE_WORK / "checkpoints"
     out_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    run_glob = repo_dir / "results_eth_ucy" / "cor_fm" / f"*_{subset}_vm{video_mode}*"
     ckpts = sorted(
-        glob.glob(
-            str(
-                repo_dir
-                / "results_eth_ucy"
-                / "cor_fm"
-                / f"*_{SUBSET}_vm{video_mode}*"
-                / "models"
-                / "checkpoint_*.pt"
-            )
-        ),
+        glob.glob(str(run_glob / "models" / "checkpoint_*.pt")),
         key=os.path.getmtime,
     )
     for ckpt in ckpts:
         name = Path(ckpt).name
         if name == "checkpoint_best.pt":
-            shutil.copy2(ckpt, out_ckpt_dir / f"{SUBSET}_{video_mode}.pt")
+            shutil.copy2(ckpt, out_ckpt_dir / f"{subset}_{video_mode}.pt")
         elif name == "checkpoint_last.pt":
-            shutil.copy2(ckpt, out_ckpt_dir / f"{SUBSET}_{video_mode}_last.pt")
+            shutil.copy2(ckpt, out_ckpt_dir / f"{subset}_{video_mode}_last.pt")
     for pattern in ("metrics*.csv", "*eval*.csv", "*.log"):
-        for f in glob.glob(
-            str(
-                repo_dir
-                / "results_eth_ucy"
-                / "cor_fm"
-                / f"*_{SUBSET}_vm{video_mode}*"
-                / "**"
-                / pattern
-            ),
-            recursive=True,
-        ):
+        for f in glob.glob(str(run_glob / "**" / pattern), recursive=True):
             try:
-                shutil.copy2(f, KAGGLE_WORK / f"{SUBSET}_{video_mode}_{Path(f).name}")
+                shutil.copy2(f, KAGGLE_WORK / f"{subset}_{video_mode}_{Path(f).name}")
             except OSError:
                 pass
-    found = sorted(p.name for p in out_ckpt_dir.glob(f"{SUBSET}_{video_mode}*.pt"))
-    print(f"[artifacts] {video_mode}: {found}", flush=True)
+    found = sorted(p.name for p in out_ckpt_dir.glob(f"{subset}_{video_mode}*.pt"))
+    print(f"[artifacts] {subset}/{video_mode}: {found}", flush=True)
+    best = out_ckpt_dir / f"{subset}_{video_mode}.pt"
+    if best.exists():
+        return best
+    last = out_ckpt_dir / f"{subset}_{video_mode}_last.pt"
+    return last if last.exists() else None
+
+
+def read_eval_metrics(path: Path):
+    """Read the single-row evaluator CSV into a flat dict."""
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise ValueError(f"empty metrics file: {path}")
+    row = rows[0]
+    return {
+        "ade_min": float(row["ade_min"]),
+        "fde_min": float(row["fde_min"]),
+        "ade_avg": float(row.get("ade_avg", "nan")),
+        "fde_avg": float(row.get("fde_avg", "nan")),
+        "n_agents": int(row["n_agents"]),
+    }
+
+
+def write_results(results, results_dir: Path):
+    """Persist per-run metrics and the per-mode aggregate summary."""
+    results_dir.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "held_out_scene",
+        "video_mode",
+        "split",
+        "ade_min",
+        "fde_min",
+        "ade_avg",
+        "fde_avg",
+        "n_agents",
+        "status",
+        "checkpoint",
+    ]
+    with open(results_dir / "loso_5x5_metrics.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(results)
+
+    summary = []
+    for mode in VIDEO_MODES:
+        rows = [r for r in results if r["video_mode"] == mode and r["status"] == "ok"]
+        if not rows:
+            continue
+        summary.append(
+            {
+                "video_mode": mode,
+                "n_scenes": len(rows),
+                "ade_min_mean": sum(float(r["ade_min"]) for r in rows) / len(rows),
+                "fde_min_mean": sum(float(r["fde_min"]) for r in rows) / len(rows),
+                "ade_avg_mean": sum(float(r["ade_avg"]) for r in rows) / len(rows),
+                "fde_avg_mean": sum(float(r["fde_avg"]) for r in rows) / len(rows),
+            }
+        )
+    with open(results_dir / "loso_5x5_summary.csv", "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "video_mode",
+                "n_scenes",
+                "ade_min_mean",
+                "fde_min_mean",
+                "ade_avg_mean",
+                "fde_avg_mean",
+            ],
+        )
+        writer.writeheader()
+        for row in summary:
+            writer.writerow(
+                {k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in row.items()}
+            )
+    print(f"[results] wrote {results_dir / 'loso_5x5_metrics.csv'}", flush=True)
+    print(f"[results] wrote {results_dir / 'loso_5x5_summary.csv'}", flush=True)
 
 
 def main():
@@ -257,31 +331,155 @@ def main():
     print(f"[data] raw root: {data_dir}", flush=True)
     print(f"[data] video features: {features_root}", flush=True)
 
-    for video_mode in VIDEO_MODES:
-        video_mode = video_mode.strip()
-        if not video_mode:
-            continue
-        print(f"\n--- Training subset={SUBSET} video_mode={video_mode} ---", flush=True)
-        cmd = [
-            sys.executable,
-            "fm_eth.py",
-            "--cfg",
-            "cfg/eth_ucy/cor_fm.yml",
-            "--subset",
-            SUBSET,
-            "--video_mode",
-            video_mode,
-            "--epochs",
-            EPOCHS,
-            "--batch_size",
-            BATCH_SIZE,
-            "--data_dir",
-            str(data_dir),
-        ]
-        if features_root is not None:
-            cmd.extend(["--video_features_root", str(features_root)])
-        run_cmd(cmd, check=False)
-        copy_run_artifacts(repo_dir, video_mode, data_dir)
+    results_dir = KAGGLE_WORK / "results"
+    results = []
+    eval_batch_size = os.environ.get("EVAL_BATCH_SIZE", "64")
+
+    for subset in SUBSETS:
+        for video_mode in VIDEO_MODES:
+            print(
+                f"\n--- Training held_out={subset} video_mode={video_mode} ---",
+                flush=True,
+            )
+            cmd = [
+                sys.executable,
+                "fm_eth.py",
+                "--cfg",
+                "cfg/eth_ucy/cor_fm.yml",
+                "--subset",
+                subset,
+                "--video_mode",
+                video_mode,
+                "--epochs",
+                EPOCHS,
+                "--batch_size",
+                BATCH_SIZE,
+                "--data_dir",
+                str(data_dir),
+            ]
+            if features_root is not None:
+                cmd.extend(["--video_features_root", str(features_root)])
+            train_result = run_cmd(cmd, check=False)
+            if train_result.returncode != 0:
+                print(
+                    f"[train] FAILED {subset}/{video_mode} "
+                    f"rc={train_result.returncode}",
+                    flush=True,
+                )
+                results.append(
+                    {
+                        "held_out_scene": subset,
+                        "video_mode": video_mode,
+                        "split": "test",
+                        "ade_min": "nan",
+                        "fde_min": "nan",
+                        "ade_avg": "nan",
+                        "fde_avg": "nan",
+                        "n_agents": 0,
+                        "status": f"train_failed_{train_result.returncode}",
+                        "checkpoint": "",
+                    }
+                )
+                write_results(results, results_dir)
+                continue
+
+            ckpt_path = copy_run_artifacts(repo_dir, subset, video_mode)
+            if ckpt_path is None:
+                print(f"[eval] no checkpoint for {subset}/{video_mode}", flush=True)
+                results.append(
+                    {
+                        "held_out_scene": subset,
+                        "video_mode": video_mode,
+                        "split": "test",
+                        "ade_min": "nan",
+                        "fde_min": "nan",
+                        "ade_avg": "nan",
+                        "fde_avg": "nan",
+                        "n_agents": 0,
+                        "status": "missing_checkpoint",
+                        "checkpoint": "",
+                    }
+                )
+                write_results(results, results_dir)
+                continue
+
+            if not RUN_EVAL:
+                continue
+
+            out_base = results_dir / f"{subset}_{video_mode}"
+            eval_cmd = [
+                sys.executable,
+                "tools/eval_eth_transfer.py",
+                "--cfg",
+                "cfg/eth_ucy/cor_fm.yml",
+                "--ckpt",
+                str(ckpt_path),
+                "--data-dir",
+                str(data_dir),
+                "--norm-scene",
+                subset,
+                "--eval-scene",
+                subset,
+                "--split",
+                "test",
+                "--video-mode",
+                video_mode,
+                "--batch-size",
+                eval_batch_size,
+                "--out",
+                str(out_base),
+            ]
+            if features_root is not None and video_mode != "off":
+                eval_cmd.extend(["--features-root", str(features_root)])
+            print(
+                f"\n--- Evaluating held_out={subset} video_mode={video_mode} ---",
+                flush=True,
+            )
+            eval_result = run_cmd(eval_cmd, check=False)
+            if eval_result.returncode != 0:
+                print(
+                    f"[eval] FAILED {subset}/{video_mode} "
+                    f"rc={eval_result.returncode}",
+                    flush=True,
+                )
+                results.append(
+                    {
+                        "held_out_scene": subset,
+                        "video_mode": video_mode,
+                        "split": "test",
+                        "ade_min": "nan",
+                        "fde_min": "nan",
+                        "ade_avg": "nan",
+                        "fde_avg": "nan",
+                        "n_agents": 0,
+                        "status": f"eval_failed_{eval_result.returncode}",
+                        "checkpoint": str(ckpt_path),
+                    }
+                )
+                write_results(results, results_dir)
+                continue
+
+            metrics = read_eval_metrics(Path(f"{out_base}.csv"))
+            results.append(
+                {
+                    "held_out_scene": subset,
+                    "video_mode": video_mode,
+                    "split": "test",
+                    "ade_min": f"{metrics['ade_min']:.6f}",
+                    "fde_min": f"{metrics['fde_min']:.6f}",
+                    "ade_avg": f"{metrics['ade_avg']:.6f}",
+                    "fde_avg": f"{metrics['fde_avg']:.6f}",
+                    "n_agents": metrics["n_agents"],
+                    "status": "ok",
+                    "checkpoint": str(ckpt_path),
+                }
+            )
+            write_results(results, results_dir)
+
+    print(
+        f"\n[5x5] completed {len(results)}/{len(SUBSETS) * len(VIDEO_MODES)} runs",
+        flush=True,
+    )
 
     if RUN_M5:
         env = os.environ.copy()
@@ -306,6 +504,7 @@ def main():
         "**/q2_transfer*.csv",
         "**/*transfer*matrix*.csv",
         "**/metrics*.csv",
+        "results/*.csv",
     ):
         for f in glob.glob(pattern, recursive=True):
             try:

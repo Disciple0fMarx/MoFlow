@@ -6,8 +6,10 @@ normalization statistics from the evaluation scene: inputs are normalized with
 ``--norm-scene``'s LOSO train-split statistics (the statistics the checkpoint
 was trained with), while the test windows come from ``--eval-scene``.
 
-Output: one CSV row per run with ``condition,ade_min,fde_min,n_agents`` in
-original (meter) scale.
+Output: one CSV row per run with
+``condition,ade_min,fde_min,ade_avg,fde_avg,n_agents`` in original (meter)
+scale. ``*_min`` selects the best of the K sampled trajectories; ``*_avg``
+averages over all K samples.
 
 Example::
 
@@ -184,6 +186,8 @@ def main():
 
     ade_sum = 0.0
     fde_sum = 0.0
+    ade_avg_sum = 0.0
+    fde_avg_sum = 0.0
     n_agents = 0
     for i, batch in enumerate(loader):
         if args.n_batches and i >= args.n_batches:
@@ -205,6 +209,8 @@ def main():
         dist = torch.linalg.norm(pred - gt[:, None], dim=-1)  # [BA, K, F]
         ade_sum += dist.mean(dim=-1).min(dim=-1).values.sum().item()
         fde_sum += dist[..., -1].min(dim=-1).values.sum().item()
+        ade_avg_sum += dist.mean(dim=-1).mean(dim=-1).sum().item()
+        fde_avg_sum += dist[..., -1].mean(dim=-1).sum().item()
         n_agents += dist.shape[0]
         if (i + 1) % 10 == 0:
             print(f"[eth-transfer] batch {i + 1}/{len(loader)}", flush=True)
@@ -214,15 +220,29 @@ def main():
 
     ade = ade_sum / n_agents
     fde = fde_sum / n_agents
+    ade_avg = ade_avg_sum / n_agents
+    fde_avg = fde_avg_sum / n_agents
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(f"{out}.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["condition", "ade_min", "fde_min", "n_agents"])
-        w.writerow(["baseline", f"{ade:.6f}", f"{fde:.6f}", n_agents])
+        w.writerow(
+            ["condition", "ade_min", "fde_min", "ade_avg", "fde_avg", "n_agents"]
+        )
+        w.writerow(
+            [
+                "baseline",
+                f"{ade:.6f}",
+                f"{fde:.6f}",
+                f"{ade_avg:.6f}",
+                f"{fde_avg:.6f}",
+                n_agents,
+            ]
+        )
     print(
         f"[eth-transfer] scene={args.eval_scene} norm={args.norm_scene} "
-        f"ADE_min={ade:.4f} FDE_min={fde:.4f} n={n_agents}",
+        f"ADE_min={ade:.4f} FDE_min={fde:.4f} "
+        f"ADE_avg={ade_avg:.4f} FDE_avg={fde_avg:.4f} n={n_agents}",
         flush=True,
     )
 
