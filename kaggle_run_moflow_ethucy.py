@@ -1,7 +1,4 @@
 #!/usr/bin/env python
-"""
-Kaggle Kernel Runner for MoFlow ETH/UCY M1-M6 pipeline.
-"""
 import csv
 import glob
 import os
@@ -9,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+import base64
 from pathlib import Path
 
 KAGGLE_INPUT = Path("/kaggle/input")
@@ -21,11 +19,7 @@ _subsets_env = os.environ.get("SUBSETS")
 if _subsets_env is None:
     _subsets_env = os.environ.get("SUBSET", DEFAULT_SUBSETS)
 SUBSETS = [s.strip() for s in _subsets_env.split(",") if s.strip()]
-VIDEO_MODES = [
-    m.strip()
-    for m in os.environ.get("VIDEO_MODES", "off,static,full").split(",")
-    if m.strip()
-]
+VIDEO_MODES = [m.strip() for m in os.environ.get("VIDEO_MODES", "off,static,full").split(",") if m.strip()]
 RUN_EVAL = os.environ.get("RUN_EVAL", "1") == "1"
 EPOCHS = os.environ.get("EPOCHS", "80")
 BATCH_SIZE = os.environ.get("BATCH_SIZE", "64")
@@ -44,93 +38,43 @@ def run_cmd(cmd, cwd=None, check=True):
 
 
 def _input_candidates():
-    candidates = [
-        KAGGLE_INPUT / "moflow-ethucy-processed",
-        KAGGLE_INPUT / "datasets" / "dhyaelbahri" / "moflow-ethucy-processed",
-        KAGGLE_INPUT / "datasets" / "moflow-ethucy-processed",
-        KAGGLE_INPUT / "ethucy" / "processed",
-        KAGGLE_INPUT / "ethucy-processed",
-    ]
+    candidates = [KAGGLE_INPUT / "moflow-ethucy-processed", KAGGLE_INPUT / "datasets" / "dhyaelbahri" / "moflow-ethucy-processed", KAGGLE_INPUT / "datasets" / "moflow-ethucy-processed", KAGGLE_INPUT / "ethucy" / "processed", KAGGLE_INPUT / "ethucy-processed"]
     if KAGGLE_INPUT.is_dir():
         for item in sorted(KAGGLE_INPUT.iterdir()):
-            if not item.is_dir():
-                continue
+            if not item.is_dir(): continue
             candidates.append(item)
             try:
                 children = sorted(p for p in item.iterdir() if p.is_dir())
-            except OSError:
-                children = []
+            except OSError: children = []
             candidates.extend(children)
             for child in children:
-                try:
-                    candidates.extend(sorted(p for p in child.iterdir() if p.is_dir()))
-                except OSError:
-                    pass
+                try: candidates.extend(sorted(p for p in child.iterdir() if p.is_dir()))
+                except OSError: pass
     return candidates
 
 
 def find_features_root():
     for cand in _input_candidates():
         feat = cand / "features" / "resnet18"
-        if feat.is_dir() and any(feat.glob("*.npy")):
-            return feat
+        if feat.is_dir() and any(feat.glob("*.npy")): return feat
     return None
 
 
-RAW_REPO_URL = (
-    "https://gitlab.tu-clausthal.de/pka20/Trajectory-Prediction-Pedestrian.git"
-)
-RAW_SPARSE_PATTERNS = [
-    "/datasets/ETH/seq_eth/obsmat.txt",
-    "/datasets/ETH/seq_eth/H.txt",
-    "/datasets/ETH/seq_hotel/obsmat.txt",
-    "/datasets/ETH/seq_hotel/H.txt",
-    "/datasets/UCY/students03/obsmat.txt",
-    "/datasets/UCY/students03/H.txt",
-    "/datasets/UCY/students03/annotation.vsp",
-    "/datasets/UCY/zara01/obsmat.txt",
-    "/datasets/UCY/zara01/H.txt",
-    "/datasets/UCY/zara01/annotation.vsp",
-    "/datasets/UCY/zara02/obsmat.txt",
-    "/datasets/UCY/zara02/H.txt",
-    "/datasets/UCY/zara02/annotation.vsp",
-]
+RAW_REPO_URL = "https://gitlab.tu-clausthal.de/pka20/Trajectory-Prediction-Pedestrian.git"
+RAW_SPARSE_PATTERNS = ["/datasets/ETH/seq_eth/obsmat.txt", "/datasets/ETH/seq_eth/H.txt", "/datasets/ETH/seq_hotel/obsmat.txt", "/datasets/ETH/seq_hotel/H.txt", "/datasets/UCY/students03/obsmat.txt", "/datasets/UCY/students03/H.txt", "/datasets/UCY/students03/annotation.vsp", "/datasets/UCY/zara01/obsmat.txt", "/datasets/UCY/zara01/H.txt", "/datasets/UCY/zara01/annotation.vsp", "/datasets/UCY/zara02/obsmat.txt", "/datasets/UCY/zara02/H.txt", "/datasets/UCY/zara02/annotation.vsp"]
 
 
 def ensure_raw_data_root():
     raw_repo = KAGGLE_WORK / "tu-clausthal"
     data_root = raw_repo / "datasets"
-    required = [
-        data_root / "ETH" / "seq_eth" / "obsmat.txt",
-        data_root / "ETH" / "seq_hotel" / "obsmat.txt",
-        data_root / "UCY" / "students03" / "annotation.vsp",
-        data_root / "UCY" / "zara01" / "annotation.vsp",
-        data_root / "UCY" / "zara02" / "annotation.vsp",
-    ]
+    required = [data_root / "ETH" / "seq_eth" / "obsmat.txt", data_root / "ETH" / "seq_hotel" / "obsmat.txt", data_root / "UCY" / "students03" / "annotation.vsp", data_root / "UCY" / "zara01" / "annotation.vsp", data_root / "UCY" / "zara02" / "annotation.vsp"]
     if not all(p.exists() for p in required):
         if not raw_repo.exists():
-            run_cmd(
-                [
-                    "git",
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--filter=blob:none",
-                    "--sparse",
-                    RAW_REPO_URL,
-                    str(raw_repo),
-                ]
-            )
-        run_cmd(
-            ["git", "sparse-checkout", "set", "--no-cone", *RAW_SPARSE_PATTERNS],
-            cwd=str(raw_repo),
-        )
+            run_cmd(["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", RAW_REPO_URL, str(raw_repo)])
+        run_cmd(["git", "sparse-checkout", "set", "--no-cone", *RAW_SPARSE_PATTERNS], cwd=str(raw_repo))
         run_cmd(["git", "checkout"], cwd=str(raw_repo))
     missing = [str(p) for p in required if not p.exists() or p.stat().st_size == 0]
-    if missing:
-        raise SystemExit(
-            "Strict raw TU-Clausthal data incomplete; missing: " + ", ".join(missing)
-        )
+    if missing: raise SystemExit("Strict raw TU-Clausthal data incomplete; missing: " + ", ".join(missing))
     return data_root
 
 
@@ -150,21 +94,16 @@ def copy_run_artifacts(repo_dir: Path, subset: str, video_mode: str):
     ckpts = sorted(glob.glob(str(run_glob / "models" / "checkpoint_*.pt")), key=os.path.getmtime)
     for ckpt in ckpts:
         name = Path(ckpt).name
-        if name == "checkpoint_best.pt":
-            shutil.copy2(ckpt, out_ckpt_dir / f"{subset}_{video_mode}.pt")
-        elif name == "checkpoint_last.pt":
-            shutil.copy2(ckpt, out_ckpt_dir / f"{subset}_{video_mode}_last.pt")
+        if name == "checkpoint_best.pt": shutil.copy2(ckpt, out_ckpt_dir / f"{subset}_{video_mode}.pt")
+        elif name == "checkpoint_last.pt": shutil.copy2(ckpt, out_ckpt_dir / f"{subset}_{video_mode}_last.pt")
     for pattern in ("metrics*.csv", "*eval*.csv", "*.log"):
         for f in glob.glob(str(run_glob / "**" / pattern), recursive=True):
-            try:
-                shutil.copy2(f, KAGGLE_WORK / f"{subset}_{video_mode}_{Path(f).name}")
-            except OSError:
-                pass
+            try: shutil.copy2(f, KAGGLE_WORK / f"{subset}_{video_mode}_{Path(f).name}")
+            except OSError: pass
     found = sorted(p.name for p in out_ckpt_dir.glob(f"{subset}_{video_mode}*.pt"))
     print(f"[artifacts] {subset}/{video_mode}: {found}", flush=True)
     best = out_ckpt_dir / f"{subset}_{video_mode}.pt"
-    if best.exists():
-        return best
+    if best.exists(): return best
     last = out_ckpt_dir / f"{subset}_{video_mode}_last.pt"
     return last if last.exists() else None
 
@@ -172,32 +111,14 @@ def copy_run_artifacts(repo_dir: Path, subset: str, video_mode: str):
 def read_eval_metrics(path: Path):
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
-    if not rows:
-        raise ValueError(f"empty metrics file: {path}")
+    if not rows: raise ValueError(f"empty metrics file: {path}")
     row = rows[0]
-    return {
-        "ade_min": float(row["ade_min"]),
-        "fde_min": float(row["fde_min"]),
-        "ade_avg": float(row.get("ade_avg", "nan")),
-        "fde_avg": float(row.get("fde_avg", "nan")),
-        "n_agents": int(row["n_agents"]),
-    }
+    return {"ade_min": float(row["ade_min"]), "fde_min": float(row["fde_min"]), "ade_avg": float(row.get("ade_avg", "nan")), "fde_avg": float(row.get("fde_avg", "nan")), "n_agents": int(row["n_agents"])}
 
 
 def write_results(results, results_dir: Path):
     results_dir.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "held_out_scene",
-        "video_mode",
-        "split",
-        "ade_min",
-        "fde_min",
-        "ade_avg",
-        "fde_avg",
-        "n_agents",
-        "status",
-        "checkpoint",
-    ]
+    fields = ["held_out_scene", "video_mode", "split", "ade_min", "fde_min", "ade_avg", "fde_avg", "n_agents", "status", "checkpoint"]
     with open(results_dir / "loso_5x5_metrics.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -205,52 +126,60 @@ def write_results(results, results_dir: Path):
     summary = []
     for mode in VIDEO_MODES:
         rows = [r for r in results if r["video_mode"] == mode and r["status"] == "ok"]
-        if not rows:
-            continue
-        summary.append(
-            {
-                "video_mode": mode,
-                "n_scenes": len(rows),
-                "ade_min_mean": sum(float(r["ade_min"]) for r in rows) / len(rows),
-                "fde_min_mean": sum(float(r["fde_min"]) for r in rows) / len(rows),
-                "ade_avg_mean": sum(float(r["ade_avg"]) for r in rows) / len(rows),
-                "fde_avg_mean": sum(float(r["fde_avg"]) for r in rows) / len(rows),
-            }
-        )
+        if not rows: continue
+        summary.append({"video_mode": mode, "n_scenes": len(rows), "ade_min_mean": sum(float(r["ade_min"]) for r in rows)/len(rows), "fde_min_mean": sum(float(r["fde_min"]) for r in rows)/len(rows), "ade_avg_mean": sum(float(r["ade_avg"]) for r in rows)/len(rows), "fde_avg_mean": sum(float(r["fde_avg"]) for r in rows)/len(rows)})
     with open(results_dir / "loso_5x5_summary.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["video_mode", "n_scenes", "ade_min_mean", "fde_min_mean", "ade_avg_mean", "fde_avg_mean"])
         writer.writeheader()
-        for row in summary:
-            writer.writerow({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in row.items()})
+        for row in summary: writer.writerow({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in row.items()})
     print(f"[results] wrote {results_dir / 'loso_5x5_metrics.csv'}", flush=True)
     print(f"[results] wrote {results_dir / 'loso_5x5_summary.csv'}", flush=True)
 
 
-def bundle_all_csvs():
-    out_zip = KAGGLE_WORK / "all_evaluation_csvs.zip"
-    with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(KAGGLE_WORK):
-            for fname in files:
-                if fname.endswith('.csv'):
-                    fp = Path(root)/fname
-                    try:
-                        arc = fp.relative_to(KAGGLE_WORK)
-                    except Exception:
-                        arc = Path(fname)
-                    z.write(fp, arc)
-        repo = KAGGLE_WORK / "MoFlow"
-        if repo.exists():
-            for root, _, files in os.walk(repo):
-                for fname in files:
-                    if fname.endswith('.csv'):
-                        fp = Path(root)/fname
-                        try:
-                            arc = Path('repo')/fp.relative_to(repo)
-                        except Exception:
-                            arc = Path('repo')/fname
-                        z.write(fp, arc)
-    print(f"[bundle] {out_zip} size={out_zip.stat().st_size}", flush=True)
-    return out_zip
+def bundle_and_push(repo_dir: Path):
+    # copy all csvs to repo results dir
+    res_dst = repo_dir / "results_eth_ucy" / "loso_5x5"
+    res_dst.mkdir(parents=True, exist_ok=True)
+    for root, _, files in os.walk(KAGGLE_WORK):
+        for fname in files:
+            if fname.endswith('.csv'):
+                src = Path(root)/fname
+                try:
+                    rel = src.relative_to(KAGGLE_WORK)
+                    dst = res_dst / rel.name if len(rel.parts)==1 else res_dst / rel.as_posix().replace('/', '_')
+                except Exception:
+                    dst = res_dst / fname
+                try:
+                    shutil.copy2(src, dst)
+                except Exception:
+                    pass
+    # also copy from repo
+    for root, _, files in os.walk(repo_dir / "results_eth_ucy"):
+        for fname in files:
+            if fname.endswith('.csv') and root != str(res_dst):
+                try: shutil.copy2(Path(root)/fname, res_dst / fname)
+                except: pass
+    # git push
+    try:
+        run_cmd(["git", "add", "-f", "results_eth_ucy/loso_5x5/*.csv"], cwd=str(repo_dir), check=False)
+        run_cmd(["git", "config", "user.email", "kaggle@runner.local"], cwd=str(repo_dir), check=False)
+        run_cmd(["git", "config", "user.name", "KaggleRunner"], cwd=str(repo_dir), check=False)
+        run_cmd(["git", "commit", "-m", "results(eth_ucy): push LOSO CSVs from Kaggle"], cwd=str(repo_dir), check=False)
+        run_cmd(["git", "push", "origin", BRANCH], cwd=str(repo_dir), check=False)
+    except Exception as e:
+        print(e, flush=True)
+    # base64 fallback
+    print("===CSV_B64_START===", flush=True)
+    for root, _, files in os.walk(res_dst):
+        for fname in sorted(files):
+            if fname.endswith('.csv'):
+                fp = Path(root)/fname
+                try:
+                    data = fp.read_bytes()
+                    print(f"FILE:{fp.name}::{base64.b64encode(data).decode()}", flush=True)
+                except Exception as e:
+                    print(f"FILE:{fname}::ERR:{e}", flush=True)
+    print("===CSV_B64_END===", flush=True)
 
 
 def main():
@@ -267,10 +196,8 @@ def main():
 
     modes = {m.strip() for m in VIDEO_MODES if m.strip()}
     needs_features = any(m != "off" for m in modes)
-    if BUILD_FEATURES == "":
-        build_features = "full" in modes
-    else:
-        build_features = BUILD_FEATURES in {"1", "true", "yes", "on"}
+    if BUILD_FEATURES == "": build_features = "full" in modes
+    else: build_features = BUILD_FEATURES in {"1", "true", "yes", "on"}
     data_dir = ensure_raw_data_root()
     features_root = find_features_root()
     if build_features:
@@ -279,9 +206,6 @@ def main():
     elif needs_features and features_root is None:
         raise SystemExit("Video modes requested but no features/resnet18/*.npy found under /kaggle/input")
 
-    print(f"[data] raw root: {data_dir}", flush=True)
-    print(f"[data] video features: {features_root}", flush=True)
-
     results_dir = KAGGLE_WORK / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -289,8 +213,7 @@ def main():
     if metrics_path.exists():
         with open(metrics_path, newline="") as f:
             for row in csv.DictReader(f):
-                if row.get("status") == "ok":
-                    results.append(dict(row))
+                if row.get("status") == "ok": results.append(dict(row))
         print(f"[resume] loaded {len(results)} completed runs from {metrics_path}", flush=True)
     eval_batch_size = os.environ.get("EVAL_BATCH_SIZE", "64")
     done = {(r["held_out_scene"], r["video_mode"]) for r in results if r.get("status") == "ok"}
@@ -302,43 +225,35 @@ def main():
                 continue
             print(f"\n--- Training held_out={subset} video_mode={video_mode} ---", flush=True)
             cmd = [sys.executable, "fm_eth.py", "--cfg", "cfg/eth_ucy/cor_fm.yml", "--subset", subset, "--video_mode", video_mode, "--epochs", EPOCHS, "--batch_size", BATCH_SIZE, "--data_dir", str(data_dir)]
-            if features_root is not None:
-                cmd.extend(["--video_features_root", str(features_root)])
+            if features_root is not None: cmd.extend(["--video_features_root", str(features_root)])
             train_result = run_cmd(cmd, check=False)
             if train_result.returncode != 0:
                 results.append({"held_out_scene": subset, "video_mode": video_mode, "split": "test", "ade_min": "nan", "fde_min": "nan", "ade_avg": "nan", "fde_avg": "nan", "n_agents": 0, "status": f"train_failed_{train_result.returncode}", "checkpoint": ""})
-                write_results(results, results_dir)
-                continue
+                write_results(results, results_dir); continue
             ckpt_path = copy_run_artifacts(repo_dir, subset, video_mode)
             if ckpt_path is None:
                 results.append({"held_out_scene": subset, "video_mode": video_mode, "split": "test", "ade_min": "nan", "fde_min": "nan", "ade_avg": "nan", "fde_avg": "nan", "n_agents": 0, "status": "missing_checkpoint", "checkpoint": ""})
-                write_results(results, results_dir)
-                continue
-            if not RUN_EVAL:
-                continue
+                write_results(results, results_dir); continue
+            if not RUN_EVAL: continue
             out_base = results_dir / f"{subset}_{video_mode}"
             eval_cmd = [sys.executable, "tools/eval_eth_transfer.py", "--cfg", "cfg/eth_ucy/cor_fm.yml", "--ckpt", str(ckpt_path), "--data-dir", str(data_dir), "--norm-scene", subset, "--eval-scene", subset, "--split", "test", "--video-mode", video_mode, "--batch-size", eval_batch_size, "--out", str(out_base)]
-            if features_root is not None and video_mode != "off":
-                eval_cmd.extend(["--features-root", str(features_root)])
+            if features_root is not None and video_mode != "off": eval_cmd.extend(["--features-root", str(features_root)])
             print(f"\n--- Evaluating held_out={subset} video_mode={video_mode} ---", flush=True)
             eval_result = run_cmd(eval_cmd, check=False)
             if eval_result.returncode != 0:
                 results.append({"held_out_scene": subset, "video_mode": video_mode, "split": "test", "ade_min": "nan", "fde_min": "nan", "ade_avg": "nan", "fde_avg": "nan", "n_agents": 0, "status": f"eval_failed_{eval_result.returncode}", "checkpoint": str(ckpt_path)})
-                write_results(results, results_dir)
-                continue
+                write_results(results, results_dir); continue
             metrics = read_eval_metrics(Path(f"{out_base}.csv"))
             results.append({"held_out_scene": subset, "video_mode": video_mode, "split": "test", "ade_min": f"{metrics['ade_min']:.6f}", "fde_min": f"{metrics['fde_min']:.6f}", "ade_avg": f"{metrics['ade_avg']:.6f}", "fde_avg": f"{metrics['fde_avg']:.6f}", "n_agents": metrics["n_agents"], "status": "ok", "checkpoint": str(ckpt_path)})
             write_results(results, results_dir)
 
     print(f"\n[5x5] completed {len(results)}/{len(SUBSETS) * len(VIDEO_MODES)} runs", flush=True)
-    bundle_all_csvs()
+    bundle_and_push(repo_dir)
 
     for pattern in ("**/q2_transfer*.csv", "**/*transfer*matrix*.csv", "**/metrics*.csv", "results/*.csv"):
         for f in glob.glob(pattern, recursive=True):
-            try:
-                shutil.copy2(f, KAGGLE_WORK / Path(f).name)
-            except OSError:
-                pass
+            try: shutil.copy2(f, KAGGLE_WORK / Path(f).name)
+            except OSError: pass
 
     print("DONE", flush=True)
 
