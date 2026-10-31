@@ -1,0 +1,4 @@
+video_mode,n_scenes,ade_min_mean,fde_min_mean,ade_avg_mean,fde_avg_mean
+off,5,0.359251,0.607933,1.264740,2.594361
+static,5,0.305198,0.487601,1.153811,2.370741
+full,5,0.329974,0.552353,1.179092,2.425726
