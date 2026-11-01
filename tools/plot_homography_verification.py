@@ -2,7 +2,7 @@
 """
 Visual verification of homography alignment for ETH/UCY scenes.
 Loads each scene via ETHDataset (strict TU-Clausthal raw) and plots trajectories
-in world and pixel spaces to check for axis inversions/scaling issues.
+in world and pixel spaces with background images when available.
 """
 import os
 import sys
@@ -44,6 +44,49 @@ def load_homography(data_dir, subset):
     return None
 
 
+def find_background_image(data_dir, subset):
+    """Find background/scene image if available."""
+    search_paths = [
+        os.path.join(data_dir, subset, 'visual_data'),
+        os.path.join(data_dir, subset, 'frames'),
+        os.path.join(data_dir, subset, 'images'),
+        os.path.join(REPO_ROOT, 'data', 'eth_ucy', subset, 'visual_data'),
+        os.path.join(REPO_ROOT, 'data', 'eth_ucy', subset, 'frames'),
+    ]
+    # Try common names
+    for sp in search_paths:
+        if os.path.exists(sp):
+            # look for jpg/png
+            for fn in sorted(os.listdir(sp)):
+                if fn.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    return os.path.join(sp, fn)
+    # Also check videos dir
+    for cand in [
+        os.path.join(data_dir, subset, 'reference.jpg'),
+        os.path.join(data_dir, subset, 'background.jpg'),
+        os.path.join(REPO_ROOT, 'data', 'eth_ucy', 'videos', f'{subset}.jpg'),
+    ]:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def load_image(path):
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        return np.array(img)
+    except Exception as e:
+        try:
+            import cv2
+            img = cv2.imread(path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return img
+        except Exception as e2:
+            print(f"[WARN] Failed to load image {path}: {e2}")
+            return None
+
+
 def world_to_pixel(H, points):
     if H is None or points is None:
         return None
@@ -60,59 +103,53 @@ def world_to_pixel(H, points):
 
 
 def extract_xy_agents(traj_raw, frames=8):
-    """Extract (A, T, 2) world coordinates for all agents.
-    Handles variable A and feature dims [A, T, 6] etc.
-    """
     if traj_raw is None:
         return None
     traj = np.asarray(traj_raw)
     if traj.size == 0:
         return traj
-    # Try to handle object arrays from variable-length agents
     if traj.dtype == object:
         all_agents = []
-        for i in range(traj.shape[0]):
-            for j in range(traj.shape[1]) if traj.ndim > 1 else range(1):
-                try:
-                    t = np.asarray(traj[i] if traj.ndim == 1 else traj[i, j])
-                    if t.ndim == 2 and t.shape[-1] >= 2:
-                        xy = t[..., :2]
-                        if xy.shape[0] == frames or xy.shape[-2] == frames:
-                            if xy.shape[-2] == frames and xy.shape[0] != frames:
-                                all_agents.append(xy)
-                            elif xy.shape[0] == frames:
-                                all_agents.append(xy.reshape(1, frames, 2))
-                    elif t.ndim == 1 and t.size >= frames * 2:
-                        all_agents.append(t.reshape(-1, frames, t.size // frames)[:, :, :2])
-                except Exception:
-                    continue
+        try:
+            for i in range(traj.shape[0]):
+                if traj.ndim == 1:
+                    t = np.asarray(traj[i])
+                else:
+                    t = np.asarray(traj[i, 0]) if traj.shape[1] > 0 else np.asarray(traj[i])
+                if t.ndim == 2 and t.shape[-1] >= 2:
+                    xy = t[..., :2]
+                    if xy.shape[0] == frames:
+                        all_agents.append(xy.reshape(1, frames, 2))
+                    elif xy.shape[-2] == frames:
+                        all_agents.append(xy)
+                elif t.ndim == 1 and t.size >= frames * 2:
+                    # try to find pattern
+                    if t.size % 6 == 0:
+                        tt = t.reshape(frames, 6)
+                        all_agents.append(tt[..., :2].reshape(1, frames, 2))
+                    elif t.size % 2 == 0:
+                        tt = t.reshape(frames, t.size // frames)
+                        if tt.shape[-1] >= 2:
+                            all_agents.append(tt[..., :2].reshape(1, frames, 2))
+        except Exception:
+            pass
         if all_agents:
             try:
                 return np.concatenate(all_agents, axis=0)
             except Exception:
-                return all_agents
+                return None
         return None
     if traj.ndim == 4:
-        # (B, A, T, F)
         B, A, T, F = traj.shape
         if F >= 2:
             return traj.reshape(B * A, T, F)[..., :2]
     elif traj.ndim == 3:
-        # (A, T, F) or (B, something)
-        if traj.shape[-1] >= 2:
-            # Could be (A, T*F) flattened
-            if traj.shape[-1] % 2 == 0 and traj.shape[-1] > 4 and traj.shape[1] * 2 == traj.shape[-1] and traj.shape[-1] % frames == 0:
-                # (A, T*F) -> check if F>=2
-                n_t = traj.shape[-1] // 2
-                if n_t == frames:
-                    return traj.reshape(traj.shape[0], frames, 2)
-            if traj.shape[1] == frames:
-                return traj[..., :2]
-            # try to reshape if flattened
-            if traj.shape[-1] % 6 == 0 and traj.shape[-1] // 6 == frames:
-                return traj.reshape(traj.shape[0], frames, 6)[..., :2]
-            if traj.shape[-1] % 2 == 0 and traj.shape[-1] // 2 == frames:
-                return traj.reshape(traj.shape[0], frames, 2)
+        if traj.shape[1] == frames and traj.shape[-1] >= 2:
+            return traj[..., :2]
+        if traj.shape[-1] % 6 == 0 and traj.shape[-1] // 6 == frames:
+            return traj.reshape(traj.shape[0], frames, 6)[..., :2]
+        if traj.shape[-1] % 2 == 0 and traj.shape[-1] // 2 == frames:
+            return traj.reshape(traj.shape[0], frames, 2)
     elif traj.ndim == 2:
         if traj.shape[-1] % 6 == 0:
             n_t = traj.shape[-1] // 6
@@ -123,7 +160,7 @@ def extract_xy_agents(traj_raw, frames=8):
     return None
 
 
-def plot_scene(subset, data_dir, out_dir, max_windows=5):
+def plot_scene(subset, data_dir, out_dir, max_windows=3):
     print(f"\n{'='*60}")
     print(f"Plotting homography verification for {subset}")
     print(f"{'='*60}")
@@ -140,11 +177,16 @@ def plot_scene(subset, data_dir, out_dir, max_windows=5):
         loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=seq_collate_eth)
     except Exception as e:
         print(f"[{subset}] Failed to load dataset: {e}")
-        import traceback
-        traceback.print_exc()
         return False
     
     H = load_homography(data_dir, subset)
+    bg_path = find_background_image(data_dir, subset)
+    if bg_path:
+        print(f"[{subset}] Found background: {bg_path}")
+    else:
+        print(f"[{subset}] WARNING: No background image found - using blank canvas")
+    
+    bg_img = load_image(bg_path) if bg_path else None
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle(f'ETH/UCY Homography Alignment Verification - {subset.upper()}', fontsize=16, fontweight='bold')
@@ -167,53 +209,48 @@ def plot_scene(subset, data_dir, out_dir, max_windows=5):
             fut = extract_xy_agents(fut_raw, frames=cfg.future_frames)
             
             if past is None or fut is None:
-                print(f"[{subset}] batch {batch_idx}: could not extract coords, shapes: past={getattr(past_raw,'shape',type(past_raw))}, fut={getattr(fut_raw,'shape',type(fut_raw))}")
                 continue
             
-            # past might be (B*A, P, 2) or (A, P, 2)
-            if past.ndim == 3 and past.shape[0] > 1000:  # shouldn't happen
-                past = past[:100]
-            if fut.ndim == 3 and fut.shape[0] > 1000:
-                fut = fut[:100]
-            
-            A_p = past.shape[0]
-            A_f = fut.shape[0]
-            A = min(A_p, A_f)
+            A = min(past.shape[0], fut.shape[0])
             total_agents += A
-            print(f"[{subset}] batch {batch_idx}: plotting {A} agents")
             
-            # Plot all agents
             for a in range(A):
                 ax_world.plot(past[a, :, 0], past[a, :, 1], '-', color='blue', alpha=0.5, linewidth=1)
-                ax_world.scatter(past[a, -1, 0], past[a, -1, 1], color='blue', s=10, alpha=0.6)
+                ax_world.scatter(past[a, -1, 0], past[a, -1, 1], color='blue', s=8, alpha=0.6)
                 ax_world.plot(fut[a, :, 0], fut[a, :, 1], '-', color='red', alpha=0.5, linewidth=1)
-                ax_world.scatter(fut[a, 0, 0], fut[a, 0, 1], color='orange', s=10, alpha=0.6, marker='s')
             
             if H is not None:
                 past_pix = world_to_pixel(H, past[:A])
                 fut_pix = world_to_pixel(H, fut[:A])
                 if past_pix is not None and fut_pix is not None:
                     for a in range(A):
-                        ax_pixel.plot(past_pix[a, :, 0], past_pix[a, :, 1], '-', color='blue', alpha=0.5, linewidth=1)
-                        ax_pixel.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], '-', color='red', alpha=0.5, linewidth=1)
-                    for a in range(min(A, 20)):
-                        ax_overlay.plot(past_pix[a, :, 0], past_pix[a, :, 1], '-', color='cyan', alpha=0.6, linewidth=1.2)
-                        ax_overlay.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], '-', color='orange', alpha=0.6, linewidth=1.2)
-                    # detail
-                    a = 0
+                        ax_pixel.plot(past_pix[a, :, 0], past_pix[a, :, 1], '-', color='cyan', alpha=0.5, linewidth=1)
+                        ax_pixel.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], '-', color='yellow', alpha=0.5, linewidth=1)
+                    for a in range(A):
+                        ax_overlay.plot(past_pix[a, :, 0], past_pix[a, :, 1], '-', color='lime', alpha=0.6, linewidth=1.2)
+                        ax_overlay.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], '-', color='magenta', alpha=0.6, linewidth=1.2)
                     if A > 0:
-                        ax_detail.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='blue', label='History', markersize=4)
-                        ax_detail.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='red', label='Future', markersize=4)
+                        ax_detail.plot(past_pix[0, :, 0], past_pix[0, :, 1], 'o-', color='cyan', label='History', markersize=4)
+                        ax_detail.plot(fut_pix[0, :, 0], fut_pix[0, :, 1], 's-', color='yellow', label='Future', markersize=4)
                         ax_detail.legend()
             
             count += 1
         except Exception as e:
-            print(f"[{subset}] Error processing batch {batch_idx}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[{subset}] Error: {e}")
             continue
     
-    print(f"[{subset}] Total agents plotted: {total_agents}")
+    # Add background to pixel plots
+    if bg_img is not None:
+        for ax in [ax_pixel, ax_overlay, ax_detail]:
+            ax.imshow(bg_img, alpha=0.6, extent=None)
+            ax.set_xlim(0, bg_img.shape[1])
+            ax.set_ylim(bg_img.shape[0], 0)
+    else:
+        for ax in [ax_pixel, ax_overlay, ax_detail]:
+            ax.set_facecolor('#f0f0f0')
+            ax.text(0.5, 0.5, 'No background image available', 
+                    transform=ax.transAxes, ha='center', va='center',
+                    fontsize=10, color='gray', alpha=0.7)
     
     ax_world.set_title('World Coordinates (meters) - All Agents')
     ax_world.set_xlabel('X (m)')
@@ -221,29 +258,26 @@ def plot_scene(subset, data_dir, out_dir, max_windows=5):
     ax_world.grid(True, alpha=0.3)
     ax_world.axis('equal')
     
-    ax_pixel.set_title('Pixel Coordinates (via Homography)')
+    ax_pixel.set_title('Pixel Coordinates (via Homography) + Background')
     ax_pixel.set_xlabel('U (pixels)')
     ax_pixel.set_ylabel('V (pixels)')
     ax_pixel.grid(True, alpha=0.3)
-    ax_pixel.invert_yaxis()
     
-    ax_overlay.set_title('Overlay View (Pixel Space)')
+    ax_overlay.set_title('Trajectory Overlay on Scene')
     ax_overlay.set_xlabel('U (pixels)')
     ax_overlay.set_ylabel('V (pixels)')
     ax_overlay.grid(True, alpha=0.3)
-    ax_overlay.invert_yaxis()
     
     ax_detail.set_title('Detail View - Sample Agent')
     ax_detail.set_xlabel('U (pixels)')
     ax_detail.set_ylabel('V (pixels)')
     ax_detail.grid(True, alpha=0.3)
-    ax_detail.invert_yaxis()
     
     plt.tight_layout()
     out_path = out_dir / f'{subset}_homography_verification.png'
     plt.savefig(out_path, dpi=200, bbox_inches='tight')
     plt.close()
-    print(f"[{subset}] Saved: {out_path}")
+    print(f"[{subset}] Saved: {out_path} (agents: {total_agents})")
     return total_agents > 0
 
 
@@ -259,7 +293,7 @@ def main():
     scenes = ['eth', 'hotel', 'univ', 'zara1', 'zara2']
     results = {}
     
-    print("Starting homography verification...")
+    print("Starting homography verification with background...")
     print(f"Data dir: {data_dir}")
     print(f"Output dir: {out_dir}")
     
