@@ -2,7 +2,7 @@
 # Full LOSO training + evaluation matrix for ETH/UCY
 set -e
 
-REPO_DIR=/home/dhya/Repos/Studies/MoFlow
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd $REPO_DIR
 source .venv/bin/activate
 
