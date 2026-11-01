@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Visual verification of homography alignment for ETH/UCY scenes.
-Loads each scene via ETHDataset (strict TU-Clausthal raw) and plots trajectories
-in world and pixel spaces with background images when available.
+Rigorous two-part homography diagnostic (smoke-test style).
+1) Global point cloud density map over reference frame
+2) Dense multi-agent snapshot in pixel and world coords
 """
 import os
 import sys
@@ -37,53 +37,38 @@ def load_homography(data_dir, subset):
         if os.path.exists(hp):
             try:
                 H = np.loadtxt(hp)
-                print(f"[{subset}] Loaded H from {hp}, shape={H.shape}")
                 return H
-            except Exception as e:
-                print(f"[{subset}] Failed to load {hp}: {e}")
+            except Exception:
+                pass
     return None
 
 
-def find_background_image(data_dir, subset):
-    """Find background/scene image if available."""
-    search_paths = [
+def find_reference_frame(data_dir, subset):
+    candidates = [
         os.path.join(data_dir, subset, 'visual_data'),
-        os.path.join(data_dir, subset, 'frames'),
-        os.path.join(data_dir, subset, 'images'),
         os.path.join(REPO_ROOT, 'data', 'eth_ucy', subset, 'visual_data'),
-        os.path.join(REPO_ROOT, 'data', 'eth_ucy', subset, 'frames'),
     ]
-    # Try common names
-    for sp in search_paths:
-        if os.path.exists(sp):
-            # look for jpg/png
-            for fn in sorted(os.listdir(sp)):
+    for c in candidates:
+        if os.path.exists(c):
+            for fn in sorted(os.listdir(c)):
                 if fn.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    return os.path.join(sp, fn)
-    # Also check videos dir
-    for cand in [
-        os.path.join(data_dir, subset, 'reference.jpg'),
-        os.path.join(data_dir, subset, 'background.jpg'),
-        os.path.join(REPO_ROOT, 'data', 'eth_ucy', 'videos', f'{subset}.jpg'),
-    ]:
-        if os.path.exists(cand):
-            return cand
+                    return os.path.join(c, fn)
     return None
 
 
 def load_image(path):
+    if not path or not os.path.exists(path):
+        return None
     try:
         from PIL import Image
-        img = Image.open(path)
-        return np.array(img)
-    except Exception as e:
+        return np.array(Image.open(path))
+    except Exception:
         try:
             import cv2
             img = cv2.imread(path)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             return img
-        except Exception as e2:
-            print(f"[WARN] Failed to load image {path}: {e2}")
+        except Exception:
             return None
 
 
@@ -102,35 +87,28 @@ def world_to_pixel(H, points):
     return pix.reshape(orig_shape)
 
 
-def extract_xy_agents(traj_raw, frames=8):
+def extract_xy_agents(traj_raw, frames):
     if traj_raw is None:
         return None
     traj = np.asarray(traj_raw)
     if traj.size == 0:
-        return traj
+        return None
     if traj.dtype == object:
         all_agents = []
         try:
             for i in range(traj.shape[0]):
-                if traj.ndim == 1:
-                    t = np.asarray(traj[i])
-                else:
-                    t = np.asarray(traj[i, 0]) if traj.shape[1] > 0 else np.asarray(traj[i])
-                if t.ndim == 2 and t.shape[-1] >= 2:
-                    xy = t[..., :2]
-                    if xy.shape[0] == frames:
-                        all_agents.append(xy.reshape(1, frames, 2))
-                    elif xy.shape[-2] == frames:
-                        all_agents.append(xy)
-                elif t.ndim == 1 and t.size >= frames * 2:
-                    # try to find pattern
-                    if t.size % 6 == 0:
-                        tt = t.reshape(frames, 6)
-                        all_agents.append(tt[..., :2].reshape(1, frames, 2))
-                    elif t.size % 2 == 0:
-                        tt = t.reshape(frames, t.size // frames)
-                        if tt.shape[-1] >= 2:
+                for j in range(traj.shape[1] if traj.ndim > 1 else 1):
+                    t = np.asarray(traj[i, j]) if traj.ndim > 1 else np.asarray(traj[i])
+                    if t.ndim == 2 and t.shape[-1] >= 2 and t.shape[0] == frames:
+                        all_agents.append(t[..., :2].reshape(1, frames, 2))
+                    elif t.ndim == 1 and t.size >= frames * 2:
+                        if t.size % 6 == 0:
+                            tt = t.reshape(frames, 6)
                             all_agents.append(tt[..., :2].reshape(1, frames, 2))
+                        elif t.size % 2 == 0:
+                            tt = t.reshape(frames, t.size // frames)
+                            if tt.shape[-1] >= 2:
+                                all_agents.append(tt[..., :2].reshape(1, frames, 2))
         except Exception:
             pass
         if all_agents:
@@ -160,15 +138,15 @@ def extract_xy_agents(traj_raw, frames=8):
     return None
 
 
-def plot_scene(subset, data_dir, out_dir, max_windows=3):
+def generate_diagnostics(subset, data_dir, out_dir):
     print(f"\n{'='*60}")
-    print(f"Plotting homography verification for {subset}")
+    print(f"Generating homography diagnostics for {subset}")
     print(f"{'='*60}")
     
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    cfg = Config('cfg/eth_ucy/cor_fm.yml', f'viz_h_{subset}')
+    cfg = Config('cfg/eth_ucy/cor_fm.yml', f'hdiag_{subset}')
     cfg.device = 'cpu'
     
     try:
@@ -180,105 +158,128 @@ def plot_scene(subset, data_dir, out_dir, max_windows=3):
         return False
     
     H = load_homography(data_dir, subset)
-    bg_path = find_background_image(data_dir, subset)
+    bg_path = find_reference_frame(data_dir, subset)
+    bg_img = load_image(bg_path)
     if bg_path:
-        print(f"[{subset}] Found background: {bg_path}")
+        print(f"[{subset}] Reference frame: {bg_path}")
     else:
-        print(f"[{subset}] WARNING: No background image found - using blank canvas")
+        print(f"[{subset}] WARNING: No reference frame found")
     
-    bg_img = load_image(bg_path) if bg_path else None
+    # Collect all points for density map
+    all_past_pix = []
+    all_fut_pix = []
+    best_batch = None
+    best_count = -1
     
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle(f'ETH/UCY Homography Alignment Verification - {subset.upper()}', fontsize=16, fontweight='bold')
-    
-    ax_world = axes[0, 0]
-    ax_pixel = axes[0, 1]
-    ax_overlay = axes[1, 0]
-    ax_detail = axes[1, 1]
-    
-    count = 0
-    total_agents = 0
     for batch_idx, batch in enumerate(loader):
-        if count >= max_windows:
-            break
         try:
             past_raw = batch.get('past_traj_original_scale')
             fut_raw = batch.get('fut_traj_original_scale')
-            
             past = extract_xy_agents(past_raw, frames=cfg.past_frames)
             fut = extract_xy_agents(fut_raw, frames=cfg.future_frames)
-            
             if past is None or fut is None:
                 continue
-            
             A = min(past.shape[0], fut.shape[0])
-            total_agents += A
-            
-            for a in range(A):
-                ax_world.plot(past[a, :, 0], past[a, :, 1], '-', color='blue', alpha=0.5, linewidth=1)
-                ax_world.scatter(past[a, -1, 0], past[a, -1, 1], color='blue', s=8, alpha=0.6)
-                ax_world.plot(fut[a, :, 0], fut[a, :, 1], '-', color='red', alpha=0.5, linewidth=1)
-            
+            if A > best_count:
+                best_count = A
+                best_batch = (past[:A].copy(), fut[:A].copy())
             if H is not None:
-                past_pix = world_to_pixel(H, past[:A])
-                fut_pix = world_to_pixel(H, fut[:A])
-                if past_pix is not None and fut_pix is not None:
-                    for a in range(A):
-                        ax_pixel.plot(past_pix[a, :, 0], past_pix[a, :, 1], '-', color='cyan', alpha=0.5, linewidth=1)
-                        ax_pixel.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], '-', color='yellow', alpha=0.5, linewidth=1)
-                    for a in range(A):
-                        ax_overlay.plot(past_pix[a, :, 0], past_pix[a, :, 1], '-', color='lime', alpha=0.6, linewidth=1.2)
-                        ax_overlay.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], '-', color='magenta', alpha=0.6, linewidth=1.2)
-                    if A > 0:
-                        ax_detail.plot(past_pix[0, :, 0], past_pix[0, :, 1], 'o-', color='cyan', label='History', markersize=4)
-                        ax_detail.plot(fut_pix[0, :, 0], fut_pix[0, :, 1], 's-', color='yellow', label='Future', markersize=4)
-                        ax_detail.legend()
-            
-            count += 1
-        except Exception as e:
-            print(f"[{subset}] Error: {e}")
+                pp = world_to_pixel(H, past[:A])
+                fp = world_to_pixel(H, fut[:A])
+                if pp is not None:
+                    all_past_pix.append(pp.reshape(-1, 2))
+                if fp is not None:
+                    all_fut_pix.append(fp.reshape(-1, 2))
+        except Exception:
             continue
     
-    # Add background to pixel plots
+    # Figure 1: Global point cloud density map
+    fig1, ax1 = plt.subplots(1, 1, figsize=(12, 9))
+    fig1.suptitle(f'{subset.upper()} - Global Homography Point Cloud Density Map', fontsize=14, fontweight='bold')
     if bg_img is not None:
-        for ax in [ax_pixel, ax_overlay, ax_detail]:
-            ax.imshow(bg_img, alpha=0.6, extent=None)
-            ax.set_xlim(0, bg_img.shape[1])
-            ax.set_ylim(bg_img.shape[0], 0)
+        ax1.imshow(bg_img, alpha=0.7)
+        ax1.set_xlim(0, bg_img.shape[1])
+        ax1.set_ylim(bg_img.shape[0], 0)
     else:
-        for ax in [ax_pixel, ax_overlay, ax_detail]:
-            ax.set_facecolor('#f0f0f0')
-            ax.text(0.5, 0.5, 'No background image available', 
-                    transform=ax.transAxes, ha='center', va='center',
-                    fontsize=10, color='gray', alpha=0.7)
+        ax1.set_facecolor('#f5f5f5')
     
-    ax_world.set_title('World Coordinates (meters) - All Agents')
-    ax_world.set_xlabel('X (m)')
-    ax_world.set_ylabel('Y (m)')
-    ax_world.grid(True, alpha=0.3)
-    ax_world.axis('equal')
+    all_pp = []
+    all_fp = []
+    if all_past_pix:
+        all_pp = np.concatenate(all_past_pix, axis=0)
+    if all_fut_pix:
+        all_fp = np.concatenate(all_fut_pix, axis=0)
     
-    ax_pixel.set_title('Pixel Coordinates (via Homography) + Background')
-    ax_pixel.set_xlabel('U (pixels)')
-    ax_pixel.set_ylabel('V (pixels)')
-    ax_pixel.grid(True, alpha=0.3)
+    if len(all_pp) > 0:
+        ax1.scatter(all_pp[:, 0], all_pp[:, 1], s=1, c='cyan', alpha=0.3, label='Past (all)')
+    if len(all_fp) > 0:
+        ax1.scatter(all_fp[:, 0], all_fp[:, 1], s=1, c='magenta', alpha=0.3, label='Future (all)')
+    ax1.legend(markerscale=10)
+    ax1.set_xlabel('u (pixels)')
+    ax1.set_ylabel('v (pixels)')
+    ax1.grid(True, alpha=0.2)
+    plt.tight_layout()
+    out1 = out_dir / f'{subset}_1_global_pointcloud_density.png'
+    plt.savefig(out1, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[{subset}] Saved Figure 1: {out1}")
     
-    ax_overlay.set_title('Trajectory Overlay on Scene')
-    ax_overlay.set_xlabel('U (pixels)')
-    ax_overlay.set_ylabel('V (pixels)')
-    ax_overlay.grid(True, alpha=0.3)
+    # Figure 2: Dense multi-agent snapshot
+    fig2, (ax2p, ax2w) = plt.subplots(1, 2, figsize=(18, 8))
+    fig2.suptitle(f'{subset.upper()} - Dense Multi-Agent Snapshot (Max Density: {best_count} agents)', 
+                  fontsize=14, fontweight='bold')
     
-    ax_detail.set_title('Detail View - Sample Agent')
-    ax_detail.set_xlabel('U (pixels)')
-    ax_detail.set_ylabel('V (pixels)')
-    ax_detail.grid(True, alpha=0.3)
+    if best_batch is None:
+        print(f"[{subset}] WARNING: No dense snapshot found")
+        plt.close(fig2)
+        return False
+    
+    past_b, fut_b = best_batch
+    A = past_b.shape[0]
+    
+    # Pixel space with background
+    if bg_img is not None:
+        ax2p.imshow(bg_img, alpha=0.8)
+        ax2p.set_xlim(0, bg_img.shape[1])
+        ax2p.set_ylim(bg_img.shape[0], 0)
+    else:
+        ax2p.set_facecolor('#f5f5f5')
+    
+    if H is not None:
+        pp_b = world_to_pixel(H, past_b)
+        fp_b = world_to_pixel(H, fut_b)
+        if pp_b is not None and fp_b is not None:
+            for a in range(A):
+                ax2p.plot(pp_b[a, :, 0], pp_b[a, :, 1], '--', color='cyan', alpha=0.8, linewidth=1.5)
+                ax2p.scatter(pp_b[a, -1, 0], pp_b[a, -1, 1], c='cyan', s=20)
+                ax2p.plot(fp_b[a, :, 0], fp_b[a, :, 1], '-', color='yellow', alpha=0.9, linewidth=2)
+                ax2p.scatter(fp_b[a, 0, 0], fp_b[a, 0, 1], c='orange', s=25, marker='s')
+    
+    ax2p.set_title('Pixel Space (with background)')
+    ax2p.set_xlabel('u (pixels)')
+    ax2p.set_ylabel('v (pixels)')
+    ax2p.grid(True, alpha=0.3)
+    
+    # World coordinates
+    for a in range(A):
+        ax2w.plot(past_b[a, :, 0], past_b[a, :, 1], '--', color='blue', alpha=0.7, linewidth=1.5)
+        ax2w.scatter(past_b[a, -1, 0], past_b[a, -1, 1], c='blue', s=20)
+        ax2w.plot(fut_b[a, :, 0], fut_b[a, :, 1], '-', color='red', alpha=0.9, linewidth=2)
+        ax2w.scatter(fut_b[a, 0, 0], fut_b[a, 0, 1], c='darkred', s=25, marker='s')
+    
+    ax2w.set_title('World Coordinates (meters)')
+    ax2w.set_xlabel('X (m)')
+    ax2w.set_ylabel('Y (m)')
+    ax2w.grid(True, alpha=0.4)
+    ax2w.axis('equal')
     
     plt.tight_layout()
-    out_path = out_dir / f'{subset}_homography_verification.png'
-    plt.savefig(out_path, dpi=200, bbox_inches='tight')
+    out2 = out_dir / f'{subset}_2_dense_multagent_snapshot.png'
+    plt.savefig(out2, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"[{subset}] Saved: {out_path} (agents: {total_agents})")
-    return total_agents > 0
+    print(f"[{subset}] Saved Figure 2: {out2}")
+    
+    return True
 
 
 def main():
@@ -293,12 +294,12 @@ def main():
     scenes = ['eth', 'hotel', 'univ', 'zara1', 'zara2']
     results = {}
     
-    print("Starting homography verification with background...")
+    print("Starting rigorous homography diagnostics...")
     print(f"Data dir: {data_dir}")
     print(f"Output dir: {out_dir}")
     
     for scene in scenes:
-        results[scene] = plot_scene(scene, data_dir, out_dir)
+        results[scene] = generate_diagnostics(scene, data_dir, out_dir)
     
     print(f"\n{'='*60}")
     print("SUMMARY")
