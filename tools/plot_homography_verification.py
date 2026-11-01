@@ -59,6 +59,37 @@ def world_to_pixel(H, points):
     return pix.reshape(orig_shape)
 
 
+def extract_xy(traj):
+    """Extract (x,y) from trajectory tensor/array.
+    Handles shapes: [A, P, 6] (past with features) or [A, F, 2] (future/original).
+    """
+    traj = np.asarray(traj)
+    if traj.ndim == 3 and traj.shape[-1] >= 4:
+        # past_traj_original_scale often has [abs_x, abs_y, rel_x, rel_y, vel_x, vel_y] or similar
+        # try absolute positions first
+        xy = traj[..., :2].copy()
+        return xy
+    elif traj.ndim == 3 and traj.shape[-1] == 2:
+        return traj.copy()
+    elif traj.ndim == 2:
+        # might be flattened
+        if traj.shape[-1] % 2 == 0 and traj.shape[-1] > 2:
+            # try to infer - often first 2 of each timestep
+            # but safer to take first 2 if multiple timesteps encoded differently
+            # check common case: 8*6=48
+            if traj.shape[-1] % 6 == 0:
+                n_t = traj.shape[-1] // 6
+                traj = traj.reshape(traj.shape[0], n_t, 6)
+                return traj[..., :2].copy()
+            elif traj.shape[-1] % 2 == 0:
+                n_t = traj.shape[-1] // 2
+                # ambiguous, but try as [x1,y1,x2,y2,...]
+                traj = traj.reshape(traj.shape[0], n_t, 2)
+                return traj.copy()
+        return traj.copy()
+    return traj
+
+
 def plot_scene(subset, data_dir, out_dir, max_windows=10):
     print(f"\n{'='*60}")
     print(f"Plotting homography verification for {subset}")
@@ -95,41 +126,53 @@ def plot_scene(subset, data_dir, out_dir, max_windows=10):
         if count >= max_windows:
             break
         try:
-            past = batch['past_traj_original_scale'][0].cpu().numpy()
-            fut = batch['fut_traj_original_scale'][0].cpu().numpy()
-            A = past.shape[0]
-            P = cfg.past_frames
-            F = cfg.future_frames
-            past = past.reshape(A, P, 2)
-            fut = fut.reshape(A, F, 2)
+            past_raw = batch['past_traj_original_scale']
+            fut_raw = batch['fut_traj_original_scale']
+            if hasattr(past_raw, 'cpu'):
+                past_raw = past_raw.cpu().numpy()
+            if hasattr(fut_raw, 'cpu'):
+                fut_raw = fut_raw.cpu().numpy()
             
+            past = extract_xy(past_raw)
+            fut = extract_xy(fut_raw)
+            # Ensure correct shape
+            if past.ndim == 2 and past.shape[-1] == 2:
+                past = past.reshape(past.shape[0], -1, 2)
+            if fut.ndim == 2 and fut.shape[-1] == 2:
+                fut = fut.reshape(fut.shape[0], -1, 2)
+            
+            A = past.shape[0]
             for a in range(min(A, 5)):
                 ax_world.plot(past[a, :, 0], past[a, :, 1], 'o-', color='blue', alpha=0.6, markersize=3)
                 ax_world.plot(fut[a, :, 0], fut[a, :, 1], 's-', color='red', alpha=0.6, markersize=3)
-                ax_world.plot([past[a, -1, 0], fut[a, 0, 0]], [past[a, -1, 1], fut[a, 0, 1]], 
-                             'k--', alpha=0.3, linewidth=0.5)
+                if past[a].shape[0] > 0 and fut[a].shape[0] > 0:
+                    ax_world.plot([past[a, -1, 0], fut[a, 0, 0]], [past[a, -1, 1], fut[a, 0, 1]], 
+                                 'k--', alpha=0.3, linewidth=0.5)
             
             if H is not None:
                 past_pix = world_to_pixel(H, past)
                 fut_pix = world_to_pixel(H, fut)
-                for a in range(min(A, 5)):
-                    ax_pixel.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='blue', alpha=0.6, markersize=3)
-                    ax_pixel.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='red', alpha=0.6, markersize=3)
-                    ax_pixel.plot([past_pix[a, -1, 0], fut_pix[a, 0, 0]], 
-                                 [past_pix[a, -1, 1], fut_pix[a, 0, 1]], 
-                                 'k--', alpha=0.3, linewidth=0.5)
-                for a in range(min(A, 5)):
-                    ax_overlay.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='cyan', alpha=0.7, markersize=4)
-                    ax_overlay.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='orange', alpha=0.7, markersize=4)
-                    ax_overlay.plot([past_pix[a, -1, 0], fut_pix[a, 0, 0]], 
-                                    [past_pix[a, -1, 1], fut_pix[a, 0, 1]], 
-                                    'k-', alpha=0.5, linewidth=1)
-                a = 0
-                ax_detail.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='blue', label='History', markersize=6)
-                ax_detail.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='red', label='Future', markersize=6)
-                ax_detail.annotate('Obs end', xy=(past_pix[a, -1, 0], past_pix[a, -1, 1]), 
-                                   xytext=(5, 5), textcoords='offset points')
-                ax_detail.legend()
+                if past_pix is not None:
+                    for a in range(min(A, 5)):
+                        ax_pixel.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='blue', alpha=0.6, markersize=3)
+                        ax_pixel.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='red', alpha=0.6, markersize=3)
+                        if past_pix[a].shape[0] > 0 and fut_pix[a].shape[0] > 0:
+                            ax_pixel.plot([past_pix[a, -1, 0], fut_pix[a, 0, 0]], 
+                                         [past_pix[a, -1, 1], fut_pix[a, 0, 1]], 
+                                         'k--', alpha=0.3, linewidth=0.5)
+                    for a in range(min(A, 5)):
+                        ax_overlay.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='cyan', alpha=0.7, markersize=4)
+                        ax_overlay.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='orange', alpha=0.7, markersize=4)
+                        if past_pix[a].shape[0] > 0 and fut_pix[a].shape[0] > 0:
+                            ax_overlay.plot([past_pix[a, -1, 0], fut_pix[a, 0, 0]], 
+                                            [past_pix[a, -1, 1], fut_pix[a, 0, 1]], 
+                                            'k-', alpha=0.5, linewidth=1)
+                    a = 0
+                    ax_detail.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='blue', label='History', markersize=6)
+                    ax_detail.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='red', label='Future', markersize=6)
+                    ax_detail.annotate('Obs end', xy=(past_pix[a, -1, 0], past_pix[a, -1, 1]), 
+                                       xytext=(5, 5), textcoords='offset points')
+                    ax_detail.legend()
             
             count += 1
         except Exception as e:
