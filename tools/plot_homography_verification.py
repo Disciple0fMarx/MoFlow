@@ -59,38 +59,71 @@ def world_to_pixel(H, points):
     return pix.reshape(orig_shape)
 
 
-def extract_xy(traj):
-    """Extract (x,y) from trajectory tensor/array.
-    Handles shapes: [A, P, 6] (past with features) or [A, F, 2] (future/original).
+def extract_xy_agents(traj_raw, frames=8):
+    """Extract (A, T, 2) world coordinates for all agents.
+    Handles variable A and feature dims [A, T, 6] etc.
     """
-    traj = np.asarray(traj)
-    if traj.ndim == 3 and traj.shape[-1] >= 4:
-        # past_traj_original_scale often has [abs_x, abs_y, rel_x, rel_y, vel_x, vel_y] or similar
-        # try absolute positions first
-        xy = traj[..., :2].copy()
-        return xy
-    elif traj.ndim == 3 and traj.shape[-1] == 2:
-        return traj.copy()
-    elif traj.ndim == 2:
-        # might be flattened
-        if traj.shape[-1] % 2 == 0 and traj.shape[-1] > 2:
-            # try to infer - often first 2 of each timestep
-            # but safer to take first 2 if multiple timesteps encoded differently
-            # check common case: 8*6=48
-            if traj.shape[-1] % 6 == 0:
-                n_t = traj.shape[-1] // 6
-                traj = traj.reshape(traj.shape[0], n_t, 6)
-                return traj[..., :2].copy()
-            elif traj.shape[-1] % 2 == 0:
+    if traj_raw is None:
+        return None
+    traj = np.asarray(traj_raw)
+    if traj.size == 0:
+        return traj
+    # Try to handle object arrays from variable-length agents
+    if traj.dtype == object:
+        all_agents = []
+        for i in range(traj.shape[0]):
+            for j in range(traj.shape[1]) if traj.ndim > 1 else range(1):
+                try:
+                    t = np.asarray(traj[i] if traj.ndim == 1 else traj[i, j])
+                    if t.ndim == 2 and t.shape[-1] >= 2:
+                        xy = t[..., :2]
+                        if xy.shape[0] == frames or xy.shape[-2] == frames:
+                            if xy.shape[-2] == frames and xy.shape[0] != frames:
+                                all_agents.append(xy)
+                            elif xy.shape[0] == frames:
+                                all_agents.append(xy.reshape(1, frames, 2))
+                    elif t.ndim == 1 and t.size >= frames * 2:
+                        all_agents.append(t.reshape(-1, frames, t.size // frames)[:, :, :2])
+                except Exception:
+                    continue
+        if all_agents:
+            try:
+                return np.concatenate(all_agents, axis=0)
+            except Exception:
+                return all_agents
+        return None
+    if traj.ndim == 4:
+        # (B, A, T, F)
+        B, A, T, F = traj.shape
+        if F >= 2:
+            return traj.reshape(B * A, T, F)[..., :2]
+    elif traj.ndim == 3:
+        # (A, T, F) or (B, something)
+        if traj.shape[-1] >= 2:
+            # Could be (A, T*F) flattened
+            if traj.shape[-1] % 2 == 0 and traj.shape[-1] > 4 and traj.shape[1] * 2 == traj.shape[-1] and traj.shape[-1] % frames == 0:
+                # (A, T*F) -> check if F>=2
                 n_t = traj.shape[-1] // 2
-                # ambiguous, but try as [x1,y1,x2,y2,...]
-                traj = traj.reshape(traj.shape[0], n_t, 2)
-                return traj.copy()
-        return traj.copy()
-    return traj
+                if n_t == frames:
+                    return traj.reshape(traj.shape[0], frames, 2)
+            if traj.shape[1] == frames:
+                return traj[..., :2]
+            # try to reshape if flattened
+            if traj.shape[-1] % 6 == 0 and traj.shape[-1] // 6 == frames:
+                return traj.reshape(traj.shape[0], frames, 6)[..., :2]
+            if traj.shape[-1] % 2 == 0 and traj.shape[-1] // 2 == frames:
+                return traj.reshape(traj.shape[0], frames, 2)
+    elif traj.ndim == 2:
+        if traj.shape[-1] % 6 == 0:
+            n_t = traj.shape[-1] // 6
+            return traj.reshape(traj.shape[0], n_t, 6)[..., :2]
+        if traj.shape[-1] % 2 == 0:
+            n_t = traj.shape[-1] // 2
+            return traj.reshape(traj.shape[0], n_t, 2)
+    return None
 
 
-def plot_scene(subset, data_dir, out_dir, max_windows=10):
+def plot_scene(subset, data_dir, out_dir, max_windows=5):
     print(f"\n{'='*60}")
     print(f"Plotting homography verification for {subset}")
     print(f"{'='*60}")
@@ -122,64 +155,67 @@ def plot_scene(subset, data_dir, out_dir, max_windows=10):
     ax_detail = axes[1, 1]
     
     count = 0
+    total_agents = 0
     for batch_idx, batch in enumerate(loader):
         if count >= max_windows:
             break
         try:
-            past_raw = batch['past_traj_original_scale']
-            fut_raw = batch['fut_traj_original_scale']
-            if hasattr(past_raw, 'cpu'):
-                past_raw = past_raw.cpu().numpy()
-            if hasattr(fut_raw, 'cpu'):
-                fut_raw = fut_raw.cpu().numpy()
+            past_raw = batch.get('past_traj_original_scale')
+            fut_raw = batch.get('fut_traj_original_scale')
             
-            past = extract_xy(past_raw)
-            fut = extract_xy(fut_raw)
-            # Ensure correct shape
-            if past.ndim == 2 and past.shape[-1] == 2:
-                past = past.reshape(past.shape[0], -1, 2)
-            if fut.ndim == 2 and fut.shape[-1] == 2:
-                fut = fut.reshape(fut.shape[0], -1, 2)
+            past = extract_xy_agents(past_raw, frames=cfg.past_frames)
+            fut = extract_xy_agents(fut_raw, frames=cfg.future_frames)
             
-            A = past.shape[0]
-            for a in range(min(A, 5)):
-                ax_world.plot(past[a, :, 0], past[a, :, 1], 'o-', color='blue', alpha=0.6, markersize=3)
-                ax_world.plot(fut[a, :, 0], fut[a, :, 1], 's-', color='red', alpha=0.6, markersize=3)
-                if past[a].shape[0] > 0 and fut[a].shape[0] > 0:
-                    ax_world.plot([past[a, -1, 0], fut[a, 0, 0]], [past[a, -1, 1], fut[a, 0, 1]], 
-                                 'k--', alpha=0.3, linewidth=0.5)
+            if past is None or fut is None:
+                print(f"[{subset}] batch {batch_idx}: could not extract coords, shapes: past={getattr(past_raw,'shape',type(past_raw))}, fut={getattr(fut_raw,'shape',type(fut_raw))}")
+                continue
+            
+            # past might be (B*A, P, 2) or (A, P, 2)
+            if past.ndim == 3 and past.shape[0] > 1000:  # shouldn't happen
+                past = past[:100]
+            if fut.ndim == 3 and fut.shape[0] > 1000:
+                fut = fut[:100]
+            
+            A_p = past.shape[0]
+            A_f = fut.shape[0]
+            A = min(A_p, A_f)
+            total_agents += A
+            print(f"[{subset}] batch {batch_idx}: plotting {A} agents")
+            
+            # Plot all agents
+            for a in range(A):
+                ax_world.plot(past[a, :, 0], past[a, :, 1], '-', color='blue', alpha=0.5, linewidth=1)
+                ax_world.scatter(past[a, -1, 0], past[a, -1, 1], color='blue', s=10, alpha=0.6)
+                ax_world.plot(fut[a, :, 0], fut[a, :, 1], '-', color='red', alpha=0.5, linewidth=1)
+                ax_world.scatter(fut[a, 0, 0], fut[a, 0, 1], color='orange', s=10, alpha=0.6, marker='s')
             
             if H is not None:
-                past_pix = world_to_pixel(H, past)
-                fut_pix = world_to_pixel(H, fut)
-                if past_pix is not None:
-                    for a in range(min(A, 5)):
-                        ax_pixel.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='blue', alpha=0.6, markersize=3)
-                        ax_pixel.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='red', alpha=0.6, markersize=3)
-                        if past_pix[a].shape[0] > 0 and fut_pix[a].shape[0] > 0:
-                            ax_pixel.plot([past_pix[a, -1, 0], fut_pix[a, 0, 0]], 
-                                         [past_pix[a, -1, 1], fut_pix[a, 0, 1]], 
-                                         'k--', alpha=0.3, linewidth=0.5)
-                    for a in range(min(A, 5)):
-                        ax_overlay.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='cyan', alpha=0.7, markersize=4)
-                        ax_overlay.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='orange', alpha=0.7, markersize=4)
-                        if past_pix[a].shape[0] > 0 and fut_pix[a].shape[0] > 0:
-                            ax_overlay.plot([past_pix[a, -1, 0], fut_pix[a, 0, 0]], 
-                                            [past_pix[a, -1, 1], fut_pix[a, 0, 1]], 
-                                            'k-', alpha=0.5, linewidth=1)
+                past_pix = world_to_pixel(H, past[:A])
+                fut_pix = world_to_pixel(H, fut[:A])
+                if past_pix is not None and fut_pix is not None:
+                    for a in range(A):
+                        ax_pixel.plot(past_pix[a, :, 0], past_pix[a, :, 1], '-', color='blue', alpha=0.5, linewidth=1)
+                        ax_pixel.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], '-', color='red', alpha=0.5, linewidth=1)
+                    for a in range(min(A, 20)):
+                        ax_overlay.plot(past_pix[a, :, 0], past_pix[a, :, 1], '-', color='cyan', alpha=0.6, linewidth=1.2)
+                        ax_overlay.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], '-', color='orange', alpha=0.6, linewidth=1.2)
+                    # detail
                     a = 0
-                    ax_detail.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='blue', label='History', markersize=6)
-                    ax_detail.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='red', label='Future', markersize=6)
-                    ax_detail.annotate('Obs end', xy=(past_pix[a, -1, 0], past_pix[a, -1, 1]), 
-                                       xytext=(5, 5), textcoords='offset points')
-                    ax_detail.legend()
+                    if A > 0:
+                        ax_detail.plot(past_pix[a, :, 0], past_pix[a, :, 1], 'o-', color='blue', label='History', markersize=4)
+                        ax_detail.plot(fut_pix[a, :, 0], fut_pix[a, :, 1], 's-', color='red', label='Future', markersize=4)
+                        ax_detail.legend()
             
             count += 1
         except Exception as e:
             print(f"[{subset}] Error processing batch {batch_idx}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
-    ax_world.set_title('World Coordinates (meters)')
+    print(f"[{subset}] Total agents plotted: {total_agents}")
+    
+    ax_world.set_title('World Coordinates (meters) - All Agents')
     ax_world.set_xlabel('X (m)')
     ax_world.set_ylabel('Y (m)')
     ax_world.grid(True, alpha=0.3)
@@ -196,9 +232,8 @@ def plot_scene(subset, data_dir, out_dir, max_windows=10):
     ax_overlay.set_ylabel('V (pixels)')
     ax_overlay.grid(True, alpha=0.3)
     ax_overlay.invert_yaxis()
-    ax_overlay.legend(['History', 'Future'], loc='upper right')
     
-    ax_detail.set_title('Detail View - Agent Trajectory')
+    ax_detail.set_title('Detail View - Sample Agent')
     ax_detail.set_xlabel('U (pixels)')
     ax_detail.set_ylabel('V (pixels)')
     ax_detail.grid(True, alpha=0.3)
@@ -209,7 +244,7 @@ def plot_scene(subset, data_dir, out_dir, max_windows=10):
     plt.savefig(out_path, dpi=200, bbox_inches='tight')
     plt.close()
     print(f"[{subset}] Saved: {out_path}")
-    return True
+    return total_agents > 0
 
 
 def main():
