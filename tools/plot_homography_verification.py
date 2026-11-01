@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Rigorous two-part homography diagnostic (smoke-test style).
-1) Global point cloud density map over reference frame
-2) Dense multi-agent snapshot in pixel and world coords
+Rigorous homography diagnostics replicating smoke-test logic.
 """
 import os
 import sys
@@ -37,7 +35,7 @@ def load_homography(data_dir, subset):
         if os.path.exists(hp):
             try:
                 H = np.loadtxt(hp)
-                return H
+                return H.astype(float)
             except Exception:
                 pass
     return None
@@ -50,9 +48,24 @@ def find_reference_frame(data_dir, subset):
     ]
     for c in candidates:
         if os.path.exists(c):
-            for fn in sorted(os.listdir(c)):
-                if fn.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    return os.path.join(c, fn)
+            files = sorted([f for f in os.listdir(c) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+            if files:
+                return os.path.join(c, files[len(files)//2])
+    return None
+
+
+def find_frame_by_index(data_dir, subset, idx):
+    candidates = [
+        os.path.join(data_dir, subset, 'visual_data'),
+        os.path.join(REPO_ROOT, 'data', 'eth_ucy', subset, 'visual_data'),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            files = sorted([f for f in os.listdir(c) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+            if files and idx < len(files):
+                return os.path.join(c, files[idx])
+            elif files:
+                return os.path.join(c, files[-1])
     return None
 
 
@@ -61,7 +74,7 @@ def load_image(path):
         return None
     try:
         from PIL import Image
-        return np.array(Image.open(path))
+        return np.array(Image.open(path).convert('RGB'))
     except Exception:
         try:
             import cv2
@@ -83,7 +96,9 @@ def world_to_pixel(H, points):
     ones = np.ones((pts_flat.shape[0], 1))
     homo = np.concatenate([pts_flat, ones], axis=1)
     pix = (H @ homo.T).T
-    pix = pix[:, :2] / (pix[:, 2:3] + 1e-12)
+    w = pix[:, 2:3]
+    w = np.where(np.abs(w) < 1e-12, 1e-12, w)
+    pix = pix[:, :2] / w
     return pix.reshape(orig_shape)
 
 
@@ -111,12 +126,12 @@ def extract_xy_agents(traj_raw, frames):
                                 all_agents.append(tt[..., :2].reshape(1, frames, 2))
         except Exception:
             pass
-        if all_agents:
-            try:
-                return np.concatenate(all_agents, axis=0)
-            except Exception:
-                return None
-        return None
+        if not all_agents:
+            return None
+        try:
+            return np.concatenate(all_agents, axis=0)
+        except Exception:
+            return None
     if traj.ndim == 4:
         B, A, T, F = traj.shape
         if F >= 2:
@@ -158,18 +173,19 @@ def generate_diagnostics(subset, data_dir, out_dir):
         return False
     
     H = load_homography(data_dir, subset)
-    bg_path = find_reference_frame(data_dir, subset)
-    bg_img = load_image(bg_path)
-    if bg_path:
-        print(f"[{subset}] Reference frame: {bg_path}")
+    bg_path_ref = find_reference_frame(data_dir, subset)
+    bg_img_ref = load_image(bg_path_ref)
+    if bg_path_ref:
+        print(f"[{subset}] Reference frame: {bg_path_ref}")
     else:
         print(f"[{subset}] WARNING: No reference frame found")
     
-    # Collect all points for density map
-    all_past_pix = []
-    all_fut_pix = []
+    # Scan all batches to find max density frame and collect all points
+    all_past_world = []
+    all_fut_world = []
     best_batch = None
     best_count = -1
+    best_idx = 0
     
     for batch_idx, batch in enumerate(loader):
         try:
@@ -183,41 +199,58 @@ def generate_diagnostics(subset, data_dir, out_dir):
             if A > best_count:
                 best_count = A
                 best_batch = (past[:A].copy(), fut[:A].copy())
-            if H is not None:
-                pp = world_to_pixel(H, past[:A])
-                fp = world_to_pixel(H, fut[:A])
-                if pp is not None:
-                    all_past_pix.append(pp.reshape(-1, 2))
-                if fp is not None:
-                    all_fut_pix.append(fp.reshape(-1, 2))
+                best_idx = batch_idx
+            if A > 0:
+                all_past_world.append(past[:A])
+                all_fut_world.append(fut[:A])
         except Exception:
             continue
+    
+    print(f"[{subset}] Max agents found: {best_count} at batch {best_idx}")
     
     # Figure 1: Global point cloud density map
     fig1, ax1 = plt.subplots(1, 1, figsize=(12, 9))
     fig1.suptitle(f'{subset.upper()} - Global Homography Point Cloud Density Map', fontsize=14, fontweight='bold')
-    if bg_img is not None:
-        ax1.imshow(bg_img, alpha=0.7)
-        ax1.set_xlim(0, bg_img.shape[1])
-        ax1.set_ylim(bg_img.shape[0], 0)
+    
+    if bg_img_ref is not None:
+        h_img, w_img = bg_img_ref.shape[0], bg_img_ref.shape[1]
+        ax1.imshow(bg_img_ref)
+        ax1.set_xlim([0, w_img])
+        ax1.set_ylim([h_img, 0])  # image coords
     else:
-        ax1.set_facecolor('#f5f5f5')
+        ax1.set_facecolor('#ffffff')
     
-    all_pp = []
-    all_fp = []
-    if all_past_pix:
-        all_pp = np.concatenate(all_past_pix, axis=0)
-    if all_fut_pix:
-        all_fp = np.concatenate(all_fut_pix, axis=0)
+    if H is not None and all_past_world:
+        try:
+            apw = np.concatenate(all_past_world, axis=0)
+            afw = np.concatenate(all_fut_world, axis=0)
+            app = world_to_pixel(H, apw)
+            afp = world_to_pixel(H, afw)
+            if app is not None and app.size > 0:
+                app = app.reshape(-1, 2)
+                # filter to reasonable bounds
+                if bg_img_ref is not None:
+                    mask = (app[:, 0] >= 0) & (app[:, 0] <= bg_img_ref.shape[1]) & (app[:, 1] >= 0) & (app[:, 1] <= bg_img_ref.shape[0])
+                    app_f = app[mask]
+                else:
+                    app_f = app
+                if len(app_f) > 0:
+                    ax1.scatter(app_f[:, 0], app_f[:, 1], s=2, c='crimson', alpha=0.4, marker='o')
+            if afp is not None and afp.size > 0:
+                afp = afp.reshape(-1, 2)
+                if bg_img_ref is not None:
+                    mask = (afp[:, 0] >= 0) & (afp[:, 0] <= bg_img_ref.shape[1]) & (afp[:, 1] >= 0) & (afp[:, 1] <= bg_img_ref.shape[0])
+                    afp_f = afp[mask]
+                else:
+                    afp_f = afp
+                if len(afp_f) > 0:
+                    ax1.scatter(afp_f[:, 0], afp_f[:, 1], s=2, c='cyan', alpha=0.4, marker='o')
+        except Exception as e:
+            print(f"[{subset}] Error projecting points: {e}")
     
-    if len(all_pp) > 0:
-        ax1.scatter(all_pp[:, 0], all_pp[:, 1], s=1, c='cyan', alpha=0.3, label='Past (all)')
-    if len(all_fp) > 0:
-        ax1.scatter(all_fp[:, 0], all_fp[:, 1], s=1, c='magenta', alpha=0.3, label='Future (all)')
-    ax1.legend(markerscale=10)
+    ax1.legend(['Past trajectories', 'Future trajectories'], markerscale=5)
     ax1.set_xlabel('u (pixels)')
     ax1.set_ylabel('v (pixels)')
-    ax1.grid(True, alpha=0.2)
     plt.tight_layout()
     out1 = out_dir / f'{subset}_1_global_pointcloud_density.png'
     plt.savefig(out1, dpi=300, bbox_inches='tight')
@@ -226,51 +259,54 @@ def generate_diagnostics(subset, data_dir, out_dir):
     
     # Figure 2: Dense multi-agent snapshot
     fig2, (ax2p, ax2w) = plt.subplots(1, 2, figsize=(18, 8))
-    fig2.suptitle(f'{subset.upper()} - Dense Multi-Agent Snapshot (Max Density: {best_count} agents)', 
+    fig2.suptitle(f'{subset.upper()} - Dense Multi-Agent Snapshot (Max Density: {best_count} agents, frame idx ~{best_idx})', 
                   fontsize=14, fontweight='bold')
     
-    if best_batch is None:
-        print(f"[{subset}] WARNING: No dense snapshot found")
-        plt.close(fig2)
-        return False
+    bg_img_snap = find_frame_by_index(data_dir, subset, best_idx)
+    bg_img_snap_arr = load_image(bg_img_snap)
     
-    past_b, fut_b = best_batch
-    A = past_b.shape[0]
-    
-    # Pixel space with background
-    if bg_img is not None:
-        ax2p.imshow(bg_img, alpha=0.8)
-        ax2p.set_xlim(0, bg_img.shape[1])
-        ax2p.set_ylim(bg_img.shape[0], 0)
+    if bg_img_snap_arr is not None:
+        h_s, w_s = bg_img_snap_arr.shape[0], bg_img_snap_arr.shape[1]
+        ax2p.imshow(bg_img_snap_arr)
+        ax2p.set_xlim([0, w_s])
+        ax2p.set_ylim([h_s, 0])
+    elif bg_img_ref is not None:
+        h_s, w_s = bg_img_ref.shape[0], bg_img_ref.shape[1]
+        ax2p.imshow(bg_img_ref)
+        ax2p.set_xlim([0, w_s])
+        ax2p.set_ylim([h_s, 0])
     else:
-        ax2p.set_facecolor('#f5f5f5')
+        ax2p.set_facecolor('#ffffff')
     
-    if H is not None:
+    if best_batch is not None and H is not None:
+        past_b, fut_b = best_batch
+        A = past_b.shape[0]
         pp_b = world_to_pixel(H, past_b)
         fp_b = world_to_pixel(H, fut_b)
         if pp_b is not None and fp_b is not None:
             for a in range(A):
-                ax2p.plot(pp_b[a, :, 0], pp_b[a, :, 1], '--', color='cyan', alpha=0.8, linewidth=1.5)
-                ax2p.scatter(pp_b[a, -1, 0], pp_b[a, -1, 1], c='cyan', s=20)
-                ax2p.plot(fp_b[a, :, 0], fp_b[a, :, 1], '-', color='yellow', alpha=0.9, linewidth=2)
-                ax2p.scatter(fp_b[a, 0, 0], fp_b[a, 0, 1], c='orange', s=25, marker='s')
+                ax2p.plot(pp_b[a, :, 0], pp_b[a, :, 1], '--', color='cyan', alpha=0.9, linewidth=1.8)
+                ax2p.plot(fp_b[a, :, 0], fp_b[a, :, 1], '-', color='yellow', alpha=1.0, linewidth=2.2)
+        # world
+        for a in range(A):
+            ax2w.plot(past_b[a, :, 0], past_b[a, :, 1], '--', color='blue', alpha=0.8, linewidth=1.6)
+            ax2w.plot(fut_b[a, :, 0], fut_b[a, :, 1], '-', color='red', alpha=1.0, linewidth=2.0)
+    elif best_batch is not None:
+        past_b, fut_b = best_batch
+        A = past_b.shape[0]
+        for a in range(A):
+            ax2w.plot(past_b[a, :, 0], past_b[a, :, 1], '--', color='blue', alpha=0.8, linewidth=1.6)
+            ax2w.plot(fut_b[a, :, 0], fut_b[a, :, 1], '-', color='red', alpha=1.0, linewidth=2.0)
     
-    ax2p.set_title('Pixel Space (with background)')
+    ax2p.set_title('Pixel Space - Past (dashed) / Future (solid)')
     ax2p.set_xlabel('u (pixels)')
     ax2p.set_ylabel('v (pixels)')
-    ax2p.grid(True, alpha=0.3)
-    
-    # World coordinates
-    for a in range(A):
-        ax2w.plot(past_b[a, :, 0], past_b[a, :, 1], '--', color='blue', alpha=0.7, linewidth=1.5)
-        ax2w.scatter(past_b[a, -1, 0], past_b[a, -1, 1], c='blue', s=20)
-        ax2w.plot(fut_b[a, :, 0], fut_b[a, :, 1], '-', color='red', alpha=0.9, linewidth=2)
-        ax2w.scatter(fut_b[a, 0, 0], fut_b[a, 0, 1], c='darkred', s=25, marker='s')
+    ax2p.grid(True, alpha=0.2)
     
     ax2w.set_title('World Coordinates (meters)')
     ax2w.set_xlabel('X (m)')
     ax2w.set_ylabel('Y (m)')
-    ax2w.grid(True, alpha=0.4)
+    ax2w.grid(True, linestyle='--', alpha=0.5)
     ax2w.axis('equal')
     
     plt.tight_layout()
