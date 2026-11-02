@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import glob
 import os
 import sys
 from pathlib import Path
@@ -81,6 +82,36 @@ def load_ckpt(ckpt_path, model):
         nd[kk2] = vv
     missing, unexpected = model.load_state_dict(nd, strict=False)
     return model
+
+def find_checkpoint(scene, mode, cor_fm_root="results_eth_ucy/cor_fm", flat_dir="results_eth_ucy/loso_full_matrix/checkpoints"):
+    # try flat first
+    flat = os.path.join(flat_dir, f"{scene}_{mode}.pt")
+    if os.path.exists(flat): return flat
+    # map mode
+    vm = f"vm{mode}"
+    # search patterns
+    patterns = [
+        os.path.join(cor_fm_root, f"*_{scene}_{vm}*"),
+        os.path.join(cor_fm_root, f"*{scene}*{vm}*"),
+    ]
+    candidates = []
+    for pat in patterns:
+        candidates.extend(glob.glob(pat))
+    # also scan all
+    if not candidates:
+        for d in os.listdir(cor_fm_root):
+            dp = os.path.join(cor_fm_root,d)
+            if os.path.isdir(dp) and scene in d and vm in d:
+                candidates.append(dp)
+    for c in candidates:
+        if os.path.isdir(c):
+            bp = os.path.join(c,'models','checkpoint_best.pt')
+            lp = os.path.join(c,'models','checkpoint_last.pt')
+            if os.path.exists(bp): return bp
+            if os.path.exists(lp): return lp
+        elif c.endswith('.pt'):
+            return c
+    return None
 
 def euler_sample(denoiser, cfg, x_data, num_frames, device, seed):
     K = int(cfg.denoising_head_preds)
@@ -162,10 +193,12 @@ def gradcam_for_full(ckpt_path, cfg, batch, data_dir, subset, device, seed=42):
     
     try:
         vis_dir = os.path.join(data_dir,subset,'visual_data')
+        if not os.path.exists(vis_dir):
+            vis_dir = os.path.join(_REPO_ROOT,'data','eth_ucy',subset,'visual_data')
+        cand = sorted([os.path.join(vis_dir,f) for f in os.listdir(vis_dir) if f.lower().endswith('.jpg')])[:cfg.past_frames]
+        if len(cand)<cfg.past_frames and cand: cand = cand*cfg.past_frames
+        if not cand: raise FileNotFoundError(f'No frames in {vis_dir}')
         frames_t=[]
-        # use first few frames as proxy
-        cand = sorted([os.path.join(vis_dir,f) for f in os.listdir(vis_dir) if f.endswith('.jpg')])[:cfg.past_frames]
-        if len(cand)<cfg.past_frames: cand = cand*cfg.past_frames
         for fp in cand[:cfg.past_frames]:
             pil = Image.open(fp).convert('RGB'); frames_t.append(preprocess(pil))
         frames_t = torch.stack(frames_t).to(device)
@@ -216,6 +249,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--cfg', default='cfg/eth_ucy/cor_fm.yml')
     p.add_argument('--ckpt-dir', default='results_eth_ucy/loso_full_matrix/checkpoints')
+    p.add_argument('--cor-fm-root', default='results_eth_ucy/cor_fm')
     p.add_argument('--data-dir', default='/home/efrei_stage/Desktop/tu-clausthal/datasets')
     p.add_argument('--out-dir', default='results_eth_ucy/loso_full_matrix/viz')
     p.add_argument('--scenes', nargs='+', default=['eth','hotel','univ','zara1','zara2'])
@@ -243,12 +277,12 @@ def main():
         H = load_h(os.path.join(args.data_dir,scene,'H.txt')) or load_h(os.path.join(_REPO_ROOT,'data','eth_ucy',scene,'H.txt'))
         bg = load_img(find_ref_img(args.data_dir,scene))
         
-        # load predictions for all modes
         preds_all={}
         for mode in args.modes:
-            ckpt = os.path.join(args.ckpt_dir, f'{scene}_{mode}.pt')
-            if not os.path.exists(ckpt):
-                print(f'  missing {ckpt}'); continue
+            ckpt = find_checkpoint(scene, mode, args.cor_fm_root, args.ckpt_dir)
+            if not ckpt:
+                print(f'  missing checkpoint for {scene}/{mode}'); continue
+            print(f'  [{mode}] {ckpt}')
             cfg_m = Config(args.cfg, f'viz_{scene}_{mode}')
             cfg_m.device=args.device
             try:
@@ -271,15 +305,12 @@ def main():
                 print(f'  [{mode}] err: {e}')
         
         if not preds_all: continue
-        
-        # Get obs in pixel/world
         obs_raw = batch.get('past_traj_original_scale')
         obs_m = None
         if obs_raw is not None:
             obs_m = rearrange(obs_raw,'b a (t d)->b a t d',t=cfg.past_frames)[...,:2]
             obs_m = unnormalize_min_max(obs_m,cfg.past_traj_min,cfg.past_traj_max,-1,1).cpu().numpy()[0]
         
-        # Plot comparison
         fig,(ax1,ax2)=plt.subplots(1,2,figsize=(20,9))
         fig.suptitle(f'{scene.upper()} - ETH/UCY Trajectory Comparison (Best-of-K)',fontsize=16,fontweight='bold')
         for ax in [ax1,ax2]:
@@ -287,15 +318,9 @@ def main():
                 ax.imshow(bg); ax.set_xlim(0,bg.shape[1]); ax.set_ylim(bg.shape[0],0)
             else: ax.grid(True,ls='--',alpha=0.5)
             ax.axis('off')
-        # plot on pixel space if bg available
-        for mi,mode in enumerate(['off','static','full']):
-            if mode not in preds_all: continue
-            ax = ax1 if mi<2 else ax2  # spread
-        # combined
         ax=ax1
         if bg is not None and H is not None and obs_m is not None:
-            # take first agent
-            obsp = world_to_pix(H, obs_m[0]); gtp = world_to_pix(H,preds_all.get('full',preds_all[list(preds_all.keys())[0]])['gt'][0])
+            obsp = world_to_pix(H, obs_m[0]); gtp = world_to_pix(H,preds_all['full']['gt'][0]) if 'full' in preds_all else None
             if obsp is not None: ax.plot(obsp[:,0],obsp[:,1],'--',color='black',lw=2,label='History'); ax.scatter(obsp[-1,0],obsp[-1,1],c='black',s=60)
             if gtp is not None: ax.plot(gtp[:,0],gtp[:,1],'-',color='green',lw=2,label='GT'); ax.scatter(gtp[-1,0],gtp[-1,1],c='green',s=60)
             for mode,col in [('off','blue'),('static','orange'),('full','red')]:
@@ -311,7 +336,6 @@ def main():
             ax.set_title('World Coordinates',fontsize=14)
         ax.legend(loc='best',framealpha=0.9)
         
-        # world coords
         ax=ax2
         if obs_m is not None: ax.plot(obs_m[0,:,0],obs_m[0,:,1],'--',lw=2,label='History')
         if 'full' in preds_all: ax.plot(preds_all['full']['gt'][0,:,0],preds_all['full']['gt'][0,:,1],'-',color='green',lw=2,label='GT')
@@ -326,14 +350,14 @@ def main():
         plt.close()
         print(f'  saved trajectory comparison')
         
-        # Grad-CAM for full
         if 'full' in preds_all:
             try:
                 cfg_f = Config(args.cfg,f'gc_{scene}'); cfg_f.device=args.device
                 try:
                     cfg_f.MODEL.CONTEXT_ENCODER.VIDEO_MODE='full'; cfg_f.MODEL.CONTEXT_ENCODER.USE_VIDEO=True
                 except: pass
-                ckpt_f = os.path.join(args.ckpt_dir,f'{scene}_full.pt')
+                ckpt_f = find_checkpoint(scene,'full',args.cor_fm_root,args.ckpt_dir)
+                if not ckpt_f: raise FileNotFoundError('no ckpt')
                 cam,cand_fp = gradcam_for_full(ckpt_f,cfg_f,batch,args.data_dir,scene,args.device,1234)
                 frm = load_img(cand_fp)
                 if frm is not None and len(cam)>0:
