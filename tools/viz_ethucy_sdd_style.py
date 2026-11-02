@@ -55,7 +55,7 @@ class NullLogger:
     def info(self, *a, **k): pass
     def warning(self, *a, **k): pass
 
-def load_ckpt(ckpt_path, model):
+def load_ckpt_flexible(ckpt_path, model):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = None
     if isinstance(ckpt, dict):
@@ -72,11 +72,36 @@ def load_ckpt(ckpt_path, model):
     for kk, vv in sd.items():
         kk2 = kk[7:] if kk.startswith("module.") else kk
         nd[kk2] = vv
+    # Try strict first
+    try:
+        model.load_state_dict(nd, strict=True)
+        return model
+    except Exception:
+        pass
+    # Resize embeddings if shape mismatch
+    model_sd = model.state_dict()
+    for k in list(nd.keys()):
+        if k in model_sd:
+            if model_sd[k].shape != nd[k].shape and 'embedding' in k:
+                print(f'  Resizing {k}: ckpt {nd[k].shape} -> model {model_sd[k].shape}')
+                if nd[k].shape[0] < model_sd[k].shape[0]:
+                    # pad
+                    newv = model_sd[k].clone()
+                    newv[:nd[k].shape[0]] = nd[k]
+                    nd[k] = newv
+                elif nd[k].shape[0] > model_sd[k].shape[0]:
+                    nd[k] = nd[k][:model_sd[k].shape[0]]
+                elif nd[k].shape[1] < model_sd[k].shape[1]:
+                    newv = model_sd[k].clone()
+                    newv[:, :nd[k].shape[1]] = nd[k]
+                    nd[k] = newv
+                elif nd[k].shape[1] > model_sd[k].shape[1]:
+                    nd[k] = nd[k][:, :model_sd[k].shape[1]]
     missing, unexpected = model.load_state_dict(nd, strict=False)
+    print(f'  loaded with missing={len(missing)} unexpected={len(unexpected)}')
     return model
 
 def find_checkpoint_info(scene, mode, cor_fm_root="results_eth_ucy/cor_fm", flat_dir="results_eth_ucy/loso_full_matrix/checkpoints"):
-    # try flat first
     flat = os.path.join(flat_dir, f"{scene}_{mode}.pt")
     if os.path.exists(flat): 
         return flat, None
@@ -179,7 +204,7 @@ def make_backbone(device='cpu'):
 def gradcam_for_full(ckpt_path, cfg, batch, data_dir, subset, device, seed=42):
     model = ETHMotionTransformer(model_config=cfg.MODEL, logger=NullLogger(), config=cfg)
     denoiser = FlowMatcher(cfg, model, logger=NullLogger())
-    denoiser = load_ckpt(ckpt_path, denoiser).to(device).eval()
+    denoiser = load_ckpt_flexible(ckpt_path, denoiser).to(device).eval()
     for p in denoiser.parameters(): p.requires_grad_(False)
     backbone, preprocess = make_backbone(device)
     
@@ -290,7 +315,7 @@ def main():
             try:
                 model = ETHMotionTransformer(model_config=cfg_m.MODEL, logger=NullLogger(), config=cfg_m)
                 denoiser = FlowMatcher(cfg_m, model, logger=NullLogger())
-                denoiser = load_ckpt(ckpt, denoiser).to(args.device).eval()
+                denoiser = load_ckpt_flexible(ckpt, denoiser).to(args.device).eval()
                 for p in denoiser.parameters(): p.requires_grad_(False)
                 x_data = {k:v.to(args.device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
                 gt = batch['fut_traj_original_scale'].to(args.device).float()
@@ -301,6 +326,7 @@ def main():
                 del model,denoiser; torch.cuda.empty_cache(); gc.collect()
             except Exception as e:
                 print(f'  [{mode}] err: {e}')
+                import traceback; traceback.print_exc()
         
         if not preds_all: continue
         obs_raw = batch.get('past_traj_original_scale')
