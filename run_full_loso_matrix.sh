@@ -23,6 +23,17 @@ MODES=("off" "static" "full")
 mkdir -p results_eth_ucy/loso_full_matrix/{checkpoints,metrics,logs,viz}
 mkdir -p logs_loso_full
 
+echo "=== Building video features ==="
+if [ -d "$DATA_DIR/../data/eth_ucy" ] || [ -d "$REPO_DIR/data/eth_ucy" ]; then
+    FRAMES_ROOT="$REPO_DIR/data/eth_ucy"
+else
+    FRAMES_ROOT="$DATA_DIR/../.."
+fi
+python -m video_encoder.scripts.build_ethucy_features \
+  --frames-root $FRAMES_ROOT \
+  --out $FEATURES_ROOT \
+  --stride 10 2>&1 | tail -30 || true
+
 for SUBSET in "${SUBSETS[@]}"; do
   for MODE in "${MODES[@]}"; do
     echo "=================================================="
@@ -107,6 +118,5 @@ PY
 
 echo "Generating visualizations..."
 python tools/plot_homography_verification.py 2>&1 | tail -20 || true
-python tools/viz_ethucy_loso_full.py --checkpoints-dir results_eth_ucy/loso_full_matrix/checkpoints --out-dir results_eth_ucy/loso_full_matrix/viz 2>&1 | tail -30 || true
 
 echo "COMPLETE"
