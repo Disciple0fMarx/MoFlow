@@ -55,14 +55,6 @@ class NullLogger:
     def info(self, *a, **k): pass
     def warning(self, *a, **k): pass
 
-STYLE = {
-    "history": {"color": "black", "linestyle": "--", "linewidth": 1.6, "marker": "o", "markersize": 3, "label": "History"},
-    "gt": {"color": "green", "linestyle": "-", "linewidth": 1.8, "marker": "o", "markersize": 3, "label": "Ground truth"},
-    "best_off": {"color": "blue", "linewidth": 2.4, "alpha": 0.9, "marker": "o", "markersize": 3, "label": "Best-of-K (off)"},
-    "best_static": {"color": "orange", "linewidth": 2.4, "alpha": 0.9, "marker": "o", "markersize": 3, "label": "Best-of-K (static)"},
-    "best_full": {"color": "red", "linewidth": 2.4, "alpha": 0.9, "marker": "o", "markersize": 3, "label": "Best-of-K (full)"},
-}
-
 def load_ckpt(ckpt_path, model):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = None
@@ -83,21 +75,15 @@ def load_ckpt(ckpt_path, model):
     missing, unexpected = model.load_state_dict(nd, strict=False)
     return model
 
-def find_checkpoint(scene, mode, cor_fm_root="results_eth_ucy/cor_fm", flat_dir="results_eth_ucy/loso_full_matrix/checkpoints"):
+def find_checkpoint_info(scene, mode, cor_fm_root="results_eth_ucy/cor_fm", flat_dir="results_eth_ucy/loso_full_matrix/checkpoints"):
     # try flat first
     flat = os.path.join(flat_dir, f"{scene}_{mode}.pt")
-    if os.path.exists(flat): return flat
-    # map mode
+    if os.path.exists(flat): 
+        return flat, None
     vm = f"vm{mode}"
-    # search patterns
-    patterns = [
-        os.path.join(cor_fm_root, f"*_{scene}_{vm}*"),
-        os.path.join(cor_fm_root, f"*{scene}*{vm}*"),
-    ]
     candidates = []
-    for pat in patterns:
+    for pat in [os.path.join(cor_fm_root, f"*_{scene}_{vm}*"), os.path.join(cor_fm_root, f"*{scene}*{vm}*")]:
         candidates.extend(glob.glob(pat))
-    # also scan all
     if not candidates:
         for d in os.listdir(cor_fm_root):
             dp = os.path.join(cor_fm_root,d)
@@ -107,11 +93,21 @@ def find_checkpoint(scene, mode, cor_fm_root="results_eth_ucy/cor_fm", flat_dir=
         if os.path.isdir(c):
             bp = os.path.join(c,'models','checkpoint_best.pt')
             lp = os.path.join(c,'models','checkpoint_last.pt')
-            if os.path.exists(bp): return bp
-            if os.path.exists(lp): return lp
+            ckpt = bp if os.path.exists(bp) else (lp if os.path.exists(lp) else None)
+            if ckpt:
+                return ckpt, c
         elif c.endswith('.pt'):
-            return c
-    return None
+            return c, None
+    return None, None
+
+def load_run_config(run_dir, default_cfg='cfg/eth_ucy/cor_fm.yml'):
+    if run_dir and os.path.isdir(run_dir):
+        for name in ['cor_fm_updated.yml','config_updated.yml','cor_fm.yml','config.yml']:
+            p = os.path.join(run_dir, name)
+            if os.path.exists(p): return p
+            p2 = os.path.join(run_dir, 'code_backup', name)
+            if os.path.exists(p2): return p2
+    return default_cfg
 
 def euler_sample(denoiser, cfg, x_data, num_frames, device, seed):
     K = int(cfg.denoising_head_preds)
@@ -264,10 +260,10 @@ def main():
     
     for scene in args.scenes:
         print(f'\n=== {scene.upper()} ===')
-        cfg = Config(args.cfg, f'viz_{scene}')
-        cfg.device = args.device
+        cfg_ref = Config(args.cfg, f'viz_{scene}')
+        cfg_ref.device = args.device
         try:
-            ds = ETHDataset(cfg=cfg, training=False, data_dir=args.data_dir, subset=scene, rotate_time_frame=0, type='original', video_mode='full')
+            ds = ETHDataset(cfg=cfg_ref, training=False, data_dir=args.data_dir, subset=scene, rotate_time_frame=0, type='original', video_mode='full')
             loader = DataLoader(ds,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
             it=iter(loader)
             for i in range(args.batch_idx+1): batch=next(it)
@@ -279,11 +275,13 @@ def main():
         
         preds_all={}
         for mode in args.modes:
-            ckpt = find_checkpoint(scene, mode, args.cor_fm_root, args.ckpt_dir)
+            ckpt, run_dir = find_checkpoint_info(scene, mode, args.cor_fm_root, args.ckpt_dir)
             if not ckpt:
                 print(f'  missing checkpoint for {scene}/{mode}'); continue
             print(f'  [{mode}] {ckpt}')
-            cfg_m = Config(args.cfg, f'viz_{scene}_{mode}')
+            cfg_path = load_run_config(run_dir, args.cfg)
+            print(f'    using config: {cfg_path}')
+            cfg_m = Config(cfg_path, f'viz_{scene}_{mode}')
             cfg_m.device=args.device
             try:
                 cfg_m.MODEL.CONTEXT_ENCODER.VIDEO_MODE = mode
@@ -308,8 +306,8 @@ def main():
         obs_raw = batch.get('past_traj_original_scale')
         obs_m = None
         if obs_raw is not None:
-            obs_m = rearrange(obs_raw,'b a (t d)->b a t d',t=cfg.past_frames)[...,:2]
-            obs_m = unnormalize_min_max(obs_m,cfg.past_traj_min,cfg.past_traj_max,-1,1).cpu().numpy()[0]
+            obs_m = rearrange(obs_raw,'b a (t d)->b a t d',t=cfg_ref.past_frames)[...,:2]
+            obs_m = unnormalize_min_max(obs_m,cfg_ref.past_traj_min,cfg_ref.past_traj_max,-1,1).cpu().numpy()[0]
         
         fig,(ax1,ax2)=plt.subplots(1,2,figsize=(20,9))
         fig.suptitle(f'{scene.upper()} - ETH/UCY Trajectory Comparison (Best-of-K)',fontsize=16,fontweight='bold')
@@ -352,12 +350,13 @@ def main():
         
         if 'full' in preds_all:
             try:
-                cfg_f = Config(args.cfg,f'gc_{scene}'); cfg_f.device=args.device
+                ckpt_f, run_dir_f = find_checkpoint_info(scene,'full',args.cor_fm_root,args.ckpt_dir)
+                if not ckpt_f: raise FileNotFoundError('no ckpt')
+                cfg_path_f = load_run_config(run_dir_f, args.cfg)
+                cfg_f = Config(cfg_path_f,f'gc_{scene}'); cfg_f.device=args.device
                 try:
                     cfg_f.MODEL.CONTEXT_ENCODER.VIDEO_MODE='full'; cfg_f.MODEL.CONTEXT_ENCODER.USE_VIDEO=True
                 except: pass
-                ckpt_f = find_checkpoint(scene,'full',args.cor_fm_root,args.ckpt_dir)
-                if not ckpt_f: raise FileNotFoundError('no ckpt')
                 cam,cand_fp = gradcam_for_full(ckpt_f,cfg_f,batch,args.data_dir,scene,args.device,1234)
                 frm = load_img(cand_fp)
                 if frm is not None and len(cam)>0:
