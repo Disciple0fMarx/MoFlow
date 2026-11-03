@@ -152,7 +152,7 @@ def find_checkpoint_info(scene, mode, cor_fm_root="results_eth_ucy/cor_fm", flat
     if os.path.exists(flat): return flat,None
     vm=f"vm{mode}"
     cands=[]
-    for pat in [os.path.join(cor_fm_root,f"*_{scene}_{vm}*"), os.path.join(cor_fm_root,f"*{scene}*{vm}*")]:
+    for pat in [os.path.join(cor_fm_root, f"*_{scene}_{vm}*"), os.path.join(cor_fm_root, f"*{scene}*{vm}*")]:
         cands.extend(glob.glob(pat))
     if not cands:
         for d in os.listdir(cor_fm_root):
@@ -191,7 +191,6 @@ def best_of_k(pred,gt,cfg,ds=None):
     fut_min=getattr(cfg,'fut_traj_min',getattr(ds,'fut_traj_min',-1.0) if ds else -1.0)
     fut_max=getattr(cfg,'fut_traj_max',getattr(ds,'fut_traj_max',1.0) if ds else 1.0)
     future_frames=int(getattr(cfg,'future_frames',12))
-    # gt
     gt_arr = np.array(gt.detach().cpu() if hasattr(gt,'detach') else gt)
     if gt_arr.ndim==4: gt_m = gt_arr[0,0,...]
     elif gt_arr.ndim==3: gt_m = gt_arr[0,...]
@@ -199,7 +198,6 @@ def best_of_k(pred,gt,cfg,ds=None):
     else: gt_m = gt_arr.reshape(-1,2)
     gt_m = gt_m[:future_frames,:2] if gt_m.shape[0]>=future_frames else gt_m
     gt_t = unnormalize_min_max(torch.tensor(gt_m).float().unsqueeze(0).unsqueeze(0),fut_min,fut_max,-1,1)[0,0]
-    # pred
     pred_arr = np.array(pred.detach().cpu() if hasattr(pred,'detach') else pred)
     if pred_arr.ndim==4 and pred_arr.shape[-1]==future_frames*2:
         pred_r = rearrange(torch.tensor(pred_arr).float(),'b k a (f d)->b k a f d',f=future_frames)[...,:2]
@@ -221,17 +219,35 @@ def load_h(H_path):
     try: return np.loadtxt(H_path).astype(float)
     except: return None
 
-def world_to_pix(H,pts):
-    if H is None or pts is None: return None
+def world_to_pix(H,pts,ds=None,scene=None):
+    if pts is None: return None
     pts=np.asarray(pts)
     if pts.size==0: return pts
-    orig=pts.shape
-    p=pts.reshape(-1,2)
-    ph=np.c_[p,np.ones((len(p),1))]@np.asarray(H,float).T
-    w=ph[:,2:3]; w[np.abs(w)<1e-12]=np.nan
-    out=(ph[:,:2]/w)
-    try: return out.reshape(orig[:-1]+(2,))
-    except: return out
+    if ds is not None and hasattr(ds,'world_to_pixel'):
+        try:
+            orig=pts.shape
+            p=pts.reshape(-1,2)
+            out=[]
+            for pt in p:
+                res=ds.world_to_pixel(torch.tensor(pt).reshape(1,2), scene=scene if scene else getattr(ds,'subset',None))
+                if isinstance(res,torch.Tensor): res=res.detach().cpu().numpy()
+                out.append(np.array(res).reshape(-1,2)[0])
+            out=np.array(out)
+            return out.reshape(orig[:-1]+(2,))
+        except Exception as e:
+            pass
+    # Fallback: inv(H) since H maps pixels->world
+    try:
+        Hm=np.asarray(H,float)
+        Hinv=np.linalg.inv(Hm)
+        orig=pts.shape
+        p=pts.reshape(-1,2)
+        ph=np.c_[p,np.ones((len(p),1))]@Hinv.T
+        w=ph[:,2:3]; w[np.abs(w)<1e-12]=np.nan
+        out=(ph[:,:2]/w)
+        return out.reshape(orig[:-1]+(2,))
+    except Exception:
+        return pts
 
 def find_ref_img(data_dir,subset):
     for base in [os.path.join(data_dir,subset,'visual_data'),os.path.join(_REPO_ROOT,'data','eth_ucy',subset,'visual_data')]:
@@ -345,15 +361,13 @@ def main():
             for i in range(max(0,args.batch_idx)+1):
                 try: batch=next(iter(loader))
                 except: break
-            # find valid batch with agents
             if batch is None:
                 for bi in range(min(50, len(ds_ref))):
                     loader2=DataLoader(ds_ref,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
                     it2=iter(loader2)
                     for j in range(bi+1): batch=next(it2)
                     po=batch.get('past_traj_original_scale')
-                    if po is not None and torch.is_tensor(po):
-                        if po.shape[1]>0 and (po.abs().sum()>0): break
+                    if po is not None and torch.is_tensor(po) and po.shape[1]>0 and (po.abs().sum()>0): break
             if batch is None: continue
         except Exception as e:
             print(f'[{scene}] data err: {e}'); continue
@@ -395,7 +409,6 @@ def main():
         
         if not preds_all: 
             print(f'  no predictions for {scene}'); continue
-        # obs
         obs_raw=batch.get('past_traj_original_scale')
         obs_xy=None
         if obs_raw is not None:
@@ -416,18 +429,18 @@ def main():
         ax=ax1
         if bg is not None and H is not None and obs_xy is not None:
             try:
-                obsp=world_to_pix(H,obs_xy); 
-                if obsp is not None and np.array(obsp).size>0:
+                obsp=world_to_pix(H,obs_xy,ds_ref,scene); 
+                if obsp is not None:
                     obsp2=np.array(obsp).reshape(-1,2); obsp2=obsp2[np.isfinite(obsp2).all(1)]
                     if len(obsp2): ax.plot(obsp2[:,0],obsp2[:,1],'--',color='black',lw=2,label='History'); ax.scatter(obsp2[-1,0],obsp2[-1,1],c='black',s=60)
                 if 'full' in preds_all:
-                    gtp=world_to_pix(H,preds_all['full']['gt']); 
+                    gtp=world_to_pix(H,preds_all['full']['gt'],ds_ref,scene); 
                     if gtp is not None:
                         gtp2=np.array(gtp).reshape(-1,2); gtp2=gtp2[np.isfinite(gtp2).all(1)]
                         if len(gtp2): ax.plot(gtp2[:,0],gtp2[:,1],'-',color='green',lw=2,label='GT'); ax.scatter(gtp2[-1,0],gtp2[-1,1],c='green',s=60)
                 for mode,col in [('off','blue'),('static','orange'),('full','red')]:
                     if mode in preds_all:
-                        bp=world_to_pix(H,preds_all[mode]['best'])
+                        bp=world_to_pix(H,preds_all[mode]['best'],ds_ref,scene)
                         if bp is not None:
                             bp2=np.array(bp).reshape(-1,2); bp2=bp2[np.isfinite(bp2).all(1)]
                             if len(bp2): ax.plot(bp2[:,0],bp2[:,1],'-',color=col,lw=2.5,label=f'Best-of-K {mode}')
