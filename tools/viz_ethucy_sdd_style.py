@@ -214,40 +214,28 @@ def best_of_k(pred,gt,cfg,ds=None):
     ade_min,best_idx = ade.min(dim=0)
     return ade_min,int(best_idx.item()),pred_r[0],gt_t.unsqueeze(0).unsqueeze(0)
 
-def load_h(H_path):
-    if not os.path.exists(H_path): return None
-    try: return np.loadtxt(H_path).astype(float)
-    except: return None
-
-def world_to_pix(H,pts,ds=None,scene=None):
-    if pts is None: return None
-    pts=np.asarray(pts)
-    if pts.size==0: return pts
-    if ds is not None and hasattr(ds,'world_to_pixel'):
-        try:
-            orig=pts.shape
-            p=pts.reshape(-1,2)
-            out=[]
-            for pt in p:
-                res=ds.world_to_pixel(torch.tensor(pt).reshape(1,2), scene=scene if scene else getattr(ds,'subset',None))
-                if isinstance(res,torch.Tensor): res=res.detach().cpu().numpy()
-                out.append(np.array(res).reshape(-1,2)[0])
-            out=np.array(out)
-            return out.reshape(orig[:-1]+(2,))
-        except Exception as e:
-            pass
-    # Fallback: inv(H) since H maps pixels->world
+def to_pixels(ds, pts, scene=None):
+    if pts is None or ds is None: return None
     try:
-        Hm=np.asarray(H,float)
-        Hinv=np.linalg.inv(Hm)
-        orig=pts.shape
-        p=pts.reshape(-1,2)
-        ph=np.c_[p,np.ones((len(p),1))]@Hinv.T
-        w=ph[:,2:3]; w[np.abs(w)<1e-12]=np.nan
-        out=(ph[:,:2]/w)
-        return out.reshape(orig[:-1]+(2,))
-    except Exception:
-        return pts
+        pts_arr = np.asarray(pts)
+        if pts_arr.size == 0: return pts_arr
+        orig = pts_arr.shape
+        p = pts_arr.reshape(-1, 2).astype(np.float32)
+        out_list = []
+        for pt in p:
+            res = ds.world_to_pixel(torch.tensor(pt).reshape(1, 2), scene=scene)
+            if isinstance(res, torch.Tensor):
+                res = res.detach().cpu().numpy()
+            res_arr = np.array(res).reshape(-1, 2)
+            if res_arr.size == 0:
+                out_list.append([np.nan, np.nan])
+            else:
+                out_list.append(res_arr[0])
+        out_arr = np.array(out_list)
+        return out_arr.reshape(orig[:-1] + (2,))
+    except Exception as e:
+        print(f"[viz] world_to_pixel failed: {e}")
+        return None
 
 def find_ref_img(data_dir,subset):
     for base in [os.path.join(data_dir,subset,'visual_data'),os.path.join(_REPO_ROOT,'data','eth_ucy',subset,'visual_data')]:
@@ -372,7 +360,6 @@ def main():
         except Exception as e:
             print(f'[{scene}] data err: {e}'); continue
         
-        H=load_h(os.path.join(args.data_dir,scene,'H.txt')) or load_h(os.path.join(_REPO_ROOT,'data','eth_ucy',scene,'H.txt'))
         bg=load_img(find_ref_img(args.data_dir,scene))
         
         preds_all={}
@@ -427,24 +414,24 @@ def main():
                 ax.imshow(bg); ax.set_xlim(0,bg.shape[1]); ax.set_ylim(bg.shape[0],0)
             else: ax.grid(True,ls='--',alpha=0.5); ax.axis('off')
         ax=ax1
-        if bg is not None and H is not None and obs_xy is not None:
+        if bg is not None and obs_xy is not None:
             try:
-                obsp=world_to_pix(H,obs_xy,ds_ref,scene); 
+                obsp=to_pixels(ds_ref,obs_xy,scene); 
                 if obsp is not None:
                     obsp2=np.array(obsp).reshape(-1,2); obsp2=obsp2[np.isfinite(obsp2).all(1)]
                     if len(obsp2): ax.plot(obsp2[:,0],obsp2[:,1],'--',color='black',lw=2,label='History'); ax.scatter(obsp2[-1,0],obsp2[-1,1],c='black',s=60)
                 if 'full' in preds_all:
-                    gtp=world_to_pix(H,preds_all['full']['gt'],ds_ref,scene); 
+                    gtp=to_pixels(ds_ref,preds_all['full']['gt'],scene); 
                     if gtp is not None:
                         gtp2=np.array(gtp).reshape(-1,2); gtp2=gtp2[np.isfinite(gtp2).all(1)]
                         if len(gtp2): ax.plot(gtp2[:,0],gtp2[:,1],'-',color='green',lw=2,label='GT'); ax.scatter(gtp2[-1,0],gtp2[-1,1],c='green',s=60)
                 for mode,col in [('off','blue'),('static','orange'),('full','red')]:
                     if mode in preds_all:
-                        bp=world_to_pix(H,preds_all[mode]['best'],ds_ref,scene)
+                        bp=to_pixels(ds_ref,preds_all[mode]['best'],scene)
                         if bp is not None:
                             bp2=np.array(bp).reshape(-1,2); bp2=bp2[np.isfinite(bp2).all(1)]
                             if len(bp2): ax.plot(bp2[:,0],bp2[:,1],'-',color=col,lw=2.5,label=f'Best-of-K {mode}')
-                ax.set_title('Pixel Space (projected via H.txt)',fontsize=14)
+                ax.set_title('Pixel Space (projected via ds.world_to_pixel)',fontsize=14)
             except Exception as e: print(e)
         else:
             if obs_xy is not None:
