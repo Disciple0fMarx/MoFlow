@@ -55,6 +55,30 @@ class NullLogger:
     def info(self, *a, **k): pass
     def warning(self, *a, **k): pass
 
+def infer_agents_from_ckpt(ckpt_path):
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        sd = None
+        if isinstance(ckpt, dict):
+            for k in ["state_dict", "model_state_dict", "model", "ema_state_dict"]:
+                if k in ckpt and isinstance(ckpt[k], dict):
+                    sd = ckpt[k]
+                    break
+            if sd is None and not any(isinstance(v, dict) for v in ckpt.values()):
+                sd = ckpt
+        else:
+            sd = ckpt
+        if sd is None: return None
+        for key in sd.keys():
+            if 'agent_query_embedding.weight' in key:
+                return int(sd[key].shape[0])
+        for key in sd.keys():
+            if 'agent_order_embedding.weight' in key:
+                return int(sd[key].shape[0])
+    except Exception:
+        pass
+    return None
+
 def load_ckpt_flexible(ckpt_path, model):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = None
@@ -72,33 +96,7 @@ def load_ckpt_flexible(ckpt_path, model):
     for kk, vv in sd.items():
         kk2 = kk[7:] if kk.startswith("module.") else kk
         nd[kk2] = vv
-    # Try strict first
-    try:
-        model.load_state_dict(nd, strict=True)
-        return model
-    except Exception:
-        pass
-    # Resize embeddings if shape mismatch
-    model_sd = model.state_dict()
-    for k in list(nd.keys()):
-        if k in model_sd:
-            if model_sd[k].shape != nd[k].shape and 'embedding' in k:
-                print(f'  Resizing {k}: ckpt {nd[k].shape} -> model {model_sd[k].shape}')
-                if nd[k].shape[0] < model_sd[k].shape[0]:
-                    # pad
-                    newv = model_sd[k].clone()
-                    newv[:nd[k].shape[0]] = nd[k]
-                    nd[k] = newv
-                elif nd[k].shape[0] > model_sd[k].shape[0]:
-                    nd[k] = nd[k][:model_sd[k].shape[0]]
-                elif nd[k].shape[1] < model_sd[k].shape[1]:
-                    newv = model_sd[k].clone()
-                    newv[:, :nd[k].shape[1]] = nd[k]
-                    nd[k] = newv
-                elif nd[k].shape[1] > model_sd[k].shape[1]:
-                    nd[k] = nd[k][:, :model_sd[k].shape[1]]
     missing, unexpected = model.load_state_dict(nd, strict=False)
-    print(f'  loaded with missing={len(missing)} unexpected={len(unexpected)}')
     return model
 
 def find_checkpoint_info(scene, mode, cor_fm_root="results_eth_ucy/cor_fm", flat_dir="results_eth_ucy/loso_full_matrix/checkpoints"):
@@ -312,6 +310,15 @@ def main():
                 cfg_m.MODEL.CONTEXT_ENCODER.VIDEO_MODE = mode
                 cfg_m.MODEL.CONTEXT_ENCODER.USE_VIDEO = mode != 'off'
             except: pass
+            # Override AGENTS from checkpoint to avoid shape mismatch
+            agents_ckpt = infer_agents_from_ckpt(ckpt)
+            if agents_ckpt is not None:
+                try:
+                    if getattr(cfg_m.MODEL, 'AGENTS', None) != agents_ckpt:
+                        print(f'    overriding MODEL.AGENTS {getattr(cfg_m.MODEL,"AGENTS")} -> {agents_ckpt}')
+                        cfg_m.MODEL.AGENTS = agents_ckpt
+                except Exception as e:
+                    print(f'    agents override err: {e}')
             try:
                 model = ETHMotionTransformer(model_config=cfg_m.MODEL, logger=NullLogger(), config=cfg_m)
                 denoiser = FlowMatcher(cfg_m, model, logger=NullLogger())
@@ -383,6 +390,10 @@ def main():
                 try:
                     cfg_f.MODEL.CONTEXT_ENCODER.VIDEO_MODE='full'; cfg_f.MODEL.CONTEXT_ENCODER.USE_VIDEO=True
                 except: pass
+                agents_ckpt_f = infer_agents_from_ckpt(ckpt_f)
+                if agents_ckpt_f is not None:
+                    try: cfg_f.MODEL.AGENTS = agents_ckpt_f
+                    except: pass
                 cam,cand_fp = gradcam_for_full(ckpt_f,cfg_f,batch,args.data_dir,scene,args.device,1234)
                 frm = load_img(cand_fp)
                 if frm is not None and len(cam)>0:
