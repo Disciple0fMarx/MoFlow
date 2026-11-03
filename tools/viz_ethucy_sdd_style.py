@@ -80,7 +80,6 @@ def infer_agents_from_ckpt(ckpt_path):
     return None
 
 def force_set_agents(cfg_m, agents):
-    # Try multiple paths
     try:
         cfg_m.MODEL.CONTEXT_ENCODER.AGENTS = agents
     except Exception:
@@ -93,16 +92,29 @@ def force_set_agents(cfg_m, agents):
         cfg_m.AGENTS = agents
     except Exception:
         pass
-    # Also try nested dict
     try:
         if hasattr(cfg_m, 'yml_dict'):
             yd = cfg_m.yml_dict
-            # MODEL.CONTEXT_ENCODER.AGENTS
             if 'MODEL' in yd and isinstance(yd['MODEL'], dict):
                 if 'CONTEXT_ENCODER' in yd['MODEL'] and isinstance(yd['MODEL']['CONTEXT_ENCODER'], dict):
                     yd['MODEL']['CONTEXT_ENCODER']['AGENTS'] = agents
                 yd['MODEL']['AGENTS'] = agents
             yd['AGENTS'] = agents
+    except Exception:
+        pass
+
+def copy_norm_stats(src, dst):
+    for k in ['fut_traj_min','fut_traj_max','past_traj_min','past_traj_max','norm_mode']:
+        if hasattr(src,k):
+            try:
+                setattr(dst,k,getattr(src,k))
+            except Exception:
+                pass
+    try:
+        if hasattr(dst,'yml_dict'):
+            yd = dst.yml_dict
+            for k in ['fut_traj_min','fut_traj_max','past_traj_min','past_traj_max','norm_mode']:
+                if hasattr(src,k): yd[k]=getattr(src,k)
     except Exception:
         pass
 
@@ -160,8 +172,8 @@ def load_run_config(run_dir, default_cfg='cfg/eth_ucy/cor_fm.yml'):
     return default_cfg
 
 def euler_sample(denoiser, cfg, x_data, num_frames, device, seed):
-    K = int(cfg.denoising_head_preds)
-    S = int(cfg.sampling_steps)
+    K = int(getattr(cfg,'denoising_head_preds',20))
+    S = int(getattr(cfg,'sampling_steps',10))
     dt = 1.0/S
     torch.manual_seed(seed)
     if device.startswith("cuda"): torch.cuda.manual_seed_all(seed)
@@ -173,11 +185,26 @@ def euler_sample(denoiser, cfg, x_data, num_frames, device, seed):
         y_t = y_t + preds.pred_vel * dt
     return y_t
 
-def best_of_k(pred, gt, cfg):
-    pred_metric = rearrange(pred, "b k a (f d)->b k a f d", f=cfg.future_frames)[..., :2]
-    pred_metric = unnormalize_min_max(pred_metric, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1)
-    gt_metric = rearrange(gt, "b a (f d)->b a f d", f=cfg.future_frames)[..., :2]
-    gt_metric = unnormalize_min_max(gt_metric, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1)
+def best_of_k(pred, gt, cfg, ds=None):
+    fut_min = getattr(cfg,'fut_traj_min',None)
+    fut_max = getattr(cfg,'fut_traj_max',None)
+    if ds is not None:
+        fut_min = getattr(ds,'fut_traj_min',fut_min)
+        fut_max = getattr(ds,'fut_traj_max',fut_max)
+    past_min = getattr(cfg,'past_traj_min',None)
+    past_max = getattr(cfg,'past_traj_max',None)
+    if ds is not None:
+        past_min = getattr(ds,'past_traj_min',past_min)
+        past_max = getattr(ds,'past_traj_max',past_max)
+    if fut_min is None: fut_min = -1.0
+    if fut_max is None: fut_max = 1.0
+    if past_min is None: past_min = -1.0
+    if past_max is None: past_max = 1.0
+    future_frames = int(getattr(cfg,'future_frames',12))
+    pred_metric = rearrange(pred, "b k a (f d)->b k a f d", f=future_frames)[..., :2]
+    pred_metric = unnormalize_min_max(pred_metric, fut_min, fut_max, -1, 1)
+    gt_metric = rearrange(gt, "b a (f d)->b a f d", f=future_frames)[..., :2]
+    gt_metric = unnormalize_min_max(gt_metric, fut_min, fut_max, -1, 1)
     diff = pred_metric - gt_metric.unsqueeze(1)
     ade = torch.norm(diff, dim=-1).mean(dim=-1).mean(dim=-1)
     ade_min, best_idx = ade.min(dim=1)
@@ -226,7 +253,7 @@ def make_backbone(device='cpu'):
     ])
     return m.to(device), preprocess
 
-def gradcam_for_full(ckpt_path, cfg, batch, data_dir, subset, device, seed=42):
+def gradcam_for_full(ckpt_path, cfg, batch, data_dir, subset, device, seed=42, ds=None):
     model = ETHMotionTransformer(model_config=cfg.MODEL, logger=NullLogger(), config=cfg)
     denoiser = FlowMatcher(cfg, model, logger=NullLogger())
     denoiser = load_ckpt_flexible(ckpt_path, denoiser).to(device).eval()
@@ -241,11 +268,11 @@ def gradcam_for_full(ckpt_path, cfg, batch, data_dir, subset, device, seed=42):
         vis_dir = os.path.join(data_dir,subset,'visual_data')
         if not os.path.exists(vis_dir):
             vis_dir = os.path.join(_REPO_ROOT,'data','eth_ucy',subset,'visual_data')
-        cand = sorted([os.path.join(vis_dir,f) for f in os.listdir(vis_dir) if f.lower().endswith('.jpg')])[:cfg.past_frames]
-        if len(cand)<cfg.past_frames and cand: cand = cand*cfg.past_frames
+        cand = sorted([os.path.join(vis_dir,f) for f in os.listdir(vis_dir) if f.lower().endswith('.jpg')])[:getattr(cfg,'past_frames',8)]
+        if len(cand)<getattr(cfg,'past_frames',8) and cand: cand = cand*getattr(cfg,'past_frames',8)
         if not cand: raise FileNotFoundError(f'No frames in {vis_dir}')
         frames_t=[]
-        for fp in cand[:cfg.past_frames]:
+        for fp in cand[:getattr(cfg,'past_frames',8)]:
             pil = Image.open(fp).convert('RGB'); frames_t.append(preprocess(pil))
         frames_t = torch.stack(frames_t).to(device)
         
@@ -261,11 +288,13 @@ def gradcam_for_full(ckpt_path, cfg, batch, data_dir, subset, device, seed=42):
         x_data['z_video_global']=z_mean
         gt = batch['fut_traj_original_scale'].to(device).float()
         
-        pred = euler_sample(denoiser,cfg,x_data,cfg.future_frames,device,seed)
-        pred_m = rearrange(pred,'b k a (f d)->b k a f d',f=cfg.future_frames)[...,:2]
-        pred_m = unnormalize_min_max(pred_m,cfg.fut_traj_min,cfg.fut_traj_max,-1,1)
-        gt_m = rearrange(gt,'b a (f d)->b a f d',f=cfg.future_frames)[...,:2]
-        gt_m = unnormalize_min_max(gt_m,cfg.fut_traj_min,cfg.fut_traj_max,-1,1)
+        pred = euler_sample(denoiser,cfg,x_data,getattr(cfg,'future_frames',12),device,seed)
+        pred_m = rearrange(pred,'b k a (f d)->b k a f d',f=getattr(cfg,'future_frames',12))[...,:2]
+        fut_min = getattr(cfg,'fut_traj_min',getattr(ds,'fut_traj_min',-1.0) if ds else -1.0)
+        fut_max = getattr(cfg,'fut_traj_max',getattr(ds,'fut_traj_max',1.0) if ds else 1.0)
+        pred_m = unnormalize_min_max(pred_m,fut_min,fut_max,-1,1)
+        gt_m = rearrange(gt,'b a (f d)->b a f d',f=getattr(cfg,'future_frames',12))[...,:2]
+        gt_m = unnormalize_min_max(gt_m,fut_min,fut_max,-1,1)
         diff = pred_m - gt_m.unsqueeze(1)
         ade = torch.norm(diff,dim=-1).mean(-1).mean(-1)
         score = -ade.mean()
@@ -313,8 +342,9 @@ def main():
         cfg_ref = Config(args.cfg, f'viz_{scene}')
         cfg_ref.device = args.device
         try:
-            ds = ETHDataset(cfg=cfg_ref, training=False, data_dir=args.data_dir, subset=scene, rotate_time_frame=0, type='original', video_mode='full')
-            loader = DataLoader(ds,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
+            ds_ref = ETHDataset(cfg=cfg_ref, training=False, data_dir=args.data_dir, subset=scene, rotate_time_frame=0, type='original', video_mode='full')
+            copy_norm_stats(ds_ref, cfg_ref)
+            loader = DataLoader(ds_ref,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
             it=iter(loader)
             for i in range(args.batch_idx+1): batch=next(it)
         except Exception as e:
@@ -342,14 +372,19 @@ def main():
                 print(f'    overriding MODEL.AGENTS to {agents_ckpt} from checkpoint')
                 force_set_agents(cfg_m, agents_ckpt)
             try:
+                ds_m = ETHDataset(cfg=cfg_m, training=False, data_dir=args.data_dir, subset=scene, rotate_time_frame=0, type='original', video_mode=mode)
+                copy_norm_stats(ds_m, cfg_m)
+            except Exception as e:
+                print(f'    ds_m err: {e}')
+            try:
                 model = ETHMotionTransformer(model_config=cfg_m.MODEL, logger=NullLogger(), config=cfg_m)
                 denoiser = FlowMatcher(cfg_m, model, logger=NullLogger())
                 denoiser = load_ckpt_flexible(ckpt, denoiser).to(args.device).eval()
                 for p in denoiser.parameters(): p.requires_grad_(False)
                 x_data = {k:v.to(args.device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
                 gt = batch['fut_traj_original_scale'].to(args.device).float()
-                pred = euler_sample(denoiser,cfg_m,x_data,cfg_m.future_frames,args.device,1234)
-                _,best_idx,pred_m,gt_m = best_of_k(pred,gt,cfg_m)
+                pred = euler_sample(denoiser,cfg_m,x_data,getattr(cfg_m,'future_frames',12),args.device,1234)
+                _,best_idx,pred_m,gt_m = best_of_k(pred,gt,cfg_m,ds_m if 'ds_m' in locals() else ds_ref)
                 bi = int(best_idx[0])
                 preds_all[mode] = {'best': pred_m[0,bi].cpu().numpy(), 'all': pred_m[0].cpu().numpy(), 'gt': gt_m[0].cpu().numpy()}
                 del model,denoiser; torch.cuda.empty_cache(); gc.collect()
@@ -361,8 +396,10 @@ def main():
         obs_raw = batch.get('past_traj_original_scale')
         obs_m = None
         if obs_raw is not None:
-            obs_m = rearrange(obs_raw,'b a (t d)->b a t d',t=cfg_ref.past_frames)[...,:2]
-            obs_m = unnormalize_min_max(obs_m,cfg_ref.past_traj_min,cfg_ref.past_traj_max,-1,1).cpu().numpy()[0]
+            obs_m = rearrange(obs_raw,'b a (t d)->b a t d',t=getattr(cfg_ref,'past_frames',8))[...,:2]
+            past_min = getattr(cfg_ref,'past_traj_min',getattr(ds_ref,'past_traj_min',-1.0))
+            past_max = getattr(cfg_ref,'past_traj_max',getattr(ds_ref,'past_traj_max',1.0))
+            obs_m = unnormalize_min_max(obs_m,past_min,past_max,-1,1).cpu().numpy()[0]
         
         fig,(ax1,ax2)=plt.subplots(1,2,figsize=(20,9))
         fig.suptitle(f'{scene.upper()} - ETH/UCY Trajectory Comparison (Best-of-K)',fontsize=16,fontweight='bold')
@@ -415,7 +452,12 @@ def main():
                 agents_ckpt_f = infer_agents_from_ckpt(ckpt_f)
                 if agents_ckpt_f is not None:
                     force_set_agents(cfg_f, agents_ckpt_f)
-                cam,cand_fp = gradcam_for_full(ckpt_f,cfg_f,batch,args.data_dir,scene,args.device,1234)
+                try:
+                    ds_f = ETHDataset(cfg=cfg_f, training=False, data_dir=args.data_dir, subset=scene, rotate_time_frame=0, type='original', video_mode='full')
+                    copy_norm_stats(ds_f, cfg_f)
+                except Exception:
+                    ds_f = ds_ref
+                cam,cand_fp = gradcam_for_full(ckpt_f,cfg_f,batch,args.data_dir,scene,args.device,1234,ds_f)
                 frm = load_img(cand_fp)
                 if frm is not None and len(cam)>0:
                     fig,axes=plt.subplots(2,4,figsize=(20,10))
