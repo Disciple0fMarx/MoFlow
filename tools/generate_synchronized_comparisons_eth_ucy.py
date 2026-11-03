@@ -160,16 +160,11 @@ def world_to_pix_native(ds, pts, scene=None):
     try:
         pts_arr = np.asarray(pts, dtype=float)
         if pts_arr.size == 0: return pts_arr
-        orig = pts_arr.shape
-        p = pts_arr.reshape(-1, 2)
-        out = []
-        for pt in p:
-            res = ds.world_to_pixel(torch.tensor(pt, dtype=torch.float32).reshape(1,2), scene=scene)
-            if isinstance(res, torch.Tensor): res = res.detach().cpu().numpy()
-            r = np.array(res).reshape(-1,2)
-            if r.size == 0: out.append([np.nan,np.nan])
-            else: out.append(r[0])
-        return np.array(out).reshape(orig[:-1]+(2,))
+        pts_t = torch.tensor(pts_arr, dtype=torch.float32)
+        res = ds.world_to_pixel(pts_t, scene=scene)
+        if isinstance(res, torch.Tensor): 
+            res = res.detach().cpu().numpy()
+        return res
     except Exception as e:
         print(f'[viz] world_to_pixel failed: {e}')
         return None
