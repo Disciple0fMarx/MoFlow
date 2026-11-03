@@ -201,14 +201,41 @@ def best_of_k(pred, gt, cfg, ds=None):
     if past_min is None: past_min = -1.0
     if past_max is None: past_max = 1.0
     future_frames = int(getattr(cfg,'future_frames',12))
-    pred_metric = rearrange(pred, "b k a (f d)->b k a f d", f=future_frames)[..., :2]
-    pred_metric = unnormalize_min_max(pred_metric, fut_min, fut_max, -1, 1)
-    gt_metric = rearrange(gt, "b a (f d)->b a f d", f=future_frames)[..., :2]
-    gt_metric = unnormalize_min_max(gt_metric, fut_min, fut_max, -1, 1)
-    diff = pred_metric - gt_metric.unsqueeze(1)
-    ade = torch.norm(diff, dim=-1).mean(dim=-1).mean(dim=-1)
-    ade_min, best_idx = ade.min(dim=1)
-    return ade_min, best_idx, pred_metric, gt_metric
+    
+    # Normalize gt
+    if isinstance(gt, torch.Tensor):
+        if gt.dim() == 4:
+            # [B, A, F, D] -> take first agent
+            gt_m = gt[0,0,...]
+        elif gt.dim() == 3:
+            gt_m = gt[0,0,...] if gt.shape[1] > 1 else gt[0,...]
+        else:
+            gt_m = gt
+        gt_m = gt_m[..., :2]
+        gt_m = unnormalize_min_max(gt_m.unsqueeze(0).unsqueeze(0), fut_min, fut_max, -1, 1)[0,0]
+    else:
+        gt_m = gt
+    
+    # Normalize pred
+    if isinstance(pred, torch.Tensor):
+        if pred.dim() == 4 and pred.shape[1] == 1 and pred.shape[2] == 1 and pred.shape[3] == future_frames*2:
+            # rare case
+            pred_r = pred
+        elif pred.dim() == 4 and pred.shape[-1] == future_frames*2:
+            # [B, K, A, F*2]
+            pred_r = rearrange(pred, "b k a (f d) -> b k a f d", f=future_frames)[..., :2]
+        elif pred.dim() == 3 and pred.shape[-1] == future_frames*2:
+            pred_r = rearrange(pred, "b k (f d) -> b k f d", f=future_frames)[..., :2]
+        else:
+            pred_r = pred
+        pred_r = unnormalize_min_max(pred_r, fut_min, fut_max, -1, 1)
+        diff = pred_r[0] - gt_m.unsqueeze(0).unsqueeze(0)
+        ade = torch.norm(diff, dim=-1).mean(dim=-1)
+        if ade.dim() == 2: ade = ade.mean(dim=1)
+        ade_min, best_idx = ade.min(dim=0)
+        return ade_min, int(best_idx.item()), pred_r[0], gt_m.unsqueeze(0)
+    else:
+        return None, 0, pred, gt_m
 
 def load_h(H_path):
     if not os.path.exists(H_path): return None
@@ -289,12 +316,18 @@ def gradcam_for_full(ckpt_path, cfg, batch, data_dir, subset, device, seed=42, d
         gt = batch['fut_traj_original_scale'].to(device).float()
         
         pred = euler_sample(denoiser,cfg,x_data,getattr(cfg,'future_frames',12),device,seed)
-        pred_m = rearrange(pred,'b k a (f d)->b k a f d',f=getattr(cfg,'future_frames',12))[...,:2]
+        future_frames = getattr(cfg,'future_frames',12)
+        if pred.dim() == 4 and pred.shape[-1] == future_frames*2:
+            pred_m = rearrange(pred,'b k a (f d)->b k a f d',f=future_frames)[...,:2]
+        else:
+            pred_m = pred
         fut_min = getattr(cfg,'fut_traj_min',getattr(ds,'fut_traj_min',-1.0) if ds else -1.0)
         fut_max = getattr(cfg,'fut_traj_max',getattr(ds,'fut_traj_max',1.0) if ds else 1.0)
         pred_m = unnormalize_min_max(pred_m,fut_min,fut_max,-1,1)
-        gt_m = rearrange(gt,'b a (f d)->b a f d',f=getattr(cfg,'future_frames',12))[...,:2]
-        gt_m = unnormalize_min_max(gt_m,fut_min,fut_max,-1,1)
+        if gt.dim() == 4: gt_m = gt[0,0,...].unsqueeze(0).unsqueeze(0)
+        elif gt.dim() == 3: gt_m = gt[0,...].unsqueeze(0).unsqueeze(0)
+        else: gt_m = gt
+        gt_m = unnormalize_min_max(gt_m[...,:2],fut_min,fut_max,-1,1)
         diff = pred_m - gt_m.unsqueeze(1)
         ade = torch.norm(diff,dim=-1).mean(-1).mean(-1)
         score = -ade.mean()
@@ -385,8 +418,9 @@ def main():
                 gt = batch['fut_traj_original_scale'].to(args.device).float()
                 pred = euler_sample(denoiser,cfg_m,x_data,getattr(cfg_m,'future_frames',12),args.device,1234)
                 _,best_idx,pred_m,gt_m = best_of_k(pred,gt,cfg_m,ds_m if 'ds_m' in locals() else ds_ref)
-                bi = int(best_idx[0])
-                preds_all[mode] = {'best': pred_m[0,bi].cpu().numpy(), 'all': pred_m[0].cpu().numpy(), 'gt': gt_m[0].cpu().numpy()}
+                if pred_m is None or gt_m is None: continue
+                bi = int(best_idx)
+                preds_all[mode] = {'best': pred_m[bi].cpu().numpy() if hasattr(pred_m[bi],'cpu') else np.array(pred_m[bi]), 'all': pred_m.cpu().numpy() if hasattr(pred_m,'cpu') else pred_m, 'gt': gt_m[0].cpu().numpy() if hasattr(gt_m[0],'cpu') else np.array(gt_m[0])}
                 del model,denoiser; torch.cuda.empty_cache(); gc.collect()
             except Exception as e:
                 print(f'  [{mode}] err: {e}')
@@ -409,8 +443,8 @@ def main():
             else: ax.grid(True,ls='--',alpha=0.5)
             ax.axis('off')
         ax=ax1
-        if bg is not None and H is not None and obs_m is not None:
-            obsp = world_to_pix(H, obs_m[0]); gtp = world_to_pix(H,preds_all['full']['gt'][0]) if 'full' in preds_all else None
+        if bg is not None and H is not None and obs_m is not None and 'full' in preds_all:
+            obsp = world_to_pix(H, obs_m[0]); gtp = world_to_pix(H,preds_all['full']['gt'][0])
             if obsp is not None: ax.plot(obsp[:,0],obsp[:,1],'--',color='black',lw=2,label='History'); ax.scatter(obsp[-1,0],obsp[-1,1],c='black',s=60)
             if gtp is not None: ax.plot(gtp[:,0],gtp[:,1],'-',color='green',lw=2,label='GT'); ax.scatter(gtp[-1,0],gtp[-1,1],c='green',s=60)
             for mode,col in [('off','blue'),('static','orange'),('full','red')]:
