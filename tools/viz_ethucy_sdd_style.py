@@ -55,6 +55,34 @@ class NullLogger:
     def info(self, *a, **k): pass
     def warning(self, *a, **k): pass
 
+def to_numpy(x):
+    if isinstance(x, torch.Tensor): return x.detach().cpu().numpy()
+    return np.array(x)
+
+def extract_traj_xy(t, past_frames=None, future_frames=None):
+    """Robustly extract [T, 2] or [A, T, 2] from various shapes."""
+    if t is None: return None
+    if isinstance(t, torch.Tensor): t = t.detach().cpu()
+    t = np.array(t)
+    # [B, A, T, D]
+    if t.ndim == 4:
+        if t.shape[-1] >= 2:
+            return t[..., :2]
+        # maybe flattened
+    if t.ndim == 3:
+        if t.shape[-1] >= 2:
+            return t[..., :2]
+        # try to infer
+        if past_frames and future_frames and t.shape[-1] == (past_frames + future_frames)*2:
+            return t.reshape(t.shape[0], past_frames+future_frames, 2)[..., :2]
+    if t.ndim == 2:
+        if t.shape[-1] >= 2:
+            # maybe [T, D] or [A, D]
+            if t.shape[-1] % 2 == 0 and past_frames and t.shape[-1]//2 == past_frames:
+                return t.reshape(t.shape[0], past_frames, 2)[..., :2]
+            return t.reshape(-1, t.shape[-1])[..., :2]
+    return None
+
 def infer_agents_from_ckpt(ckpt_path):
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -191,51 +219,55 @@ def best_of_k(pred, gt, cfg, ds=None):
     if ds is not None:
         fut_min = getattr(ds,'fut_traj_min',fut_min)
         fut_max = getattr(ds,'fut_traj_max',fut_max)
-    past_min = getattr(cfg,'past_traj_min',None)
-    past_max = getattr(cfg,'past_traj_max',None)
-    if ds is not None:
-        past_min = getattr(ds,'past_traj_min',past_min)
-        past_max = getattr(ds,'past_traj_max',past_max)
     if fut_min is None: fut_min = -1.0
     if fut_max is None: fut_max = 1.0
-    if past_min is None: past_min = -1.0
-    if past_max is None: past_max = 1.0
     future_frames = int(getattr(cfg,'future_frames',12))
     
-    # Normalize gt
+    # gt
     if isinstance(gt, torch.Tensor):
         if gt.dim() == 4:
-            # [B, A, F, D] -> take first agent
             gt_m = gt[0,0,...]
         elif gt.dim() == 3:
-            gt_m = gt[0,0,...] if gt.shape[1] > 1 else gt[0,...]
+            gt_m = gt[0,...]
+            if gt_m.dim()==2 and gt_m.shape[0]>future_frames and gt_m.shape[0]<100:
+                gt_m = gt_m[:future_frames]
+            elif gt_m.dim()==2 and gt_m.shape[1]==future_frames*2:
+                gt_m = gt_m.reshape(future_frames,2)
+            elif gt_m.dim()==3:
+                gt_m = gt_m[0]
         else:
             gt_m = gt
-        gt_m = gt_m[..., :2]
-        gt_m = unnormalize_min_max(gt_m.unsqueeze(0).unsqueeze(0), fut_min, fut_max, -1, 1)[0,0]
     else:
-        gt_m = gt
+        gt_m = np.array(gt)
+        if gt_m.ndim==4: gt_m = gt_m[0,0]
+        elif gt_m.ndim==3: gt_m = gt_m[0,0] if gt_m.shape[0]==1 else gt_m[0]
+    gt_m_t = torch.tensor(gt_m).float()
+    if gt_m_t.dim()==2 and gt_m_t.shape[1]==2:
+        gt_m_t = gt_m_t.unsqueeze(0).unsqueeze(0)
+    elif gt_m_t.dim()==2 and gt_m_t.shape[1]==future_frames*2:
+        gt_m_t = rearrange(gt_m_t.unsqueeze(0),'b a (f d)->b a f d',f=future_frames)[...,:2]
+    gt_m_u = unnormalize_min_max(gt_m_t[...,:2], fut_min, fut_max, -1, 1)[0,0]
     
-    # Normalize pred
+    # pred
     if isinstance(pred, torch.Tensor):
-        if pred.dim() == 4 and pred.shape[1] == 1 and pred.shape[2] == 1 and pred.shape[3] == future_frames*2:
-            # rare case
+        if pred.dim()==4 and pred.shape[-1]==future_frames*2:
+            pred_r = rearrange(pred,'b k a (f d)->b k a f d',f=future_frames)[...,:2]
+        elif pred.dim()==3 and pred.shape[-1]==future_frames*2:
+            pred_r = rearrange(pred,'b k (f d)->b k f d',f=future_frames)[...,:2].unsqueeze(2)
+        elif pred.dim()==4 and pred.shape[-1]==2:
             pred_r = pred
-        elif pred.dim() == 4 and pred.shape[-1] == future_frames*2:
-            # [B, K, A, F*2]
-            pred_r = rearrange(pred, "b k a (f d) -> b k a f d", f=future_frames)[..., :2]
-        elif pred.dim() == 3 and pred.shape[-1] == future_frames*2:
-            pred_r = rearrange(pred, "b k (f d) -> b k f d", f=future_frames)[..., :2]
         else:
             pred_r = pred
-        pred_r = unnormalize_min_max(pred_r, fut_min, fut_max, -1, 1)
-        diff = pred_r[0] - gt_m.unsqueeze(0).unsqueeze(0)
-        ade = torch.norm(diff, dim=-1).mean(dim=-1)
-        if ade.dim() == 2: ade = ade.mean(dim=1)
-        ade_min, best_idx = ade.min(dim=0)
-        return ade_min, int(best_idx.item()), pred_r[0], gt_m.unsqueeze(0)
     else:
-        return None, 0, pred, gt_m
+        pred_r = torch.tensor(np.array(pred)).float()
+        if pred_r.dim()==4 and pred_r.shape[-1]==future_frames*2:
+            pred_r = rearrange(pred_r,'b k a (f d)->b k a f d',f=future_frames)[...,:2]
+    pred_r = unnormalize_min_max(pred_r, fut_min, fut_max, -1, 1)
+    diff = pred_r[0] - gt_m_u.unsqueeze(0).unsqueeze(0)
+    ade = torch.norm(diff, dim=-1).mean(dim=-1)
+    if ade.dim()==2: ade = ade.mean(dim=1)
+    ade_min, best_idx = ade.min(dim=0)
+    return ade_min, int(best_idx.item()), pred_r[0], gt_m_u.unsqueeze(0).unsqueeze(0)
 
 def load_h(H_path):
     if not os.path.exists(H_path): return None
@@ -247,7 +279,12 @@ def world_to_pix(H, pts):
     pts = np.asarray(pts).reshape(-1,2)
     ph = np.c_[pts, np.ones((len(pts),1))] @ H.T
     w = ph[:,2:3]; w[np.abs(w)<1e-12]=np.nan
-    return (ph[:,:2]/w).reshape(np.asarray(pts).shape[:-1]+(2,))
+    out = (ph[:,:2]/w)
+    # reshape back
+    try:
+        return out.reshape(np.asarray(pts).shape[:-1]+(2,))
+    except:
+        return out
 
 def find_ref_img(data_dir, subset):
     for base in [os.path.join(data_dir,subset,'visual_data'), os.path.join(_REPO_ROOT,'data','eth_ucy',subset,'visual_data')]:
@@ -319,15 +356,17 @@ def gradcam_for_full(ckpt_path, cfg, batch, data_dir, subset, device, seed=42, d
         future_frames = getattr(cfg,'future_frames',12)
         if pred.dim() == 4 and pred.shape[-1] == future_frames*2:
             pred_m = rearrange(pred,'b k a (f d)->b k a f d',f=future_frames)[...,:2]
+        elif pred.dim()==3 and pred.shape[-1]==future_frames*2:
+            pred_m = rearrange(pred,'b k (f d)->b k f d',f=future_frames)[...,:2].unsqueeze(2)
         else:
             pred_m = pred
         fut_min = getattr(cfg,'fut_traj_min',getattr(ds,'fut_traj_min',-1.0) if ds else -1.0)
         fut_max = getattr(cfg,'fut_traj_max',getattr(ds,'fut_traj_max',1.0) if ds else 1.0)
         pred_m = unnormalize_min_max(pred_m,fut_min,fut_max,-1,1)
-        if gt.dim() == 4: gt_m = gt[0,0,...].unsqueeze(0).unsqueeze(0)
-        elif gt.dim() == 3: gt_m = gt[0,...].unsqueeze(0).unsqueeze(0)
+        if gt.dim()==4: gt_m = gt[0,0,...][:future_frames,:2].unsqueeze(0).unsqueeze(0)
+        elif gt.dim()==3: gt_m = gt[0,...][:future_frames,:2].unsqueeze(0).unsqueeze(0)
         else: gt_m = gt
-        gt_m = unnormalize_min_max(gt_m[...,:2],fut_min,fut_max,-1,1)
+        gt_m = unnormalize_min_max(gt_m,fut_min,fut_max,-1,1)
         diff = pred_m - gt_m.unsqueeze(1)
         ade = torch.norm(diff,dim=-1).mean(-1).mean(-1)
         score = -ade.mean()
@@ -409,6 +448,7 @@ def main():
                 copy_norm_stats(ds_m, cfg_m)
             except Exception as e:
                 print(f'    ds_m err: {e}')
+                ds_m = ds_ref
             try:
                 model = ETHMotionTransformer(model_config=cfg_m.MODEL, logger=NullLogger(), config=cfg_m)
                 denoiser = FlowMatcher(cfg_m, model, logger=NullLogger())
@@ -417,10 +457,14 @@ def main():
                 x_data = {k:v.to(args.device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
                 gt = batch['fut_traj_original_scale'].to(args.device).float()
                 pred = euler_sample(denoiser,cfg_m,x_data,getattr(cfg_m,'future_frames',12),args.device,1234)
-                _,best_idx,pred_m,gt_m = best_of_k(pred,gt,cfg_m,ds_m if 'ds_m' in locals() else ds_ref)
-                if pred_m is None or gt_m is None: continue
+                _,best_idx,pred_m,gt_m = best_of_k(pred,gt,cfg_m,ds_m)
+                if pred_m is None or gt_m is None: 
+                    print(f'    skipped {mode} due to shape'); continue
                 bi = int(best_idx)
-                preds_all[mode] = {'best': pred_m[bi].cpu().numpy() if hasattr(pred_m[bi],'cpu') else np.array(pred_m[bi]), 'all': pred_m.cpu().numpy() if hasattr(pred_m,'cpu') else pred_m, 'gt': gt_m[0].cpu().numpy() if hasattr(gt_m[0],'cpu') else np.array(gt_m[0])}
+                try:
+                    preds_all[mode] = {'best': pred_m[bi].detach().cpu().numpy(), 'gt': gt_m[0,0].detach().cpu().numpy()}
+                except:
+                    preds_all[mode] = {'best': np.array(pred_m)[bi], 'gt': np.array(gt_m).reshape(-1,2)}
                 del model,denoiser; torch.cuda.empty_cache(); gc.collect()
             except Exception as e:
                 print(f'  [{mode}] err: {e}')
@@ -430,10 +474,14 @@ def main():
         obs_raw = batch.get('past_traj_original_scale')
         obs_m = None
         if obs_raw is not None:
-            obs_m = rearrange(obs_raw,'b a (t d)->b a t d',t=getattr(cfg_ref,'past_frames',8))[...,:2]
-            past_min = getattr(cfg_ref,'past_traj_min',getattr(ds_ref,'past_traj_min',-1.0))
-            past_max = getattr(cfg_ref,'past_traj_max',getattr(ds_ref,'past_traj_max',1.0))
-            obs_m = unnormalize_min_max(obs_m,past_min,past_max,-1,1).cpu().numpy()[0]
+            obs_xy = extract_traj_xy(obs_raw, getattr(cfg_ref,'past_frames',8))
+            if obs_xy is not None:
+                if obs_xy.ndim==4: obs_xy = obs_xy[0]
+                if obs_xy.ndim==3: obs_xy = obs_xy[0]
+                past_min = getattr(cfg_ref,'past_traj_min',getattr(ds_ref,'past_traj_min',-1.0))
+                past_max = getattr(cfg_ref,'past_traj_max',getattr(ds_ref,'past_traj_max',1.0))
+                obs_m_t = unnormalize_min_max(torch.tensor(obs_xy).float().unsqueeze(0).unsqueeze(0), past_min, past_max, -1, 1)[0,0].numpy()
+                obs_m = obs_m_t
         
         fig,(ax1,ax2)=plt.subplots(1,2,figsize=(20,9))
         fig.suptitle(f'{scene.upper()} - ETH/UCY Trajectory Comparison (Best-of-K)',fontsize=16,fontweight='bold')
@@ -443,28 +491,49 @@ def main():
             else: ax.grid(True,ls='--',alpha=0.5)
             ax.axis('off')
         ax=ax1
-        if bg is not None and H is not None and obs_m is not None and 'full' in preds_all:
-            obsp = world_to_pix(H, obs_m[0]); gtp = world_to_pix(H,preds_all['full']['gt'][0])
-            if obsp is not None: ax.plot(obsp[:,0],obsp[:,1],'--',color='black',lw=2,label='History'); ax.scatter(obsp[-1,0],obsp[-1,1],c='black',s=60)
-            if gtp is not None: ax.plot(gtp[:,0],gtp[:,1],'-',color='green',lw=2,label='GT'); ax.scatter(gtp[-1,0],gtp[-1,1],c='green',s=60)
+        if bg is not None and H is not None and obs_m is not None and len(obs_m)>0 and 'full' in preds_all:
+            try:
+                obsp = world_to_pix(H, obs_m)
+                if obsp is not None and obsp.ndim==2:
+                    ax.plot(obsp[:,0],obsp[:,1],'--',color='black',lw=2,label='History'); ax.scatter(obsp[-1,0],obsp[-1,1],c='black',s=60)
+                gtp = world_to_pix(H,preds_all['full']['gt'])
+                if gtp is not None:
+                    gtp2 = gtp.reshape(-1,2)
+                    ax.plot(gtp2[:,0],gtp2[:,1],'-',color='green',lw=2,label='GT'); ax.scatter(gtp2[-1,0],gtp2[-1,1],c='green',s=60)
+                for mode,col in [('off','blue'),('static','orange'),('full','red')]:
+                    if mode in preds_all:
+                        bp = world_to_pix(H,preds_all[mode]['best'])
+                        if bp is not None:
+                            bp2 = bp.reshape(-1,2)
+                            ax.plot(bp2[:,0],bp2[:,1],'-',color=col,lw=2.5,label=f'Best-of-K {mode}')
+                ax.set_title('Pixel Space (projected via H.txt)',fontsize=14)
+            except Exception as e:
+                print(e)
+        else:
+            if obs_m is not None and len(obs_m)>0:
+                om = np.array(obs_m).reshape(-1,2)
+                ax.plot(om[:,0],om[:,1],'--',lw=2,label='History')
+            if 'full' in preds_all:
+                gt2 = np.array(preds_all['full']['gt']).reshape(-1,2)
+                ax.plot(gt2[:,0],gt2[:,1],'-',color='green',lw=2,label='GT')
             for mode,col in [('off','blue'),('static','orange'),('full','red')]:
                 if mode in preds_all:
-                    bp = world_to_pix(H,preds_all[mode]['best'][0])
-                    if bp is not None: ax.plot(bp[:,0],bp[:,1],'-',color=col,lw=2.5,label=f'Best-of-K {mode}')
-            ax.set_title('Pixel Space (projected via H.txt)',fontsize=14)
-        else:
-            if obs_m is not None: ax.plot(obs_m[0,:,0],obs_m[0,:,1],'--',lw=2,label='History')
-            if 'full' in preds_all: ax.plot(preds_all['full']['gt'][0,:,0],preds_all['full']['gt'][0,:,1],'-',color='green',lw=2,label='GT')
-            for mode,col in [('off','blue'),('static','orange'),('full','red')]:
-                if mode in preds_all: ax.plot(preds_all[mode]['best'][0,:,0],preds_all[mode]['best'][0,:,1],'-',color=col,lw=2.5,label=f'Best-of-K {mode}')
+                    bp2 = np.array(preds_all[mode]['best']).reshape(-1,2)
+                    ax.plot(bp2[:,0],bp2[:,1],'-',color=col,lw=2.5,label=f'Best-of-K {mode}')
             ax.set_title('World Coordinates',fontsize=14)
         ax.legend(loc='best',framealpha=0.9)
         
         ax=ax2
-        if obs_m is not None: ax.plot(obs_m[0,:,0],obs_m[0,:,1],'--',lw=2,label='History')
-        if 'full' in preds_all: ax.plot(preds_all['full']['gt'][0,:,0],preds_all['full']['gt'][0,:,1],'-',color='green',lw=2,label='GT')
+        if obs_m is not None and len(obs_m)>0:
+            om = np.array(obs_m).reshape(-1,2)
+            ax.plot(om[:,0],om[:,1],'--',lw=2,label='History')
+        if 'full' in preds_all:
+            gt2 = np.array(preds_all['full']['gt']).reshape(-1,2)
+            ax.plot(gt2[:,0],gt2[:,1],'-',color='green',lw=2,label='GT')
         for mode,col in [('off','blue'),('static','orange'),('full','red')]:
-            if mode in preds_all: ax.plot(preds_all[mode]['best'][0,:,0],preds_all[mode]['best'][0,:,1],'-',color=col,lw=2.5,label=f'Best-of-K {mode}')
+            if mode in preds_all:
+                bp2 = np.array(preds_all[mode]['best']).reshape(-1,2)
+                ax.plot(bp2[:,0],bp2[:,1],'-',color=col,lw=2.5,label=f'Best-of-K {mode}')
         ax.set_title('World Coordinates (meters)',fontsize=14)
         ax.grid(True,ls='--',alpha=0.5)
         ax.axis('equal')
