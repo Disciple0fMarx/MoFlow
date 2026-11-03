@@ -5,6 +5,7 @@ Direct ETH/UCY equivalent of tools/generate_synchronized_comparisons.py.
 """
 from __future__ import annotations
 
+from einops import rearrange
 import argparse
 import gc
 import json
