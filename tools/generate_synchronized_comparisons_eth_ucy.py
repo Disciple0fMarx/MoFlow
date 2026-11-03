@@ -50,7 +50,6 @@ from models.backbone_eth_ucy import ETHMotionTransformer
 from models.flow_matching import FlowMatcher
 from utils.normalization import unnormalize_min_max
 from utils.config import Config
-from tools.gradcam_eth import GradCAM
 
 SCENES = ("eth", "hotel", "univ", "zara1", "zara2")
 VARIANTS = ("off", "static", "full")
