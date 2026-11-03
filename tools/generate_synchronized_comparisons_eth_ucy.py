@@ -286,7 +286,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             gt=batch['fut_traj_original_scale'].to(device).float()
             pred=euler_sample(denoiser,cfg_m,x_data,getattr(cfg_m,'future_frames',12),device,args.seed)
             ade_min,bi,pred_m,gt_m=best_of_k_eth(pred,gt,cfg_m,ds_m)
-            bundles[mode]={'preds':to_numpy(pred_m),'best':to_numpy(pred_m[bi]),'gt':to_numpy(gt_m[0,0] if gt_m.ndim==4 else 0]),'ade':float(ade_min)}
+            bundles[mode]={'preds':to_numpy(pred_m),'best':to_numpy(pred_m[bi]),'gt':to_numpy(gt_m[0,0] if gt_m.ndim==4 else (gt_m[0] if gt_m.ndim==3 else gt_m)),'ade':float(ade_min)}
             del model,denoiser; torch.cuda.empty_cache(); gc.collect()
         except Exception as e: print(f'  {mode} err: {e}')
     if not bundles: return
