@@ -79,6 +79,33 @@ def infer_agents_from_ckpt(ckpt_path):
         pass
     return None
 
+def force_set_agents(cfg_m, agents):
+    # Try multiple paths
+    try:
+        cfg_m.MODEL.CONTEXT_ENCODER.AGENTS = agents
+    except Exception:
+        pass
+    try:
+        cfg_m.MODEL.AGENTS = agents
+    except Exception:
+        pass
+    try:
+        cfg_m.AGENTS = agents
+    except Exception:
+        pass
+    # Also try nested dict
+    try:
+        if hasattr(cfg_m, 'yml_dict'):
+            yd = cfg_m.yml_dict
+            # MODEL.CONTEXT_ENCODER.AGENTS
+            if 'MODEL' in yd and isinstance(yd['MODEL'], dict):
+                if 'CONTEXT_ENCODER' in yd['MODEL'] and isinstance(yd['MODEL']['CONTEXT_ENCODER'], dict):
+                    yd['MODEL']['CONTEXT_ENCODER']['AGENTS'] = agents
+                yd['MODEL']['AGENTS'] = agents
+            yd['AGENTS'] = agents
+    except Exception:
+        pass
+
 def load_ckpt_flexible(ckpt_path, model):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = None
@@ -310,15 +337,10 @@ def main():
                 cfg_m.MODEL.CONTEXT_ENCODER.VIDEO_MODE = mode
                 cfg_m.MODEL.CONTEXT_ENCODER.USE_VIDEO = mode != 'off'
             except: pass
-            # Override AGENTS from checkpoint to avoid shape mismatch
             agents_ckpt = infer_agents_from_ckpt(ckpt)
             if agents_ckpt is not None:
-                try:
-                    if getattr(cfg_m.MODEL, 'AGENTS', None) != agents_ckpt:
-                        print(f'    overriding MODEL.AGENTS {getattr(cfg_m.MODEL,"AGENTS")} -> {agents_ckpt}')
-                        cfg_m.MODEL.AGENTS = agents_ckpt
-                except Exception as e:
-                    print(f'    agents override err: {e}')
+                print(f'    overriding MODEL.AGENTS to {agents_ckpt} from checkpoint')
+                force_set_agents(cfg_m, agents_ckpt)
             try:
                 model = ETHMotionTransformer(model_config=cfg_m.MODEL, logger=NullLogger(), config=cfg_m)
                 denoiser = FlowMatcher(cfg_m, model, logger=NullLogger())
@@ -392,8 +414,7 @@ def main():
                 except: pass
                 agents_ckpt_f = infer_agents_from_ckpt(ckpt_f)
                 if agents_ckpt_f is not None:
-                    try: cfg_f.MODEL.AGENTS = agents_ckpt_f
-                    except: pass
+                    force_set_agents(cfg_f, agents_ckpt_f)
                 cam,cand_fp = gradcam_for_full(ckpt_f,cfg_f,batch,args.data_dir,scene,args.device,1234)
                 frm = load_img(cand_fp)
                 if frm is not None and len(cam)>0:
