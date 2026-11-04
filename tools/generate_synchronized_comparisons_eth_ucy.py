@@ -225,7 +225,7 @@ def euler_sample(denoiser,cfg,x_data,num_frames,device,seed):
         y_t=y_t+preds.pred_vel*dt
     return y_t
 
-def best_of_k_eth(pred,gt,cfg,ds=None):
+def best_of_k_eth(pred,gt,cfg,ds=None,init_pos=None):
     fut_min=getattr(cfg,'fut_traj_min',getattr(ds,'fut_traj_min',-1.0) if ds else -1.0)
     fut_max=getattr(cfg,'fut_traj_max',getattr(ds,'fut_traj_max',1.0) if ds else 1.0)
     future_frames=int(getattr(cfg,'future_frames',12))
@@ -242,6 +242,15 @@ def best_of_k_eth(pred,gt,cfg,ds=None):
         pred_r=rearrange(torch.tensor(pred_arr).float(),'b k (f d)->b k f d',f=future_frames)[...,:2].unsqueeze(2)
     else: pred_r=torch.tensor(pred_arr).float()
     pred_r=unnormalize_min_max(pred_r,fut_min,fut_max,-1,1)
+    # Convert relative to absolute if init_pos provided
+    if init_pos is not None:
+        init_t = torch.tensor(np.asarray(init_pos), dtype=torch.float32)
+        if init_t.ndim == 1:
+            init_t = init_t.reshape(1,1,2)
+        elif init_t.ndim == 2:
+            init_t = init_t.reshape(1,1,1,2)
+        gt_t = gt_t + init_t
+        pred_r = pred_r + init_t
     diff=pred_r[0]-gt_t.unsqueeze(0).unsqueeze(0); ade=torch.norm(diff,-1).mean(-1)
     if ade.dim()==2: ade=ade.mean(1)
     ade_min,bi=ade.min(0); return ade_min,int(bi.item()),pred_r[0],gt_t.unsqueeze(0).unsqueeze(0)
@@ -294,7 +303,16 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             x_data={k:v.to(device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
             gt=batch['fut_traj_original_scale'].to(device).float()
             pred=euler_sample(denoiser,cfg_m,x_data,getattr(cfg_m,'future_frames',12),device,args.seed)
-            ade_min,bi,pred_m,gt_m=best_of_k_eth(pred,gt,cfg_m,ds_m)
+            # get init pos
+            init_pos=None
+            try:
+                po_b = batch.get('past_traj_original_scale')
+                if po_b is not None:
+                    po_n = to_numpy(po_b)
+                    if po_n.ndim==4: init_pos = po_n[0,0,-1,:2]
+                    elif po_n.ndim==3: init_pos = po_n[0,-1,:2]
+            except: pass
+            ade_min,bi,pred_m,gt_m=best_of_k_eth(pred,gt,cfg_m,ds_m,init_pos=init_pos)
             bundles[mode]={'preds':to_numpy(pred_m),'best':to_numpy(pred_m[bi]),'gt':to_numpy(gt_m[0,0] if gt_m.ndim==4 else (gt_m[0] if gt_m.ndim==3 else gt_m)),'ade':float(ade_min)}
             del model,denoiser; torch.cuda.empty_cache(); gc.collect()
         except Exception as e: print(f'  {mode} err: {e}')
@@ -305,6 +323,11 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
     elif obs_xy.ndim==3: obs_xy=obs_xy[0]
     past_min=getattr(cfg_ref,'past_traj_min',getattr(ds_ref,'past_traj_min',-1.0)); past_max=getattr(cfg_ref,'past_traj_max',getattr(ds_ref,'past_traj_max',1.0))
     obs_xy=unnormalize_min_max(torch.tensor(obs_xy).float().unsqueeze(0).unsqueeze(0),past_min,past_max,-1,1)[0,0].numpy()
+    # obs is absolute; ensure we use absolute coords consistently
+    try:
+        # if somehow relative, add last? but original_scale is absolute in ETH loader
+        pass
+    except: pass
     bundles_list=bundles
     # attach obs to all
     for k in bundles_list: bundles_list[k]['obs']=obs_xy
