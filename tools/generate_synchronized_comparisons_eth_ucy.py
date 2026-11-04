@@ -44,6 +44,7 @@ import numpy as np
 import torch
 import cv2
 from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 from torch.utils.data import DataLoader
 
 from data.dataloader_eth_ucy import ETHDataset, seq_collate_eth
@@ -300,6 +301,43 @@ def _draw_bundle_eth(ax,bundle,background,extent,ds_ref,scene,xlim,ylim):
     if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
     ax.set_xlim(*xlim); ax.set_ylim(*ylim)
 
+def _draw_agent_crops(ax, agent_crops, scene_name=None):
+    """Render agent-centric crops in a corner inset if available."""
+    try:
+        if agent_crops is None:
+            return
+        ac = agent_crops
+        if isinstance(ac, torch.Tensor):
+            ac = ac.detach().cpu()
+        ac_np = np.asarray(ac)
+        if ac_np.size == 0:
+            return
+        # Expected shapes: [B,A,P,3,h,w] or [A,P,3,h,w]
+        if ac_np.ndim == 6:
+            crop = ac_np[0, 0, -1]  # first batch, first agent, last observed frame
+        elif ac_np.ndim == 5:
+            crop = ac_np[0, -1]
+        elif ac_np.ndim == 4:
+            crop = ac_np[-1]
+        else:
+            return
+        if crop.shape[0] == 3:
+            img = np.transpose(crop, (1, 2, 0))
+        elif crop.shape[-1] == 3:
+            img = crop
+        else:
+            return
+        img = np.clip(img, 0, 1)
+        # Draw inset in top-right corner
+        inset = ax.inset_axes([0.72, 0.72, 0.25, 0.25])
+        inset.imshow(img, interpolation='bilinear')
+        inset.set_xticks([])
+        inset.set_yticks([])
+        inset.set_title('Agent crop', fontsize=8)
+    except Exception as e:
+        pass
+
+
 def render_scene_eth(scene,args,out_dir,data_dir,device):
     cfg_ref=Config(args.cfg,f'sync_{scene}'); cfg_ref.device=device
     ds_ref=ETHDataset(cfg=cfg_ref,training=False,data_dir=data_dir,subset=scene,rotate_time_frame=0,type='original',video_mode='full')
@@ -395,6 +433,10 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
         ax.set_title(f"{PANEL_TITLES[variant]}\nADE$_{{min}}$ = {b['ade']:.2f}",fontsize=11)
         ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
+        try:
+            _draw_agent_crops(ax, batch.get('agent_crops'))
+        except Exception:
+            pass
     # panel 4
     ax=axes[3]
     if bg is not None:
