@@ -194,6 +194,24 @@ def world_to_pix_native(ds, pts, scene=None):
         print(f'[viz] world_to_pixel failed: {e}')
         return None
 
+def ensure_2d_coords(arr):
+    if arr is None: return None
+    arr = np.asarray(arr, dtype=float)
+    if arr.ndim == 1:
+        if len(arr) >= 2:
+            return arr.reshape(-1, 2)
+        return None
+    if arr.ndim == 2:
+        if arr.shape[1] < 2:
+            return None
+        return arr[..., :2]
+    if arr.ndim > 2:
+        arr = arr.reshape(-1, arr.shape[-1])
+        if arr.shape[1] < 2: return None
+        return arr[..., :2]
+    return None
+
+
 def shared_limits_eth(bundles, background, scene, ds_ref):
     arrays = []
     for b in bundles.values():
@@ -362,14 +380,18 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             ax.imshow(bg,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
         # draw in pixel space for overlay
         obs_p=world_to_pix_native(ds_ref,b['obs'],scene)
-        if obs_p is not None and getattr(obs_p,'ndim',0)>=2 and obs_p.shape[-1]>=2 and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
+        obs_p=ensure_2d_coords(obs_p)
+        if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
         for hyp in np.asarray(b['preds']):
             hp=world_to_pix_native(ds_ref,hyp,scene)
-            if hp is not None and getattr(hp,'ndim',0)>=2 and hp.shape[-1]>=2 and np.isfinite(hp).all(): ax.plot(hp[:,0],hp[:,1],color=PRED_COLOR,alpha=0.12,zorder=2)
+            hp=ensure_2d_coords(hp)
+            if hp is not None and np.isfinite(hp).all(): ax.plot(hp[:,0],hp[:,1],color=PRED_COLOR,alpha=0.12,zorder=2)
         best_p=world_to_pix_native(ds_ref,b['best'],scene)
-        if best_p is not None and getattr(best_p,'ndim',0)>=2 and best_p.shape[-1]>=2 and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
+        best_p=ensure_2d_coords(best_p)
+        if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
         gt_p=world_to_pix_native(ds_ref,b['gt'],scene)
-        if gt_p is not None and getattr(gt_p,'ndim',0)>=2 and gt_p.shape[-1]>=2 and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
+        gt_p=ensure_2d_coords(gt_p)
+        if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
         ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
         ax.set_title(f"{PANEL_TITLES[variant]}\nADE$_{{min}}$ = {b['ade']:.2f}",fontsize=11)
         ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
@@ -379,11 +401,14 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         ax.imshow(bg,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
     fb=bundles_list.get('full') or list(bundles_list.values())[0]
     obs_p=world_to_pix_native(ds_ref,fb['obs'],scene)
-    if obs_p is not None and getattr(obs_p,'ndim',0)>=2 and obs_p.shape[-1]>=2 and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
+    obs_p=ensure_2d_coords(obs_p)
+    if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
     gt_p=world_to_pix_native(ds_ref,fb['gt'],scene)
-    if gt_p is not None and getattr(gt_p,'ndim',0)>=2 and gt_p.shape[-1]>=2 and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
+    gt_p=ensure_2d_coords(gt_p)
+    if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
     best_p=world_to_pix_native(ds_ref,fb['best'],scene)
-    if best_p is not None and getattr(best_p,'ndim',0)>=2 and best_p.shape[-1]>=2 and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
+    best_p=ensure_2d_coords(best_p)
+    if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
     ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
     ax.set_title(f"Grad-CAM (full)\nETH/UCY overlay",fontsize=11)
     ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
