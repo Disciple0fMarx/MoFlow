@@ -160,10 +160,24 @@ def world_to_pix_native(ds, pts, scene=None):
     try:
         pts_arr = np.asarray(pts, dtype=float)
         if pts_arr.size == 0: return pts_arr
+        
+        # Isolate strictly (x, y) spatial coordinates to prevent feature channels from breaking matmul
+        if pts_arr.ndim >= 2 and pts_arr.shape[-1] > 2:
+            pts_arr = pts_arr[..., :2]
+            
+        original_shape = pts_arr.shape
+        if pts_arr.ndim > 2:
+            pts_arr = pts_arr.reshape(-1, 2)
+            
         pts_t = torch.tensor(pts_arr, dtype=torch.float32)
         res = ds.world_to_pixel(pts_t, scene=scene)
+        
         if isinstance(res, torch.Tensor): 
             res = res.detach().cpu().numpy()
+            
+        if len(original_shape) > 2:
+            res = res.reshape(original_shape[:-1] + (2,))
+            
         return res
     except Exception as e:
         print(f'[viz] world_to_pixel failed: {e}')
