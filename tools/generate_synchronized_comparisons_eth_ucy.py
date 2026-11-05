@@ -8,6 +8,7 @@ from __future__ import annotations
 from einops import rearrange
 import argparse
 import gc
+import traceback
 import json
 import os
 import sys
@@ -167,7 +168,7 @@ def _find_frame_path(vis_dir, fid):
             # pick closest
             return sorted(cands)[0]
     except Exception:
-        pass
+        traceback.print_exc()
     return None
 
 
@@ -367,7 +368,7 @@ def _draw_agent_crops(ax, agent_crops, scene_name=None):
         inset.set_yticks([])
         inset.set_title('Agent crop', fontsize=8)
     except Exception as e:
-        pass
+        traceback.print_exc()
 
 
 def render_scene_eth(scene,args,out_dir,data_dir,device):
@@ -405,6 +406,10 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             x_data={k:v.to(device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
             gt=batch['fut_traj_original_scale'].to(device).float()
             pred=euler_sample(denoiser,cfg_m,x_data,getattr(cfg_m,'future_frames',12),device,args.seed)
+            try:
+                print(f'[DIAG] {scene}/{mode} raw_pred min/max: {pred.min().item():.6f}/{pred.max().item():.6f}')
+            except Exception:
+                traceback.print_exc()
             # get init pos
             init_pos=None
             try:
@@ -413,8 +418,13 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                     po_n = to_numpy(po_b)
                     if po_n.ndim==4: init_pos = po_n[0,0,-1,:2]
                     elif po_n.ndim==3: init_pos = po_n[0,-1,:2]
-            except: pass
+            except Exception:
+                traceback.print_exc()
             ade_min,bi,pred_m,gt_m=best_of_k_eth(pred,gt,cfg_m,ds_m,init_pos=init_pos)
+            try:
+                print(f'[DIAG] {scene}/{mode} unnorm_pred_m min/max: {np.asarray(pred_m).min():.6f}/{np.asarray(pred_m).max():.6f}, ade_min={float(ade_min):.6f}')
+            except Exception:
+                traceback.print_exc()
             bundles[mode]={'preds':to_numpy(pred_m),'best':to_numpy(pred_m[bi]),'gt':to_numpy(gt_m[0,0] if gt_m.ndim==4 else (gt_m[0] if gt_m.ndim==3 else gt_m)),'ade':float(ade_min)}
             del model,denoiser; torch.cuda.empty_cache(); gc.collect()
         except Exception as e: print(f'  {mode} err: {e}')
@@ -471,10 +481,11 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         try:
             _draw_agent_crops(ax, batch.get('agent_crops'))
         except Exception:
-            pass
+            traceback.print_exc()
     # panel 4: Grad-CAM
     ax=axes[3]
     cam_overlay_done=False
+    gcam_err=None
     if bg is not None and _HAS_GCAM and ds_ref is not None:
         try:
             import torchvision
@@ -492,7 +503,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                     bidx_cand = int(batch['index'].detach().cpu().numpy().reshape(-1)[0]) if hasattr(batch['index'],'detach') else int(batch['index'])
                     if bidx_cand < len(ds_ref): bidx = bidx_cand
             except Exception:
-                pass
+                traceback.print_exc()
             base_fid = int(frame_ids[bidx]) if frame_ids is not None and len(frame_ids)>bidx else 0
             frames_t_list=[]; frames_rgb_list=[]
             for t in range(cfg_ref.past_frames):
@@ -551,30 +562,21 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                         try:
                             _draw_agent_crops(ax, batch.get('agent_crops'))
                         except Exception:
-                            pass
+                            traceback.print_exc()
         except Exception as e:
+            gcam_err = e
+            traceback.print_exc()
             print(f'  gradcam err: {e}')
-    if not cam_overlay_done and bg is not None:
-        ax.imshow(bg,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
-        fb=bundles_list.get('full') or list(bundles_list.values())[0]
-        obs_p=world_to_pix_native(ds_ref,fb['obs'],scene); obs_p=ensure_2d_coords(obs_p)
-        if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
-        gt_p=world_to_pix_native(ds_ref,fb['gt'],scene); gt_p=ensure_2d_coords(gt_p)
-        if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
-        best_p=world_to_pix_native(ds_ref,fb['best'],scene); best_p=ensure_2d_coords(best_p)
-        if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
-        ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
-        ax.set_title(f"Grad-CAM (full)\nETH/UCY overlay",fontsize=11)
-        ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
-        try:
-            _draw_agent_crops(ax, batch.get('agent_crops'))
-        except Exception:
-            pass
-    elif cam_overlay_done:
+    if cam_overlay_done:
         pass
     else:
-        ax.text(0.5,0.5,'Grad-CAM unavailable',ha='center',va='center',transform=ax.transAxes)
-        ax.set_xticks([]); ax.set_yticks([])
+        if bg is not None:
+            ax.imshow(bg,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear',alpha=0.3)
+        err_msg = f"Grad-CAM FAILED\n{gcam_err}" if 'gcam_err' in locals() and gcam_err is not None else "Grad-CAM unavailable"
+        ax.text(0.5,0.5,err_msg,ha='center',va='center',fontsize=8,color='red',transform=ax.transAxes,wrap=True)
+        ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
+        ax.set_title(f"Grad-CAM (full)",fontsize=11)
+        ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
     fig.suptitle(f'ETH/UCY synchronized comparison | {scene.upper()} | window idx {args.batch_idx}',fontsize=13)
     fig.legend(handles=_legend_handles(),loc='lower center',ncol=4,frameon=False,fontsize=10,bbox_to_anchor=(0.5,0.0))
     fig.tight_layout(rect=(0,0.06,1,0.94))
