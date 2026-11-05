@@ -150,11 +150,34 @@ def load_run_config(run_dir, default_cfg='cfg/eth_ucy/cor_fm.yml'):
             if os.path.exists(p2): return p2
     return default_cfg
 
+def _find_frame_path(vis_dir, fid):
+    if vis_dir is None or fid is None:
+        return None
+    # try exact patterns
+    for pat in [f'frame{int(fid):06d}.jpg', f'frame{int(fid):06d}.png', f'frame{int(fid):05d}.jpg']:
+        p=os.path.join(vis_dir, pat)
+        if os.path.exists(p): return p
+    # glob
+    try:
+        import glob
+        cands = glob.glob(os.path.join(vis_dir, f'*{int(fid)}*.jpg')) + glob.glob(os.path.join(vis_dir, f'*{int(fid)}*.png'))
+        if cands: return sorted(cands)[0]
+        cands = glob.glob(os.path.join(vis_dir, 'frame*.jpg')) + glob.glob(os.path.join(vis_dir, 'frame*.png'))
+        if cands:
+            # pick closest
+            return sorted(cands)[0]
+    except Exception:
+        pass
+    return None
+
+
 def find_ref_img(data_dir,scene):
     for base in [os.path.join(data_dir,scene,'visual_data'),os.path.join(_REPO_ROOT,'data','eth_ucy',scene,'visual_data')]:
         if os.path.exists(base):
-            for f in sorted(os.listdir(base)):
-                if f.lower().endswith(('.jpg','.png','.jpeg')): return os.path.join(base,f)
+            # try to find any frame
+            import glob
+            cands = glob.glob(os.path.join(base,'frame*.jpg')) + glob.glob(os.path.join(base,'frame*.png')) + glob.glob(os.path.join(base,'*.jpg')) + glob.glob(os.path.join(base,'*.png'))
+            if cands: return sorted(cands)[0]
     return None
 
 def load_img(p):
@@ -353,11 +376,14 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
     copy_norm_stats(ds_ref,cfg_ref)
     loader=DataLoader(ds_ref,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
     batch=None
-    for bi in range(min(80,len(ds_ref))):
+    chosen_bi = args.batch_idx
+    for bi in range(min(200,len(ds_ref))):
         it=iter(loader)
         for _ in range(bi+1): batch=next(it)
         po=batch.get('past_traj_original_scale')
-        if po is not None and torch.is_tensor(po) and po.shape[1]>0 and po.abs().sum()>0: break
+        if po is not None and torch.is_tensor(po) and po.shape[1]>0 and po.abs().sum()>0:
+            chosen_bi = bi
+            break
     if batch is None: print(f'[ETH-UCY] {scene}: no valid batch'); return
     bg=load_img(find_ref_img(data_dir,scene))
     bundles={}
@@ -460,15 +486,23 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             # load frames
             vis_dir = os.path.join(data_dir, scene, 'visual_data')
             frame_ids = getattr(ds_ref, 'frame_ids', None)
-            base_fid = int(frame_ids[args.batch_idx]) if frame_ids is not None and len(frame_ids)>args.batch_idx else 0
+            bidx = locals().get('chosen_bi', args.batch_idx)
+            try:
+                if 'batch' in locals() and isinstance(batch,dict) and 'index' in batch:
+                    bidx_cand = int(batch['index'].detach().cpu().numpy().reshape(-1)[0]) if hasattr(batch['index'],'detach') else int(batch['index'])
+                    if bidx_cand < len(ds_ref): bidx = bidx_cand
+            except Exception:
+                pass
+            base_fid = int(frame_ids[bidx]) if frame_ids is not None and len(frame_ids)>bidx else 0
             frames_t_list=[]; frames_rgb_list=[]
             for t in range(cfg_ref.past_frames):
                 fid = base_fid - (cfg_ref.past_frames - 1 - t) * 10
-                fpath = os.path.join(vis_dir, f'frame{fid:06d}.jpg')
-                if not os.path.exists(fpath):
+                fpath = _find_frame_path(vis_dir, fid)
+                if fpath is None:
                     import glob
-                    cand=sorted(glob.glob(os.path.join(vis_dir,'frame*.jpg')))
+                    cand=sorted(glob.glob(os.path.join(vis_dir,'frame*.jpg')))+sorted(glob.glob(os.path.join(vis_dir,'frame*.png')))
                     if cand: fpath=cand[min(max(0,len(cand)//2),len(cand)-1)]
+                if fpath is None: continue
                 img=cv2.imread(fpath)
                 if img is None: continue
                 img_rgb=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
