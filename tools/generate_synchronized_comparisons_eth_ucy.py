@@ -53,6 +53,15 @@ from models.flow_matching import FlowMatcher
 from utils.normalization import unnormalize_min_max
 from utils.config import Config
 
+# Optional Grad-CAM support
+try:
+    from tools import gradcam_eth as gcam_eth
+    from tools.gradcam_eth import _make_backbone, gradcam_pass, _apply_jet
+    _HAS_GCAM = True
+except Exception:
+    gcam_eth = None
+    _HAS_GCAM = False
+
 SCENES = ("eth", "hotel", "univ", "zara1", "zara2")
 VARIANTS = ("off", "static", "full")
 PANEL_TITLES = {
@@ -437,23 +446,101 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             _draw_agent_crops(ax, batch.get('agent_crops'))
         except Exception:
             pass
-    # panel 4
+    # panel 4: Grad-CAM
     ax=axes[3]
-    if bg is not None:
+    cam_overlay_done=False
+    if bg is not None and _HAS_GCAM and ds_ref is not None:
+        try:
+            import torchvision
+            from torchvision import transforms
+            from PIL import Image
+            # load backbone
+            backbone, dim, preprocess = _make_backbone('resnet18', pretrained=True, device=device)
+            backbone.eval()
+            # load frames
+            vis_dir = os.path.join(data_dir, scene, 'visual_data')
+            frame_ids = getattr(ds_ref, 'frame_ids', None)
+            base_fid = int(frame_ids[args.batch_idx]) if frame_ids is not None and len(frame_ids)>args.batch_idx else 0
+            frames_t_list=[]; frames_rgb_list=[]
+            for t in range(cfg_ref.past_frames):
+                fid = base_fid - (cfg_ref.past_frames - 1 - t) * 10
+                fpath = os.path.join(vis_dir, f'frame{fid:06d}.jpg')
+                if not os.path.exists(fpath):
+                    import glob
+                    cand=sorted(glob.glob(os.path.join(vis_dir,'frame*.jpg')))
+                    if cand: fpath=cand[min(max(0,len(cand)//2),len(cand)-1)]
+                img=cv2.imread(fpath)
+                if img is None: continue
+                img_rgb=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+                frames_rgb_list.append(img_rgb)
+                pil=Image.fromarray(img_rgb); frames_t_list.append(preprocess(pil))
+            if frames_t_list:
+                frames_t=torch.stack(frames_t_list,0).to(device)
+                # get ckpt for full
+                ckpt_f,run_f=find_checkpoint(scene,'full',args.cor_fm_root,args.ckpt_dir)
+                if ckpt_f:
+                    cfg_f=Config(load_run_config(run_f,args.cfg),f'gcam_{scene}')
+                    cfg_f.device=device
+                    try: cfg_f.MODEL.CONTEXT_ENCODER.VIDEO_MODE='full'; cfg_f.MODEL.CONTEXT_ENCODER.USE_VIDEO=True
+                    except: pass
+                    model_f=ETHMotionTransformer(model_config=cfg_f.MODEL,logger=NullLogger(),config=cfg_f)
+                    den_f=FlowMatcher(cfg_f,model_f,logger=NullLogger())
+                    den_f=load_ckpt_flexible(ckpt_f,den_f).to(device).eval()
+                    for p in den_f.parameters(): p.requires_grad_(False)
+                    x_gc={k:v.to(device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
+                    gt_gc=batch['fut_traj_original_scale'].to(device).float()
+                    res_gc=gradcam_pass(backbone,den_f,cfg_f,x_gc,frames_t,gt_gc,cfg_f.future_frames,device,args.seed)
+                    cam=res_gc['cam']
+                    if cam is not None and len(cam)>0 and len(frames_rgb_list)>0:
+                        cam2d=cam[-1]
+                        H,W=frames_rgb_list[-1].shape[:2]
+                        cam_up=cv2.resize(cam2d,(W,H),interpolation=cv2.INTER_LINEAR)
+                        heat_rgb,_=_apply_jet(cam_up,0.4)
+                        base=frames_rgb_list[-1].astype(np.float32)/255.0
+                        overlay=(1-0.4)*base+0.4*heat_rgb
+                        overlay=np.clip(overlay*255,0,255).astype(np.uint8)
+                        h,wbg=bg.shape[:2]
+                        extent=(0,wbg,hbg,0)
+                        ax.imshow(overlay,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
+                        cam_overlay_done=True
+                        # draw trajs
+                        fb=bundles_list.get('full') or list(bundles_list.values())[0]
+                        obs_p=world_to_pix_native(ds_ref,fb['obs'],scene); obs_p=ensure_2d_coords(obs_p)
+                        if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
+                        gt_p=world_to_pix_native(ds_ref,fb['gt'],scene); gt_p=ensure_2d_coords(gt_p)
+                        if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='lime',linewidth=1.8,marker='o',markersize=3,zorder=4)
+                        best_p=world_to_pix_native(ds_ref,fb['best'],scene); best_p=ensure_2d_coords(best_p)
+                        if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color='white',linewidth=1.8,alpha=0.95,linestyle='--',zorder=5)
+                        ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
+                        ax.set_title(f"Grad-CAM (full)\nanchor frame",fontsize=11)
+                        ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
+                        try:
+                            _draw_agent_crops(ax, batch.get('agent_crops'))
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f'  gradcam err: {e}')
+    if not cam_overlay_done and bg is not None:
         ax.imshow(bg,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
-    fb=bundles_list.get('full') or list(bundles_list.values())[0]
-    obs_p=world_to_pix_native(ds_ref,fb['obs'],scene)
-    obs_p=ensure_2d_coords(obs_p)
-    if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
-    gt_p=world_to_pix_native(ds_ref,fb['gt'],scene)
-    gt_p=ensure_2d_coords(gt_p)
-    if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
-    best_p=world_to_pix_native(ds_ref,fb['best'],scene)
-    best_p=ensure_2d_coords(best_p)
-    if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
-    ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
-    ax.set_title(f"Grad-CAM (full)\nETH/UCY overlay",fontsize=11)
-    ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
+        fb=bundles_list.get('full') or list(bundles_list.values())[0]
+        obs_p=world_to_pix_native(ds_ref,fb['obs'],scene); obs_p=ensure_2d_coords(obs_p)
+        if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
+        gt_p=world_to_pix_native(ds_ref,fb['gt'],scene); gt_p=ensure_2d_coords(gt_p)
+        if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
+        best_p=world_to_pix_native(ds_ref,fb['best'],scene); best_p=ensure_2d_coords(best_p)
+        if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
+        ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
+        ax.set_title(f"Grad-CAM (full)\nETH/UCY overlay",fontsize=11)
+        ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
+        try:
+            _draw_agent_crops(ax, batch.get('agent_crops'))
+        except Exception:
+            pass
+    elif cam_overlay_done:
+        pass
+    else:
+        ax.text(0.5,0.5,'Grad-CAM unavailable',ha='center',va='center',transform=ax.transAxes)
+        ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(f'ETH/UCY synchronized comparison | {scene.upper()} | window idx {args.batch_idx}',fontsize=13)
     fig.legend(handles=_legend_handles(),loc='lower center',ncol=4,frameon=False,fontsize=10,bbox_to_anchor=(0.5,0.0))
     fig.tight_layout(rect=(0,0.06,1,0.94))
