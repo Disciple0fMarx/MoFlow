@@ -454,6 +454,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             elif gtm.ndim==3: gtm = gtm[0]
             if pm.ndim==3: pm = pm  # [K,A,T,2] or [K,T,2]
             bundles[mode]={'preds':pm,'best':btm.reshape(-1,2),'gt':gtm.reshape(-1,2),'ade':float(ade_min)}
+            print(f'[DBG] {scene}/{mode}: preds.shape={getattr(pm,"shape",None)}, best.shape={btm.reshape(-1,2).shape}, gt.shape={gtm.reshape(-1,2).shape}')
             del model,denoiser; torch.cuda.empty_cache(); gc.collect()
         except Exception as e: print(f'  {mode} err: {e}')
     if not bundles: return
@@ -493,14 +494,21 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         obs_p=world_to_pix_native(ds_ref,b['obs'],scene,target_res=(w,h) if bg is not None else None)
         obs_p=ensure_2d_coords(obs_p)
         if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
-        for hyp in np.asarray(b['preds']):
-            hp=world_to_pix_native(ds_ref,hyp,scene,target_res=(w,h) if bg is not None else None)
+        preds_b = np.asarray(b['preds'])
+        print(f'[DBG-PLOT] {variant} preds_b.shape={preds_b.shape}')
+        for hyp in preds_b:
+            hyp_arr = np.asarray(hyp)
+            if hyp_arr.ndim > 2: hyp_arr = hyp_arr.reshape(-1, hyp_arr.shape[-1])
+            hp=world_to_pix_native(ds_ref,hyp_arr,scene,target_res=(w,h) if bg is not None else None)
             hp=ensure_2d_coords(hp)
             if hp is not None and np.isfinite(hp).all(): ax.plot(hp[:,0],hp[:,1],color=PRED_COLOR,alpha=0.12,zorder=2)
-        best_p=world_to_pix_native(ds_ref,b['best'],scene,target_res=(w,h) if bg is not None else None)
+        best_arr = np.asarray(b['best']).reshape(-1,2)
+        gt_arr = np.asarray(b['gt']).reshape(-1,2)
+        print(f'[DBG-PLOT2] {variant} best.shape={best_arr.shape} gt.shape={gt_arr.shape}')
+        best_p=world_to_pix_native(ds_ref,best_arr,scene,target_res=(w,h) if bg is not None else None)
         best_p=ensure_2d_coords(best_p)
         if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
-        gt_p=world_to_pix_native(ds_ref,b['gt'],scene,target_res=(w,h) if bg is not None else None)
+        gt_p=world_to_pix_native(ds_ref,gt_arr,scene,target_res=(w,h) if bg is not None else None)
         gt_p=ensure_2d_coords(gt_p)
         if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
         if bg is not None:
