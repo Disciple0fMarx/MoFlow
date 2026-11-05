@@ -384,20 +384,21 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
     loader=DataLoader(ds_ref,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
     batch=None
     chosen_bi = args.batch_idx
-    # scan for valid window with motion
-    for bi in range(min(500,len(ds_ref))):
-        try:
-            it=iter(loader)
-            for _ in range(bi+1): batch=next(it)
-            po=batch.get('past_traj_original_scale')
-            if po is not None and torch.is_tensor(po):
-                po_n = po.detach().cpu().numpy()
-                if po_n.shape[1]>0 and po_n.reshape(-1,2).std()>1e-6:
-                    chosen_bi = bi
-                    break
-        except Exception:
-            traceback.print_exc()
-            continue
+    if getattr(args, 'batch_idx', 0) == 0:
+        # scan for valid window with motion
+        for bi in range(min(500,len(ds_ref))):
+            try:
+                it=iter(loader)
+                for _ in range(bi+1): batch=next(it)
+                po=batch.get('past_traj_original_scale')
+                if po is not None and torch.is_tensor(po):
+                    po_n = po.detach().cpu().numpy()
+                    if po_n.shape[1]>0 and po_n.reshape(-1,2).std()>1e-6:
+                        chosen_bi = bi
+                        break
+            except Exception:
+                traceback.print_exc()
+                continue
     args.batch_idx = chosen_bi
     # reload batch at chosen_bi
     try:
