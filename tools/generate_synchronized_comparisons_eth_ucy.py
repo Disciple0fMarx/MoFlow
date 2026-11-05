@@ -398,6 +398,13 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         except Exception:
             traceback.print_exc()
             continue
+    args.batch_idx = chosen_bi
+    # reload batch at chosen_bi
+    try:
+        it=iter(loader)
+        for _ in range(chosen_bi+1): batch=next(it)
+    except Exception:
+        traceback.print_exc()
     if batch is None: print(f'[ETH-UCY] {scene}: no valid batch'); return
     bg=load_img(find_ref_img(data_dir,scene))
     bundles={}
