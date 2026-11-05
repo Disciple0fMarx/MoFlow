@@ -189,7 +189,7 @@ def load_img(p):
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     except: return None
 
-def world_to_pix_native(ds, pts, scene=None):
+def world_to_pix_native(ds, pts, scene=None, target_res=None):
     if pts is None or ds is None: return None
     try:
         pts_arr = np.asarray(pts, dtype=float)
@@ -210,7 +210,13 @@ def world_to_pix_native(ds, pts, scene=None):
             return None
             
         pts_t = torch.tensor(pts_arr, dtype=torch.float32)
-        res = ds.world_to_pixel(pts_t, scene=scene)
+        try:
+            if target_res is not None:
+                res = ds.world_to_pixel(pts_t, scene=scene, target_res=target_res)
+            else:
+                res = ds.world_to_pixel(pts_t, scene=scene)
+        except TypeError:
+            res = ds.world_to_pixel(pts_t, scene=scene)
         
         if isinstance(res, torch.Tensor): 
             res = res.detach().cpu().numpy()
@@ -462,20 +468,23 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         if bg is not None and ds_ref is not None:
             ax.imshow(bg,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
         # draw in pixel space for overlay
-        obs_p=world_to_pix_native(ds_ref,b['obs'],scene)
+        obs_p=world_to_pix_native(ds_ref,b['obs'],scene,target_res=(w,h) if bg is not None else None)
         obs_p=ensure_2d_coords(obs_p)
         if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
         for hyp in np.asarray(b['preds']):
-            hp=world_to_pix_native(ds_ref,hyp,scene)
+            hp=world_to_pix_native(ds_ref,hyp,scene,target_res=(w,h) if bg is not None else None)
             hp=ensure_2d_coords(hp)
             if hp is not None and np.isfinite(hp).all(): ax.plot(hp[:,0],hp[:,1],color=PRED_COLOR,alpha=0.12,zorder=2)
-        best_p=world_to_pix_native(ds_ref,b['best'],scene)
+        best_p=world_to_pix_native(ds_ref,b['best'],scene,target_res=(w,h) if bg is not None else None)
         best_p=ensure_2d_coords(best_p)
         if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
-        gt_p=world_to_pix_native(ds_ref,b['gt'],scene)
+        gt_p=world_to_pix_native(ds_ref,b['gt'],scene,target_res=(w,h) if bg is not None else None)
         gt_p=ensure_2d_coords(gt_p)
         if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
-        ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
+        if bg is not None:
+            ax.set_xlim(0, w); ax.set_ylim(h, 0)
+        else:
+            ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
         ax.set_title(f"{PANEL_TITLES[variant]}\nADE$_{{min}}$ = {b['ade']:.2f}",fontsize=11)
         ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
         try:
@@ -533,6 +542,13 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                     den_f=load_ckpt_flexible(ckpt_f,den_f).to(device).eval()
                     for p in den_f.parameters(): p.requires_grad_(False)
                     x_gc={k:v.to(device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
+                    # ensure z_video_global present for gradcam if expected
+                    if 'z_video_global' not in x_gc and ds_ref.z_video_global is not None:
+                        try:
+                            bidx_cand = locals().get('chosen_bi', args.batch_idx)
+                            x_gc['z_video_global'] = ds_ref.z_video_global[bidx_cand:bidx_cand+1].to(device)
+                        except Exception:
+                            traceback.print_exc()
                     gt_gc=batch['fut_traj_original_scale'].to(device).float()
                     res_gc=gradcam_pass(backbone,den_f,cfg_f,x_gc,frames_t,gt_gc,cfg_f.future_frames,device,args.seed)
                     cam=res_gc['cam']
