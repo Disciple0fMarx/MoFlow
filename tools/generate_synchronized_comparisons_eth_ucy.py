@@ -384,13 +384,20 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
     loader=DataLoader(ds_ref,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
     batch=None
     chosen_bi = args.batch_idx
-    for bi in range(min(200,len(ds_ref))):
-        it=iter(loader)
-        for _ in range(bi+1): batch=next(it)
-        po=batch.get('past_traj_original_scale')
-        if po is not None and torch.is_tensor(po) and po.shape[1]>0 and po.abs().sum()>0:
-            chosen_bi = bi
-            break
+    # scan for valid window with motion
+    for bi in range(min(500,len(ds_ref))):
+        try:
+            it=iter(loader)
+            for _ in range(bi+1): batch=next(it)
+            po=batch.get('past_traj_original_scale')
+            if po is not None and torch.is_tensor(po):
+                po_n = po.detach().cpu().numpy()
+                if po_n.shape[1]>0 and po_n.reshape(-1,2).std()>1e-6:
+                    chosen_bi = bi
+                    break
+        except Exception:
+            traceback.print_exc()
+            continue
     if batch is None: print(f'[ETH-UCY] {scene}: no valid batch'); return
     bg=load_img(find_ref_img(data_dir,scene))
     bundles={}
@@ -431,7 +438,14 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                 print(f'[DIAG] {scene}/{mode} unnorm_pred_m min/max: {np.asarray(pred_m).min():.6f}/{np.asarray(pred_m).max():.6f}, ade_min={float(ade_min):.6f}')
             except Exception:
                 traceback.print_exc()
-            bundles[mode]={'preds':to_numpy(pred_m),'best':to_numpy(pred_m[bi]),'gt':to_numpy(gt_m[0,0] if gt_m.ndim==4 else (gt_m[0] if gt_m.ndim==3 else gt_m)),'ade':float(ade_min)}
+            pm = to_numpy(pred_m)
+            btm = to_numpy(pred_m[bi])
+            gtm = to_numpy(gt_m)
+            # normalize shapes
+            if gtm.ndim==4: gtm = gtm[0,0]
+            elif gtm.ndim==3: gtm = gtm[0]
+            if pm.ndim==3: pm = pm  # [K,A,T,2] or [K,T,2]
+            bundles[mode]={'preds':pm,'best':btm.reshape(-1,2),'gt':gtm.reshape(-1,2),'ade':float(ade_min)}
             del model,denoiser; torch.cuda.empty_cache(); gc.collect()
         except Exception as e: print(f'  {mode} err: {e}')
     if not bundles: return
