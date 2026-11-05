@@ -454,7 +454,6 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             elif gtm.ndim==3: gtm = gtm[0]
             if pm.ndim==3: pm = pm  # [K,A,T,2] or [K,T,2]
             bundles[mode]={'preds':pm,'best':btm.reshape(-1,2),'gt':gtm.reshape(-1,2),'ade':float(ade_min)}
-            print(f'[DBG] {scene}/{mode}: preds.shape={getattr(pm,"shape",None)}, best.shape={btm.reshape(-1,2).shape}, gt.shape={gtm.reshape(-1,2).shape}')
             del model,denoiser; torch.cuda.empty_cache(); gc.collect()
         except Exception as e: print(f'  {mode} err: {e}')
     if not bundles: return
@@ -495,7 +494,6 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         obs_p=ensure_2d_coords(obs_p)
         if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
         preds_b = np.asarray(b['preds'])
-        print(f'[DBG-PLOT] {variant} preds_b.shape={preds_b.shape}')
         # normalize preds_b to list of [T,2]
         if preds_b.ndim == 3:  # [K,T,2]
             hyps = preds_b
@@ -516,7 +514,6 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         else: best_arr = best_arr.reshape(-1,2)
         if gt_arr.ndim==3: gt_arr = gt_arr.reshape(-1,2)
         else: gt_arr = gt_arr.reshape(-1,2)
-        print(f'[DBG-PLOT2] {variant} best.shape={best_arr.shape} gt.shape={gt_arr.shape}')
         best_p=world_to_pix_native(ds_ref,best_arr,scene,target_res=(w,h) if bg is not None else None)
         best_p=ensure_2d_coords(best_p)
         if best_p is not None and np.isfinite(best_p).all() and best_p.shape[0]>1: ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
