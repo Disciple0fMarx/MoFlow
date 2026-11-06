@@ -268,7 +268,7 @@ def shared_limits_eth(bundles, background, scene, ds_ref):
         x0,x1 = float(lo[0]-margin), float(hi[0]+margin)
         y0,y1 = float(lo[1]-margin), float(hi[1]+margin)
         # get image extent by projecting corners
-        c1 = world_to_pix_native(ds_ref, np.array([[x0,y0],[x1,y0],[x1,y1],[x0,y1]]), scene)
+        c1 = world_to_pix_native(ds_ref, np.array([[x0,y0],[x1,y0],[x1,y1],[x0,y1]]), scene, target_res=(bg.shape[1],bg.shape[0]) if bg is not None else None)
         if c1 is not None and np.isfinite(c1).all():
             cx0,cx1=np.min(c1[:,0]),np.max(c1[:,0]); cy0,cy1=np.min(c1[:,1]),np.max(c1[:,1])
             return (cx0,cx1),(cy1,cy0)
@@ -327,12 +327,12 @@ def best_of_k_eth(pred,gt,cfg,ds=None,init_pos=None):
 def _draw_bundle_eth(ax,bundle,background,extent,ds_ref,scene,xlim,ylim):
     if background is not None and ds_ref is not None:
         ax.imshow(background,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
-    obs_p=world_to_pix_native(ds_ref,bundle['obs'],scene)
+    obs_p=world_to_pix_native(ds_ref,bundle['obs'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None)
     if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
     else:
         o=np.array(bundle['obs']).reshape(-1,2); ax.plot(o[:,0],o[:,1],'--',color='black',linewidth=1.6,zorder=4)
     for hyp in np.asarray(bundle['preds']):
-        hp=world_to_pix_native(ds_ref,hyp,scene)
+        hp=world_to_pix_native(ds_ref,hyp,scene,target_res=(w,h) if 'w' in locals() and bg is not None else None)
         if hp is not None and np.isfinite(hp).all(): ax.plot(hp[:,0],hp[:,1],color=PRED_COLOR,alpha=0.12,zorder=2)
     best_p=world_to_pix_native(ds_ref,bundle['best'],scene)
     if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
@@ -605,11 +605,11 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                         cam_overlay_done=True
                         # draw trajs
                         fb=bundles_list.get('full') or list(bundles_list.values())[0]
-                        obs_p=world_to_pix_native(ds_ref,fb['obs'],scene); obs_p=ensure_2d_coords(obs_p)
+                        obs_p=world_to_pix_native(ds_ref,fb['obs'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); obs_p=ensure_2d_coords(obs_p)
                         if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
-                        gt_p=world_to_pix_native(ds_ref,fb['gt'],scene); gt_p=ensure_2d_coords(gt_p)
+                        gt_p=world_to_pix_native(ds_ref,fb['gt'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); gt_p=ensure_2d_coords(gt_p)
                         if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='lime',linewidth=1.8,marker='o',markersize=3,zorder=4)
-                        best_p=world_to_pix_native(ds_ref,fb['best'],scene); best_p=ensure_2d_coords(best_p)
+                        best_p=world_to_pix_native(ds_ref,fb['best'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); best_p=ensure_2d_coords(best_p)
                         if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color='white',linewidth=1.8,alpha=0.95,linestyle='--',zorder=5)
                         ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
                         ax.set_title(f"Grad-CAM (full)\nanchor frame",fontsize=11)
