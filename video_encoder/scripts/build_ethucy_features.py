@@ -1,37 +1,104 @@
-"""Build full-range ETH/UCY global video features from ``visual_data`` frames.
+"""Build full-range ETH/UCY global video features from TU-Clausthal layout.
 
-Encodes pre-extracted frame images from the external TU-Clausthal datasets root
-(strict external path binding, e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets)
-at the dataset stride and writes the standard per-scene cache consumed by
-``FrameFeatureLookup``.
+Supports nested TU-Clausthal paths (ETH/seq_eth, ETH/seq_hotel, UCY/students03,
+UCY/zara01, UCY/zara02). If <scene_dir>/visual_data is missing/empty, auto-extracts
+frames from video.avi using cv2.VideoCapture into visual_data/frame{idx:06d}.jpg,
+then encodes at dataset stride and writes the standard per-scene cache consumed by
+FrameFeatureLookup. Strict external path binding (--frames-root).
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
 from tqdm import tqdm
 
+# Ensure repo root on path for data.* imports when run as script
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from data.tu_clausthal_eth_ucy_parser import TU_CLAUSTHAL_MAP
 from video_encoder.backbones import build_backbone
 
 
+def _resolve_scene_dir(frames_root: Path, scene: str) -> Path:
+    if scene not in TU_CLAUSTHAL_MAP:
+        raise ValueError(f"Unknown scene {scene}, valid: {sorted(set(TU_CLAUSTHAL_MAP.keys()))}")
+    group, scene_dir = TU_CLAUSTHAL_MAP[scene]
+    path = frames_root / group / scene_dir
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"TU-Clausthal scene directory not found: {path}. "
+            f"Expected nested layout under --frames-root ({frames_root}) with {group}/{scene_dir}."
+        )
+    return path
+
+
+def _extract_frames_from_video(video_path: Path, visual_data_dir: Path) -> list[tuple[int, Path]]:
+    visual_data_dir.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Failed to open video for auto-extraction: {video_path}")
+    frames: list[tuple[int, Path]] = []
+    idx = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            # Use 1-based frame numbering aligned with typical ETH/UCY frame ids
+            fid = idx + 1
+            out_path = visual_data_dir / f"frame{fid:06d}.jpg"
+            if not cv2.imwrite(str(out_path), frame):
+                raise IOError(f"Failed to write extracted frame: {out_path}")
+            frames.append((fid, out_path))
+            idx += 1
+    finally:
+        cap.release()
+    if not frames:
+        raise RuntimeError(f"No frames extracted from video: {video_path}")
+    return frames
+
+
+def _ensure_visual_data(scene_dir: Path) -> Path:
+    visual_data_dir = scene_dir / "visual_data"
+    has_frames = visual_data_dir.is_dir() and any(visual_data_dir.glob("frame*.jpg"))
+    if has_frames:
+        return visual_data_dir
+    # Auto-extract from video.avi in the TU-Clausthal scene folder
+    video_path = scene_dir / "video.avi"
+    if not video_path.is_file():
+        raise FileNotFoundError(
+            f"visual_data missing/empty and video.avi not found for auto-extraction in: {scene_dir}. "
+            "Strict external TU-Clausthal layout requires video.avi or pre-extracted visual_data/frame*.jpg."
+        )
+    print(f"[ethucy-features] auto-extracting frames from {video_path} -> {visual_data_dir}", flush=True)
+    _extract_frames_from_video(video_path, visual_data_dir)
+    return visual_data_dir
+
+
 def _frame_files(frames_root: Path, scene: str, stride: int) -> list[tuple[int, Path]]:
-    scene_dir = frames_root / scene / "visual_data"
-    if not scene_dir.is_dir():
-        raise FileNotFoundError(f"Missing frame directory: {scene_dir}")
+    scene_dir = _resolve_scene_dir(frames_root, scene)
+    visual_data_dir = _ensure_visual_data(scene_dir)
     frames = []
-    for path in scene_dir.glob("frame*.jpg"):
-        fid = int(path.stem.replace("frame", ""))
-        if fid % stride == 0:
+    for path in visual_data_dir.glob("frame*.jpg"):
+        try:
+            fid = int(path.stem.replace("frame", ""))
+        except ValueError:
+            continue
+        if stride <= 1 or fid % stride == 0:
             frames.append((fid, path))
     frames.sort(key=lambda item: item[0])
     if not frames:
-        raise FileNotFoundError(f"No frame images found under {scene_dir}")
+        raise FileNotFoundError(f"No frame images found under {visual_data_dir} (stride={stride})")
     return frames
 
 
@@ -78,7 +145,11 @@ def build_scene(
 def main() -> None:
     default_frames = Path("/home/efrei_stage/Desktop/tu-clausthal/datasets")
     p = argparse.ArgumentParser()
-    p.add_argument("--frames-root", default=str(default_frames), help="External TU-Clausthal datasets root containing <scene>/visual_data/")
+    p.add_argument(
+        "--frames-root",
+        default=str(default_frames),
+        help="External TU-Clausthal datasets root (contains ETH/ and UCY/).",
+    )
     p.add_argument("--out", default="features/resnet18")
     p.add_argument(
         "--scenes",
@@ -92,6 +163,11 @@ def main() -> None:
 
     out_dir = Path(args.out)
     frames_root = Path(args.frames_root)
+    if not frames_root.is_dir():
+        raise FileNotFoundError(
+            f"External --frames-root not found: {frames_root}. "
+            "Expected TU-Clausthal datasets root (e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets)."
+        )
     for scene in args.scenes:
         n, dim = build_scene(
             frames_root=frames_root,
