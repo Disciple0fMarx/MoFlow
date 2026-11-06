@@ -682,24 +682,23 @@ class ETHDataset(object):
 
         scene = getattr(self, "current_scene", self.subset)
         orig_w, orig_h = self.SCENE_RESOLUTIONS.get(scene, self.orig_res)
-        try:
-            import os
+        import os
 
-            import cv2
+        import cv2
 
-            vis_dir = os.path.join(
-                getattr(self, "data_dir", "data/eth_ucy"), scene, "visual_data"
+        vis_dir = os.path.join(getattr(self, "data_dir"), scene, "visual_data")
+        if not getattr(self, "data_dir", None):
+            raise FileNotFoundError("ETHUCYDataset.data_dir must be set for strict external visual asset loading.")
+        if not os.path.isdir(vis_dir):
+            raise FileNotFoundError(
+                f"External visual_data directory not found: {vis_dir}. "
+                "Provide data_dir pointing at the TU-Clausthal datasets root with <scene>/visual_data/."
             )
-        except Exception:
-            vis_dir = None
-            cv2 = None
 
-        # Try to determine base frame id for this sample if available
         base_fid = None
         try:
             if hasattr(self, "frame_ids") and len(self.frame_ids) > 0:
-                # This method is called per-item via __getitem__; we need item index
-                # but it's not passed - we'll rely on cached frame mapping if set
+                # Per-item frame binding is not available in this helper; require explicit frame mapping upstream.
                 pass
         except Exception:
             pass
@@ -733,41 +732,38 @@ class ETHDataset(object):
                     and x2_clip > x1_clip
                     and y2_clip > y1_clip
                 ):
-                    # attempt to load a nearby frame (stride 10 as per data)
+                    # Strict external path binding: no repo-internal fallback, no nearest-frame fallback.
                     fid = base_fid if base_fid is not None else 0
                     fpath = os.path.join(vis_dir, f"frame{int(fid):06d}.jpg")
                     if not os.path.exists(fpath):
-                        # try to find any frame
-                        import glob
-
-                        cands = sorted(glob.glob(os.path.join(vis_dir, "frame*.jpg")))
-                        if cands:
-                            fpath = cands[0]
-                    try:
-                        img = cv2.imread(fpath)
-                        if img is not None:
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                            crop = img[y1_clip:y2_clip, x1_clip:x2_clip]
-                            if crop.shape[0] > 0 and crop.shape[1] > 0:
-                                if crop.shape[0] != h or crop.shape[1] != w:
-                                    crop = cv2.resize(crop, (w, h))
-                                # pad if needed
-                                if x1 < 0 or y1 < 0 or x2 > orig_w or y2 > orig_h:
-                                    pad_img = np.zeros((h, w, 3), dtype=crop.dtype)
-                                    py1 = max(0, -y1)
-                                    px1 = max(0, -x1)
-                                    py2 = py1 + crop.shape[0]
-                                    px2 = px1 + crop.shape[1]
-                                    pad_img[py1:py2, px1:px2] = crop
-                                    crop = pad_img
-                                crop_t = (
-                                    torch.from_numpy(crop).permute(2, 0, 1).float()
-                                    / 255.0
-                                )
-                                crops[a, p] = crop_t
-                                continue
-                    except Exception:
-                        pass
+                        # try png/alt naming only within the same external dir (no fallback to other dirs/frames)
+                        alt = os.path.join(vis_dir, f"frame{int(fid):06d}.png")
+                        if os.path.exists(alt):
+                            fpath = alt
+                        else:
+                            raise FileNotFoundError(
+                                f"Required external frame not found: {fpath} (strict; no fallback). "
+                                f"vis_dir={vis_dir}, fid={fid}"
+                            )
+                    img = cv2.imread(fpath)
+                    if img is None:
+                        raise FileNotFoundError(f"Failed to read external frame asset: {fpath}")
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    crop = img[y1_clip:y2_clip, x1_clip:x2_clip]
+                    if crop.shape[0] > 0 and crop.shape[1] > 0:
+                        if crop.shape[0] != h or crop.shape[1] != w:
+                            crop = cv2.resize(crop, (w, h))
+                        if x1 < 0 or y1 < 0 or x2 > orig_w or y2 > orig_h:
+                            pad_img = np.zeros((h, w, 3), dtype=crop.dtype)
+                            py1 = max(0, -y1)
+                            px1 = max(0, -x1)
+                            py2 = py1 + crop.shape[0]
+                            px2 = px1 + crop.shape[1]
+                            pad_img[py1:py2, px1:px2] = crop
+                            crop = pad_img
+                        crop_t = torch.from_numpy(crop).permute(2, 0, 1).float() / 255.0
+                        crops[a, p] = crop_t
+                        continue
                 crops[a, p] = torch.zeros(3, h, w, dtype=torch.float32)
 
         return crops

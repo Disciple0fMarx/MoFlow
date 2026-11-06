@@ -1,10 +1,9 @@
 """Build full-range ETH/UCY global video features from ``visual_data`` frames.
 
-The legacy cache in ``features/resnet18`` only covers the validation segment of
-each scene. Full raw training/test windows need every frame in the scene's
-timeline. This script encodes the repo-local frame images (which cover the full
-timelines) at the dataset stride and writes the standard per-scene cache
-consumed by ``FrameFeatureLookup``.
+Encodes pre-extracted frame images from the external TU-Clausthal datasets root
+(strict external path binding, e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets)
+at the dataset stride and writes the standard per-scene cache consumed by
+``FrameFeatureLookup``.
 """
 
 from __future__ import annotations
@@ -77,9 +76,9 @@ def build_scene(
 
 
 def main() -> None:
-    default_frames = Path(__file__).resolve().parents[2] / "data" / "eth_ucy"
+    default_frames = Path("/home/efrei_stage/Desktop/tu-clausthal/datasets")
     p = argparse.ArgumentParser()
-    p.add_argument("--frames-root", default=str(default_frames))
+    p.add_argument("--frames-root", default=str(default_frames), help="External TU-Clausthal datasets root containing <scene>/visual_data/")
     p.add_argument("--out", default="features/resnet18")
     p.add_argument(
         "--scenes",

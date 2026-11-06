@@ -153,33 +153,41 @@ def load_run_config(run_dir, default_cfg='cfg/eth_ucy/cor_fm.yml'):
 
 def _find_frame_path(vis_dir, fid):
     if vis_dir is None or fid is None:
-        return None
-    # try exact patterns
+        raise FileNotFoundError(f"vis_dir and fid are required for strict frame lookup (got vis_dir={vis_dir!r}, fid={fid!r})")
+    if not os.path.isdir(vis_dir):
+        raise FileNotFoundError(
+            f"External visual_data directory not found: {vis_dir}. "
+            "Provide --data-dir pointing at the TU-Clausthal datasets root "
+            "(e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets) containing <scene>/visual_data/."
+        )
     for pat in [f'frame{int(fid):06d}.jpg', f'frame{int(fid):06d}.png', f'frame{int(fid):05d}.jpg']:
-        p=os.path.join(vis_dir, pat)
-        if os.path.exists(p): return p
-    # glob
-    try:
-        import glob
-        cands = glob.glob(os.path.join(vis_dir, f'*{int(fid)}*.jpg')) + glob.glob(os.path.join(vis_dir, f'*{int(fid)}*.png'))
-        if cands: return sorted(cands)[0]
-        cands = glob.glob(os.path.join(vis_dir, 'frame*.jpg')) + glob.glob(os.path.join(vis_dir, 'frame*.png'))
-        if cands:
-            # pick closest
-            return sorted(cands)[0]
-    except Exception:
-        traceback.print_exc()
-    return None
+        p = os.path.join(vis_dir, pat)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(
+        f"No frame asset for fid={fid} under external visual_data: {vis_dir}. "
+        "Expected frame{fid:06d}.jpg/png (strict external path; no repo-internal fallback)."
+    )
 
 
-def find_ref_img(data_dir,scene):
-    for base in [os.path.join(data_dir,scene,'visual_data'),os.path.join(_REPO_ROOT,'data','eth_ucy',scene,'visual_data')]:
-        if os.path.exists(base):
-            # try to find any frame
-            import glob
-            cands = glob.glob(os.path.join(base,'frame*.jpg')) + glob.glob(os.path.join(base,'frame*.png')) + glob.glob(os.path.join(base,'*.jpg')) + glob.glob(os.path.join(base,'*.png'))
-            if cands: return sorted(cands)[0]
-    return None
+def find_ref_img(data_dir, scene):
+    base = os.path.join(data_dir, scene, 'visual_data')
+    if not os.path.isdir(base):
+        raise FileNotFoundError(
+            f"External visual_data directory not found: {base}. "
+            "Strict external path binding: pass --data-dir pointing at the TU-Clausthal datasets root "
+            "(e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets). No repo-internal fallback."
+        )
+    import glob
+    cands = (
+        glob.glob(os.path.join(base, 'frame*.jpg'))
+        + glob.glob(os.path.join(base, 'frame*.png'))
+        + glob.glob(os.path.join(base, '*.jpg'))
+        + glob.glob(os.path.join(base, '*.png'))
+    )
+    if cands:
+        return sorted(cands)[0]
+    raise FileNotFoundError(f"No frame assets found under external visual_data: {base}")
 
 def load_img(p):
     if not p or not os.path.exists(p): return None
@@ -557,13 +565,9 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             for t in range(cfg_ref.past_frames):
                 fid = base_fid - (cfg_ref.past_frames - 1 - t) * 10
                 fpath = _find_frame_path(vis_dir, fid)
-                if fpath is None:
-                    import glob
-                    cand=sorted(glob.glob(os.path.join(vis_dir,'frame*.jpg')))+sorted(glob.glob(os.path.join(vis_dir,'frame*.png')))
-                    if cand: fpath=cand[min(max(0,len(cand)//2),len(cand)-1)]
-                if fpath is None: continue
                 img=cv2.imread(fpath)
-                if img is None: continue
+                if img is None:
+                    raise FileNotFoundError(f"Failed to read external frame asset: {fpath}")
                 img_rgb=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
                 frames_rgb_list.append(img_rgb)
                 pil=Image.fromarray(img_rgb); frames_t_list.append(preprocess(pil))
@@ -653,7 +657,12 @@ def main():
     p.add_argument('--seed',type=int,default=1234)
     args=p.parse_args()
     data_dir=args.data_dir
-    if not os.path.exists(data_dir): data_dir=str(_REPO_ROOT/'data/eth_ucy')
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(
+            f"External --data-dir not found: {data_dir}. "
+            "Expected TU-Clausthal datasets root (e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets). "
+            "No repo-internal fallback is used."
+        )
     out_dir=Path(args.out_dir)
     for scene in args.scenes: render_scene_eth(scene,args,out_dir,data_dir,args.device)
     print('Done.')
