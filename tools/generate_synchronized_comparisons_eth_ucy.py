@@ -124,46 +124,16 @@ def load_ckpt_flexible(ckpt_path, model):
     for kk,vv in sd.items():
         kk2 = kk[7:] if kk.startswith("module.") else kk
         nd[kk2]=vv
-    # shape-tolerant adaptation (e.g., agent_query_embedding / agent_order_embedding mismatches)
+    # no fragile reshaping: instantiate model from the correct run/checkpoint config so
+    # embedding shapes (e.g. agent_query_embedding/agent_order_embedding) match natively.
+    incompatible = model.load_state_dict(nd, strict=False)
     try:
-        msd = model.state_dict()
-        adapted = OrderedDict()
-        adapted_keys = []
-        skipped = []
-        for k,v in nd.items():
-            if k in msd and hasattr(v, 'shape') and hasattr(msd[k], 'shape') and tuple(v.shape) != tuple(msd[k].shape):
-                vs, ms = tuple(v.shape), tuple(msd[k].shape)
-                nv = None
-                try:
-                    if len(vs) == len(ms) and vs[1:] == ms[1:] and vs[0] > 0 and ms[0] > 0:
-                        # match dim 0: slice or repeat
-                        if vs[0] >= ms[0]:
-                            nv = v[:ms[0]].clone()
-                        else:
-                            reps = (ms[0] + vs[0] - 1) // vs[0]
-                            nv = v.repeat((reps,) + (1,) * (len(vs)-1))[:ms[0]].clone()
-                    elif len(vs) == len(ms) and vs[0] == ms[0]:
-                        # match trailing dims by crop/pad
-                        nv = torch.zeros(ms, dtype=v.dtype)
-                        slices = tuple(slice(0, min(a,b)) for a,b in zip(vs, ms))
-                        nv[slices] = v[slices]
-                except Exception:
-                    nv = None
-                if nv is not None and tuple(nv.shape) == ms:
-                    adapted[k] = nv
-                    adapted_keys.append((k, vs, ms))
-                    continue
-                skipped.append((k, vs, ms))
-                continue
-            adapted[k]=v
-        if adapted_keys:
-            print(f"[ckpt] shape-adapted {len(adapted_keys)} keys (e.g. {adapted_keys[0][0]}: ckpt{adapted_keys[0][1]} -> model{adapted_keys[0][2]})")
-        if skipped:
-            print(f"[ckpt] shape-skipped {len(skipped)} keys (e.g. {skipped[0][0]}: ckpt{skipped[0][1]} vs model{skipped[0][2]})")
-        nd = adapted
+        missing = getattr(incompatible, "missing_keys", [])
+        unexpected = getattr(incompatible, "unexpected_keys", [])
+        if missing or unexpected:
+            print(f"[ckpt] loaded with missing={len(missing)} unexpected={len(unexpected)} (strict=False)")
     except Exception:
-        traceback.print_exc()
-    model.load_state_dict(nd, strict=False)
+        pass
     return model
 
 def find_checkpoint(scene, mode, cor_fm_root="results_eth_ucy/cor_fm", flat_dir="results_eth_ucy/loso_full_matrix/checkpoints"):
@@ -488,6 +458,25 @@ def _draw_agent_crops(ax, agent_crops, scene_name=None):
         traceback.print_exc()
 
 
+def _resolve_dataset_agents(ckpt_path, cfg_m, batch, ds_fallback):
+    ac = infer_agents_from_ckpt(ckpt_path)
+    if ac is not None:
+        return int(ac)
+    try:
+        po = batch.get('past_traj_original_scale') if isinstance(batch, dict) else None
+        if po is not None and torch.is_tensor(po):
+            if po.ndim == 4:
+                return int(po.shape[1])
+            if po.ndim == 3:
+                return int(po.shape[0])
+    except Exception:
+        pass
+    try:
+        return int(getattr(ds_fallback, 'past_traj_original_scale').shape[1])
+    except Exception:
+        return int(getattr(cfg_m.MODEL.CONTEXT_ENCODER, 'AGENTS', 2))
+
+
 def render_scene_eth(scene,args,out_dir,data_dir,device):
     cfg_ref=Config(args.cfg,f'sync_{scene}'); cfg_ref.device=device
     ds_ref=ETHDataset(cfg=cfg_ref,training=False,data_dir=data_dir,subset=scene,rotate_time_frame=0,type='original',video_mode='full')
@@ -523,13 +512,14 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
     for mode in VARIANTS:
         ckpt,run_dir=find_checkpoint(scene,mode,args.cor_fm_root,args.ckpt_dir)
         if not ckpt: print(f'  SKIP {scene}/{mode} missing'); continue
+        # Build config from the run that produced this checkpoint so embedding shapes match natively.
         cfg_path=load_run_config(run_dir,args.cfg); cfg_m=Config(cfg_path,f'sync_{scene}_{mode}'); cfg_m.device=device
         try: cfg_m.MODEL.CONTEXT_ENCODER.VIDEO_MODE=mode; cfg_m.MODEL.CONTEXT_ENCODER.USE_VIDEO=(mode!='off')
         except: pass
-        ac=infer_agents_from_ckpt(ckpt)
-        if ac is not None: force_set_agents(cfg_m,ac)
+        ac=_resolve_dataset_agents(ckpt,cfg_m,batch,ds_ref)
+        force_set_agents(cfg_m,ac)
         try: ds_m=ETHDataset(cfg=cfg_m,training=False,data_dir=data_dir,subset=scene,rotate_time_frame=0,type='original',video_mode=mode); copy_norm_stats(ds_m,cfg_m)
-        except: ds_m=ds_ref
+        except: ds_m=ds_ref; copy_norm_stats(ds_m,cfg_m)
         try:
             model=ETHMotionTransformer(model_config=cfg_m.MODEL,logger=NullLogger(),config=cfg_m)
             denoiser=FlowMatcher(cfg_m,model,logger=NullLogger())
@@ -676,55 +666,58 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                 pil=Image.fromarray(img_rgb); frames_t_list.append(preprocess(pil))
             if frames_t_list:
                 frames_t=torch.stack(frames_t_list,0).to(device)
-                # get ckpt for full
+                # get ckpt for full (instantiate with checkpoint/run config to match embedding dims)
                 ckpt_f,run_f=find_checkpoint(scene,'full',args.cor_fm_root,args.ckpt_dir)
                 if ckpt_f:
                     cfg_f=Config(load_run_config(run_f,args.cfg),f'gcam_{scene}')
                     cfg_f.device=device
                     try: cfg_f.MODEL.CONTEXT_ENCODER.VIDEO_MODE='full'; cfg_f.MODEL.CONTEXT_ENCODER.USE_VIDEO=True
                     except: pass
+                    ac_f=_resolve_dataset_agents(ckpt_f,cfg_f,batch,ds_ref)
+                    force_set_agents(cfg_f,ac_f)
+                    copy_norm_stats(ds_ref,cfg_f)
                     model_f=ETHMotionTransformer(model_config=cfg_f.MODEL,logger=NullLogger(),config=cfg_f)
                     den_f=FlowMatcher(cfg_f,model_f,logger=NullLogger())
                     den_f=load_ckpt_flexible(ckpt_f,den_f).to(device).eval()
-                    for p in den_f.parameters(): p.requires_grad_(False)
-                    x_gc={k:v.to(device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
-                    # ensure z_video_global present for gradcam if expected
-                    if 'z_video_global' not in x_gc and ds_ref.z_video_global is not None:
-                        try:
-                            bidx_cand = locals().get('chosen_bi', args.batch_idx)
-                            x_gc['z_video_global'] = ds_ref.z_video_global[bidx_cand:bidx_cand+1].to(device)
-                        except Exception:
-                            traceback.print_exc()
-                    gt_gc=batch['fut_traj_original_scale'].to(device).float()
-                    res_gc=gradcam_pass(backbone,den_f,cfg_f,x_gc,frames_t,gt_gc,cfg_f.future_frames,device,args.seed)
-                    cam=res_gc['cam']
-                    if cam is not None and len(cam)>0 and len(frames_rgb_list)>0:
-                        cam2d=cam[-1]
-                        H,W=frames_rgb_list[-1].shape[:2]
-                        cam_up=cv2.resize(cam2d,(W,H),interpolation=cv2.INTER_LINEAR)
-                        heat_rgb,_=_apply_jet(cam_up,0.4)
-                        base=frames_rgb_list[-1].astype(np.float32)/255.0
-                        overlay=(1-0.4)*base+0.4*heat_rgb
-                        overlay=np.clip(overlay*255,0,255).astype(np.uint8)
-                        h,wbg=bg.shape[:2]
-                        extent=(0,wbg,hbg,0)
-                        ax.imshow(overlay,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
-                        cam_overlay_done=True
-                        # draw trajs
-                        fb=bundles_list.get('full') or list(bundles_list.values())[0]
-                        obs_p=world_to_pix_native(ds_ref,fb['obs'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); obs_p=ensure_2d_coords(obs_p)
-                        if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
-                        gt_p=world_to_pix_native(ds_ref,fb['gt'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); gt_p=ensure_2d_coords(gt_p)
-                        if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='lime',linewidth=1.8,marker='o',markersize=3,zorder=4)
-                        best_p=world_to_pix_native(ds_ref,fb['best'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); best_p=ensure_2d_coords(best_p)
-                        if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color='white',linewidth=1.8,alpha=0.95,linestyle='--',zorder=5)
-                        ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
-                        ax.set_title(f"Grad-CAM (full)\nanchor frame",fontsize=11)
-                        ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
-                        try:
-                            _draw_agent_crops(ax, batch.get('agent_crops'))
-                        except Exception:
-                            traceback.print_exc()
+                for p in den_f.parameters(): p.requires_grad_(False)
+                x_gc={k:v.to(device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
+                # ensure z_video_global present for gradcam if expected
+                if 'z_video_global' not in x_gc and ds_ref.z_video_global is not None:
+                    try:
+                        bidx_cand = locals().get('chosen_bi', args.batch_idx)
+                        x_gc['z_video_global'] = ds_ref.z_video_global[bidx_cand:bidx_cand+1].to(device)
+                    except Exception:
+                        traceback.print_exc()
+                gt_gc=batch['fut_traj_original_scale'].to(device).float()
+                res_gc=gradcam_pass(backbone,den_f,cfg_f,x_gc,frames_t,gt_gc,cfg_f.future_frames,device,args.seed)
+                cam=res_gc['cam']
+                if cam is not None and len(cam)>0 and len(frames_rgb_list)>0:
+                    cam2d=cam[-1]
+                    H,W=frames_rgb_list[-1].shape[:2]
+                    cam_up=cv2.resize(cam2d,(W,H),interpolation=cv2.INTER_LINEAR)
+                    heat_rgb,_=_apply_jet(cam_up,0.4)
+                    base=frames_rgb_list[-1].astype(np.float32)/255.0
+                    overlay=(1-0.4)*base+0.4*heat_rgb
+                    overlay=np.clip(overlay*255,0,255).astype(np.uint8)
+                    h,wbg=bg.shape[:2]
+                    extent=(0,wbg,hbg,0)
+                    ax.imshow(overlay,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
+                    cam_overlay_done=True
+                    # draw trajs
+                    fb=bundles_list.get('full') or list(bundles_list.values())[0]
+                    obs_p=world_to_pix_native(ds_ref,fb['obs'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); obs_p=ensure_2d_coords(obs_p)
+                    if obs_p is not None and np.isfinite(obs_p).all(): ax.plot(obs_p[:,0],obs_p[:,1],'--',color='black',linewidth=1.6,marker='o',markersize=3,zorder=4)
+                    gt_p=world_to_pix_native(ds_ref,fb['gt'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); gt_p=ensure_2d_coords(gt_p)
+                    if gt_p is not None and np.isfinite(gt_p).all(): ax.plot(gt_p[:,0],gt_p[:,1],color='lime',linewidth=1.8,marker='o',markersize=3,zorder=4)
+                    best_p=world_to_pix_native(ds_ref,fb['best'],scene,target_res=(w,h) if 'w' in locals() and bg is not None else None); best_p=ensure_2d_coords(best_p)
+                    if best_p is not None and np.isfinite(best_p).all(): ax.plot(best_p[:,0],best_p[:,1],color='white',linewidth=1.8,alpha=0.95,linestyle='--',zorder=5)
+                    ax.set_xlim(*xlimp); ax.set_ylim(*ylimp)
+                    ax.set_title(f"Grad-CAM (full)\nanchor frame",fontsize=11)
+                    ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
+                    try:
+                        _draw_agent_crops(ax, batch.get('agent_crops'))
+                    except Exception:
+                        traceback.print_exc()
         except Exception as e:
             gcam_err = e
             traceback.print_exc()
