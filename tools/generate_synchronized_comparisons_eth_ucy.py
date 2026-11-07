@@ -124,6 +124,21 @@ def load_ckpt_flexible(ckpt_path, model):
     for kk,vv in sd.items():
         kk2 = kk[7:] if kk.startswith("module.") else kk
         nd[kk2]=vv
+    # shape-tolerant filtering (e.g., agent_query_embedding / agent_order_embedding mismatches)
+    try:
+        msd = model.state_dict()
+        filtered = OrderedDict()
+        skipped = []
+        for k,v in nd.items():
+            if k in msd and hasattr(v, 'shape') and hasattr(msd[k], 'shape') and tuple(v.shape) != tuple(msd[k].shape):
+                skipped.append((k, tuple(v.shape), tuple(msd[k].shape)))
+                continue
+            filtered[k]=v
+        if skipped:
+            print(f"[ckpt] shape-filtered {len(skipped)} keys (e.g. {skipped[0][0]}: ckpt{skipped[0][1]} vs model{skipped[0][2]})")
+        nd = filtered
+    except Exception:
+        traceback.print_exc()
     model.load_state_dict(nd, strict=False)
     return model
 
@@ -152,23 +167,59 @@ def load_run_config(run_dir, default_cfg='cfg/eth_ucy/cor_fm.yml'):
             if os.path.exists(p2): return p2
     return default_cfg
 
-def _find_frame_path(vis_dir, fid):
-    if vis_dir is None or fid is None:
-        raise FileNotFoundError(f"vis_dir and fid are required for strict frame lookup (got vis_dir={vis_dir!r}, fid={fid!r})")
-    if not os.path.isdir(vis_dir):
-        raise FileNotFoundError(
-            f"External visual_data directory not found: {vis_dir}. "
-            "Provide --data-dir pointing at the TU-Clausthal datasets root "
-            "(e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets) containing <scene>/visual_data/."
-        )
-    for pat in [f'frame{int(fid):06d}.jpg', f'frame{int(fid):06d}.png', f'frame{int(fid):05d}.jpg']:
-        p = os.path.join(vis_dir, pat)
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError(
-        f"No frame asset for fid={fid} under external visual_data: {vis_dir}. "
-        "Expected frame{fid:06d}.jpg/png (strict external path; no repo-internal fallback)."
-    )
+def _decode_frame_from_video(video_path, frame_index):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Failed to open external video for frame streaming: {video_path}")
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fi = max(0, int(frame_index))
+        if total > 0:
+            fi = min(fi, total - 1)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            # fallback: sequential read
+            cap.release(); cap = cv2.VideoCapture(str(video_path))
+            cur = 0; frame = None
+            while cur <= fi:
+                ok, fr = cap.read()
+                if not ok or fr is None:
+                    break
+                frame = fr; cur += 1
+            if frame is None:
+                raise FileNotFoundError(f"Failed to decode frame_index={frame_index} (clamped {fi}) from {video_path}")
+        return frame
+    finally:
+        try: cap.release()
+        except Exception: pass
+
+
+def _find_frame_path(vis_dir, fid, data_dir=None, scene=None):
+    # Negative frame IDs (historical obs windows): clamp to 0 / absolute start.
+    fid_eff = int(fid) if fid is not None else 0
+    if fid_eff < 0:
+        fid_eff = 0
+    # Try pre-extracted frames in external visual_data if present.
+    if vis_dir is not None and os.path.isdir(vis_dir):
+        for pat in [f'frame{fid_eff:06d}.jpg', f'frame{fid_eff:06d}.png', f'frame{fid_eff:05d}.jpg', f'frame{int(fid):06d}.jpg']:
+            p = os.path.join(vis_dir, pat)
+            if os.path.exists(p):
+                return p
+    # Robust fallback: on-the-fly decode from external video.avi via TU-ClaustHAL_MAP (no repo writes).
+    if data_dir is not None and scene is not None:
+        scene_path = _resolve_scene_path(data_dir, scene)
+        vpath = Path(scene_path) / 'video.avi'
+        if not vpath.is_file():
+            raise FileNotFoundError(f"External video.avi not found for scene={scene}: {vpath}")
+        frame_bgr = _decode_frame_from_video(vpath, fid_eff)
+        # return ndarray marker via special tuple? simpler: cache in /tmp outside repo? forbidden to write assets in repo; /tmp is fine
+        import tempfile
+        tmp = Path(tempfile.gettempdir()) / f"moflow_vframe_{scene}_{fid_eff}.jpg"
+        if not tmp.exists():
+            cv2.imwrite(str(tmp), frame_bgr)
+        return str(tmp)
+    raise FileNotFoundError(f"Cannot resolve frame for fid={fid} (vis_dir={vis_dir}, data_dir={data_dir}, scene={scene})")
 
 
 def _resolve_scene_path(data_dir, scene):
@@ -592,7 +643,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             frames_t_list=[]; frames_rgb_list=[]
             for t in range(cfg_ref.past_frames):
                 fid = base_fid - (cfg_ref.past_frames - 1 - t) * 10
-                fpath = _find_frame_path(vis_dir, fid)
+                fpath = _find_frame_path(vis_dir, fid, data_dir=data_dir, scene=scene)
                 img=cv2.imread(fpath)
                 if img is None:
                     raise FileNotFoundError(f"Failed to read external frame asset: {fpath}")
