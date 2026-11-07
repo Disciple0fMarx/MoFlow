@@ -115,9 +115,22 @@ def _cfg_norm_bounds(cfg):
 
 def best_of_k_target_score(pred: torch.Tensor, gt: torch.Tensor, cfg):
     fmin, fmax = _cfg_norm_bounds(cfg)
-    pred_metric = rearrange(pred, "b k a (f d) -> b k a f d", f=cfg.future_frames)[..., :2]
+    f = int(getattr(cfg, "future_frames", gt.shape[-2] if gt.ndim >= 2 else 12))
+    # pred: [B,K,A,F*D] or [B,K,A,F,D]
+    if pred.ndim == 4:
+        pred_metric = rearrange(pred, "b k a (f d) -> b k a f d", f=f)[..., :2]
+    elif pred.ndim == 5:
+        pred_metric = pred[..., :2]
+    else:
+        raise ValueError(f"Unexpected pred shape in best_of_k_target_score: {tuple(pred.shape)}")
     pred_metric = unnormalize_min_max(pred_metric, fmin, fmax, -1, 1)
-    gt_metric = rearrange(gt, "b a (f d) -> b a f d", f=cfg.future_frames)[..., :2]
+    # gt: [B,A,F*D] or [B,A,F,D]
+    if gt.ndim == 3:
+        gt_metric = rearrange(gt, "b a (f d) -> b a f d", f=f)[..., :2]
+    elif gt.ndim == 4:
+        gt_metric = gt[..., :2]
+    else:
+        raise ValueError(f"Unexpected gt shape in best_of_k_target_score: {tuple(gt.shape)}")
     gt_metric = unnormalize_min_max(gt_metric, fmin, fmax, -1, 1)
     diff = pred_metric - gt_metric.unsqueeze(1)
     ade = torch.norm(diff, dim=-1).mean(dim=-1).mean(dim=-1)
