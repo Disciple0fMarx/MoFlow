@@ -100,11 +100,25 @@ def euler_sample_predictions(
     return y_t
 
 
+def _cfg_norm_bounds(cfg):
+    def _get(*names, default):
+        for n in names:
+            if hasattr(cfg, n):
+                v = getattr(cfg, n)
+                if v is not None:
+                    return v
+        return default
+    fmin = _get('fut_traj_min', 'FUT_TRAJ_MIN', 'data_min', 'DATA_MIN', default=-1.0)
+    fmax = _get('fut_traj_max', 'FUT_TRAJ_MAX', 'data_max', 'DATA_MAX', default=1.0)
+    return fmin, fmax
+
+
 def best_of_k_target_score(pred: torch.Tensor, gt: torch.Tensor, cfg):
+    fmin, fmax = _cfg_norm_bounds(cfg)
     pred_metric = rearrange(pred, "b k a (f d) -> b k a f d", f=cfg.future_frames)[..., :2]
-    pred_metric = unnormalize_min_max(pred_metric, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1)
+    pred_metric = unnormalize_min_max(pred_metric, fmin, fmax, -1, 1)
     gt_metric = rearrange(gt, "b a (f d) -> b a f d", f=cfg.future_frames)[..., :2]
-    gt_metric = unnormalize_min_max(gt_metric, cfg.fut_traj_min, cfg.fut_traj_max, -1, 1)
+    gt_metric = unnormalize_min_max(gt_metric, fmin, fmax, -1, 1)
     diff = pred_metric - gt_metric.unsqueeze(1)
     ade = torch.norm(diff, dim=-1).mean(dim=-1).mean(dim=-1)
     ade_min, best_idx = ade.min(dim=1)
