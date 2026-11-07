@@ -49,6 +49,7 @@ from matplotlib.patches import Rectangle
 from torch.utils.data import DataLoader
 
 from data.dataloader_eth_ucy import ETHDataset, seq_collate_eth
+from data.tu_clausthal_eth_ucy_parser import TU_CLAUSTHAL_MAP
 from models.backbone_eth_ucy import ETHMotionTransformer
 from models.flow_matching import FlowMatcher
 from utils.normalization import unnormalize_min_max
@@ -170,15 +171,41 @@ def _find_frame_path(vis_dir, fid):
     )
 
 
+def _resolve_scene_path(data_dir, scene):
+    data_dir = Path(data_dir)
+    if scene not in TU_CLAUSTHAL_MAP:
+        raise ValueError(f"Unknown scene {scene}, valid: {sorted(set(TU_CLAUSTHAL_MAP.keys()))}")
+    group, scene_dir = TU_CLAUSTHAL_MAP[scene]
+    # nested TU-Clausthal layout
+    nested = data_dir / group / scene_dir
+    if nested.is_dir():
+        return nested
+    # compatibility: data_dir already points at group or scene_dir
+    if (data_dir / scene_dir).is_dir():
+        return data_dir / scene_dir
+    if data_dir.name == group and (data_dir / scene_dir).is_dir():
+        return data_dir / scene_dir
+    raise FileNotFoundError(
+        f"TU-Clausthal scene path not found for scene={scene} under external --data-dir={data_dir}. "
+        f"Expected nested layout: {group}/{scene_dir} (e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets/{group}/{scene_dir})."
+    )
+
+
+def _resolve_visual_data_dir(data_dir, scene):
+    scene_path = _resolve_scene_path(data_dir, scene)
+    vis = scene_path / "visual_data"
+    if vis.is_dir():
+        return str(vis)
+    raise FileNotFoundError(
+        f"External visual_data directory not found: {vis}. "
+        "Strict external path binding (TU-Clausthal nested layout); no repo-internal fallback. "
+        "Generate/extract visual_data or provide pre-extracted frames under the external scene directory."
+    )
+
+
 def find_ref_img(data_dir, scene):
-    base = os.path.join(data_dir, scene, 'visual_data')
-    if not os.path.isdir(base):
-        raise FileNotFoundError(
-            f"External visual_data directory not found: {base}. "
-            "Strict external path binding: pass --data-dir pointing at the TU-Clausthal datasets root "
-            "(e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets). No repo-internal fallback."
-        )
-    import glob
+    base = _resolve_visual_data_dir(data_dir, scene)
+    import glob, os
     cands = (
         glob.glob(os.path.join(base, 'frame*.jpg'))
         + glob.glob(os.path.join(base, 'frame*.png'))
@@ -187,6 +214,7 @@ def find_ref_img(data_dir, scene):
     )
     if cands:
         return sorted(cands)[0]
+    # strict external-only fallback: try first frame from video.avi in the resolved scene dir via cv2? no; require frames
     raise FileNotFoundError(f"No frame assets found under external visual_data: {base}")
 
 def load_img(p):
@@ -551,7 +579,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             backbone, dim, preprocess = _make_backbone('resnet18', pretrained=True, device=device)
             backbone.eval()
             # load frames
-            vis_dir = os.path.join(data_dir, scene, 'visual_data')
+            vis_dir = _resolve_visual_data_dir(data_dir, scene)
             frame_ids = getattr(ds_ref, 'frame_ids', None)
             bidx = locals().get('chosen_bi', args.batch_idx)
             try:
