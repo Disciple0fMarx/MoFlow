@@ -101,44 +101,99 @@ def discover_run_dir(cor_fm_root: Path, scene: str, mode: str) -> Optional[Path]
     return uniq[0]
 
 
-def parse_best_metrics(csv_path: Path) -> Dict[str, Optional[float]]:
-    out = {k: None for k in METRIC_ALIASES}
-    out["best_epoch"] = None  # type: ignore
-    out["n_rows"] = 0  # type: ignore
+HORIZON_METRIC_PREFIXES = [
+    "ADE_min", "ADE_avg", "FDE_min", "FDE_avg",
+    "JADE_min", "JADE_avg", "JFDE_min", "JFDE_avg",
+    "MASD", "AVar", "FVar",
+]
+
+
+def _norm_metric_col(col: str) -> str:
+    c = str(col).strip()
+    # normalize common variants
+    c = c.replace("ade_min", "ADE_min").replace("fde_min", "FDE_min")
+    c = c.replace("ade_avg", "ADE_avg").replace("fde_avg", "FDE_avg")
+    c = c.replace("jade_min", "JADE_min").replace("jfde_min", "JFDE_min")
+    c = c.replace("jade_avg", "JADE_avg").replace("jfde_avg", "JFDE_avg")
+    c = c.replace("masd", "MASD").replace("avar", "AVar").replace("fvar", "FVar")
+    c = c.replace("-", "_")
+    return c
+
+
+def _is_horizon_metric_col(col: str) -> bool:
+    c = _norm_metric_col(col)
+    for pfx in HORIZON_METRIC_PREFIXES:
+        if c == pfx:
+            return True
+        if c.startswith(pfx + "_") or c.startswith(pfx + "@") or c.startswith(pfx + "/"):
+            return True
+        # e.g. ADE_min_1.2, ADE_min1.2
+        if re.match(rf"^{re.escape(pfx)}[_/@]?\d", c):
+            return True
+    return False
+
+
+def _extract_horizon_metrics(row: Dict[str, object], fieldnames: List[str]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for col in fieldnames:
+        if not col:
+            continue
+        if _is_horizon_metric_col(col):
+            key = _norm_metric_col(col)
+            # keep horizon suffix numeric-friendly
+            key = re.sub(r"[^A-Za-z0-9_.]+", "_", key)
+            out[key] = _to_float(row.get(col))
+    return out
+
+
+def _best_epoch_key(row_vals: Dict[str, object], i: int):
+    # primary: overall min ADE (ADE_min final if present, else any ADE_min*, else val/loss)
+    candidates = []
+    for k, v in row_vals.items():
+        if v is None:
+            continue
+        nk = k.lower()
+        if nk in ("ade_min", "minade", "ade_min_final"):
+            candidates.append((0, float(v)))
+        elif nk.startswith("ade_min"):
+            candidates.append((1, float(v)))
+    if candidates:
+        candidates.sort()
+        return (candidates[0][1], i)
+    for lk in ["val_loss", "loss", "eval_loss"]:
+        if lk in row_vals and row_vals[lk] is not None:
+            return (float(row_vals[lk]), i)
+    return (float("inf"), i)
+
+
+def parse_best_metrics(csv_path: Path) -> Dict[str, Optional[object]]:
+    out: Dict[str, Optional[object]] = {"best_epoch": None, "n_rows": 0}
     if not csv_path.exists():
         return out
     with csv_path.open(newline="") as fh:
         reader = csv.DictReader(fh)
         rows = list(reader)
-        fieldnames = reader.fieldnames or (rows[0].keys() if rows else [])
-    out["n_rows"] = len(rows)  # type: ignore
+        fieldnames = list(reader.fieldnames or (rows[0].keys() if rows else []))
+    out["n_rows"] = len(rows)
     if not rows:
         return out
-    cols = {k: _find_col(fieldnames, v) for k, v in METRIC_ALIASES.items()}
-    # pick best epoch by minADE then minFDE (lower better)
+    # also keep legacy aliases for compatibility
+    legacy_cols = {k: _find_col(fieldnames, v) for k, v in METRIC_ALIASES.items()}
     best = None
     best_key = None
     for i, row in enumerate(rows):
-        vals = {k: _to_float(row.get(cols[k])) if cols[k] else None for k in METRIC_ALIASES}
-        if all(v is None for v in vals.values()):
-            continue
-        key = (
-            vals["minADE"] if vals["minADE"] is not None else float("inf"),
-            vals["minFDE"] if vals["minFDE"] is not None else float("inf"),
-            i,
-        )
+        all_num = { _norm_metric_col(k): _to_float(v) for k, v in row.items() if k }
+        key = _best_epoch_key(all_num, i)
         if best_key is None or key < best_key:
             best_key = key
-            best = (i, row, vals)
-    if best is None:
-        # fallback: last row
-        row = rows[-1]
-        vals = {k: _to_float(row.get(cols[k])) if cols[k] else None for k in METRIC_ALIASES}
-        best = (len(rows) - 1, row, vals)
-    i, row, vals = best
-    out.update(vals)
+            best = (i, row)
+    assert best is not None
+    i, row = best
     epoch_col = _find_col(fieldnames, ["epoch", "ep", "step"])
-    out["best_epoch"] = _to_float(row.get(epoch_col)) if epoch_col else i  # type: ignore
+    out["best_epoch"] = _to_float(row.get(epoch_col)) if epoch_col else i
+    for k, col in legacy_cols.items():
+        out[k] = _to_float(row.get(col)) if col else None
+    out.update(_extract_horizon_metrics(row, fieldnames))
     return out
 
 
@@ -170,8 +225,8 @@ def aggregate(cor_fm_root: Path) -> List[Dict[str, object]]:
                 "status": "ok" if run_dir else "missing_run_dir",
             }
             if not run_dir:
-                for k in ["minADE", "minFDE", "avgADE", "avgFDE", "best_epoch", "n_rows"]:
-                    rec[k] = ""
+                rec["best_epoch"] = ""
+                rec["n_rows"] = 0
                 rec.update({
                     "checkpoint_best_exists": False,
                     "checkpoint_best_path": "",
@@ -193,25 +248,46 @@ def aggregate(cor_fm_root: Path) -> List[Dict[str, object]]:
             elif not art["eval_val_metrics_exists"]:
                 rec["status"] = "missing_eval_metrics"
             else:
-                missing = [k for k in ["minADE", "minFDE", "avgADE", "avgFDE"] if rec.get(k) == ""]
-                rec["status"] = "ok" if not missing else f"partial_metrics_missing:{','.join(missing)}"
+                rec["status"] = "ok"
             rows.append(rec)
     return rows
 
 
-def write_csv(rows: List[Dict[str, object]], out_path: Path) -> None:
+def _dynamic_metric_fields(rows: List[Dict[str, object]]) -> List[str]:
+    base = {
+        "scene","video_mode","vm_tag","status","run_dir",
+        "checkpoint_best_exists","checkpoint_best_path","checkpoint_last_exists",
+        "eval_val_metrics_exists","eval_val_metrics_path","config_backup_exists",
+        "best_epoch","n_rows","minADE","minFDE","avgADE","avgFDE",
+    }
+    keys = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in base:
+                keys.add(k)
+    def sort_key(k: str):
+        m = re.match(r"([A-Za-z]+(?:_[A-Za-z]+)*)[_@]?([0-9]+(?:\.[0-9]+)?)?$", k)
+        if m:
+            return (m.group(1), float(m.group(2)) if m.group(2) else -1, k)
+        return (k, -1, k)
+    return sorted(keys, key=sort_key)
+
+
+def write_csv(rows: List[Dict[str, object]], out_path: Path) -> List[str]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    metric_fields = _dynamic_metric_fields(rows)
     fields = [
         "scene", "video_mode", "vm_tag", "status", "run_dir",
         "checkpoint_best_exists", "checkpoint_best_path", "checkpoint_last_exists",
         "eval_val_metrics_exists", "eval_val_metrics_path", "config_backup_exists",
         "best_epoch", "n_rows", "minADE", "minFDE", "avgADE", "avgFDE",
-    ]
+    ] + metric_fields
     with out_path.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in fields})
+    return metric_fields
 
 
 def _fmt(v) -> str:
@@ -265,17 +341,25 @@ def main(argv=None):
     p.add_argument("--cor-fm-root", default="results_eth_ucy/cor_fm")
     p.add_argument("--out-csv", default="results_eth_ucy/aggregated_benchmark_metrics.csv")
     p.add_argument("--out-md", default="results_eth_ucy/aggregated_benchmark_metrics.md")
+    p.add_argument("--out-comprehensive-csv", default="results_eth_ucy/comprehensive_horizon_metrics.csv")
     args = p.parse_args(argv)
 
     cor_fm_root = Path(args.cor_fm_root)
     if not cor_fm_root.exists():
         print(f"[WARN] cor_fm root not found: {cor_fm_root}. Writing empty discovery report.")
     rows = aggregate(cor_fm_root)
-    write_csv(rows, Path(args.out_csv))
+    metric_fields = write_csv(rows, Path(args.out_csv))
+    # comprehensive wide-format: one row per (scene, video_mode) with all horizon metric-horizon pairs
+    write_csv(rows, Path(args.out_comprehensive_csv))
     write_markdown(rows, Path(args.out_md), cor_fm_root)
     n_ok = sum(1 for r in rows if r.get("status") == "ok")
     n_ckpt = sum(1 for r in rows if r.get("checkpoint_best_exists"))
-    print(f"[aggregate] wrote {args.out_csv} and {args.out_md} ({n_ok}/15 ok, {n_ckpt}/15 checkpoint_best.pt found)")
+    print(f"[aggregate] wrote {args.out_csv}, {args.out_comprehensive_csv}, {args.out_md} ({n_ok}/15 ok, {n_ckpt}/15 checkpoint_best.pt found)")
+    # clean stdout summary
+    show = ["scene","video_mode","status","best_epoch","minADE","minFDE","avgADE","avgFDE"] + metric_fields[:12]
+    print(" | ".join(show))
+    for r in rows:
+        print(" | ".join(_fmt(r.get(k)) for k in show))
     for r in rows:
         if r.get("status") != "ok":
             print(f"  [!] {r['scene']}/{r['video_mode']}: {r['status']} run_dir={r.get('run_dir') or '-'}")
