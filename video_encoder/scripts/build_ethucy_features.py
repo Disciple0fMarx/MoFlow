@@ -54,8 +54,8 @@ def _extract_frames_from_video(video_path: Path, visual_data_dir: Path) -> list[
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
-            # Use 1-based frame numbering aligned with typical ETH/UCY frame ids
-            fid = idx + 1
+            # Use 0-based frame numbering to match obsmat frame identifiers
+            fid = idx
             out_path = visual_data_dir / f"frame{fid:06d}.jpg"
             if not cv2.imwrite(str(out_path), frame):
                 raise IOError(f"Failed to write extracted frame: {out_path}")
