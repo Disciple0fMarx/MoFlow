@@ -124,19 +124,43 @@ def load_ckpt_flexible(ckpt_path, model):
     for kk,vv in sd.items():
         kk2 = kk[7:] if kk.startswith("module.") else kk
         nd[kk2]=vv
-    # shape-tolerant filtering (e.g., agent_query_embedding / agent_order_embedding mismatches)
+    # shape-tolerant adaptation (e.g., agent_query_embedding / agent_order_embedding mismatches)
     try:
         msd = model.state_dict()
-        filtered = OrderedDict()
+        adapted = OrderedDict()
+        adapted_keys = []
         skipped = []
         for k,v in nd.items():
             if k in msd and hasattr(v, 'shape') and hasattr(msd[k], 'shape') and tuple(v.shape) != tuple(msd[k].shape):
-                skipped.append((k, tuple(v.shape), tuple(msd[k].shape)))
+                vs, ms = tuple(v.shape), tuple(msd[k].shape)
+                nv = None
+                try:
+                    if len(vs) == len(ms) and vs[1:] == ms[1:] and vs[0] > 0 and ms[0] > 0:
+                        # match dim 0: slice or repeat
+                        if vs[0] >= ms[0]:
+                            nv = v[:ms[0]].clone()
+                        else:
+                            reps = (ms[0] + vs[0] - 1) // vs[0]
+                            nv = v.repeat((reps,) + (1,) * (len(vs)-1))[:ms[0]].clone()
+                    elif len(vs) == len(ms) and vs[0] == ms[0]:
+                        # match trailing dims by crop/pad
+                        nv = torch.zeros(ms, dtype=v.dtype)
+                        slices = tuple(slice(0, min(a,b)) for a,b in zip(vs, ms))
+                        nv[slices] = v[slices]
+                except Exception:
+                    nv = None
+                if nv is not None and tuple(nv.shape) == ms:
+                    adapted[k] = nv
+                    adapted_keys.append((k, vs, ms))
+                    continue
+                skipped.append((k, vs, ms))
                 continue
-            filtered[k]=v
+            adapted[k]=v
+        if adapted_keys:
+            print(f"[ckpt] shape-adapted {len(adapted_keys)} keys (e.g. {adapted_keys[0][0]}: ckpt{adapted_keys[0][1]} -> model{adapted_keys[0][2]})")
         if skipped:
-            print(f"[ckpt] shape-filtered {len(skipped)} keys (e.g. {skipped[0][0]}: ckpt{skipped[0][1]} vs model{skipped[0][2]})")
-        nd = filtered
+            print(f"[ckpt] shape-skipped {len(skipped)} keys (e.g. {skipped[0][0]}: ckpt{skipped[0][1]} vs model{skipped[0][2]})")
+        nd = adapted
     except Exception:
         traceback.print_exc()
     model.load_state_dict(nd, strict=False)
