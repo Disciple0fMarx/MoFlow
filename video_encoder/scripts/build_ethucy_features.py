@@ -1,10 +1,13 @@
-"""Build full-range ETH/UCY global video features from TU-Clausthal layout.
+"""Build ETH/UCY ResNet18 global video feature caches (strict external-only).
 
-Supports nested TU-Clausthal paths (ETH/seq_eth, ETH/seq_hotel, UCY/students03,
-UCY/zara01, UCY/zara02). If <scene_dir>/visual_data is missing/empty, auto-extracts
-frames from video.avi using cv2.VideoCapture into visual_data/frame{idx:06d}.jpg,
-then encodes at dataset stride and writes the standard per-scene cache consumed by
-FrameFeatureLookup. Strict external path binding (--frames-root).
+Invariants:
+- Read source videos EXCLUSIVELY from external TU-Clausthal mirror:
+  <frames-root>/(ETH|UCY)/<scene_dir>/video.avi (resolved via TU_CLAUSTHAL_MAP).
+- Write ONLY precomputed feature caches (<scene>.npy, <scene>.manifest.parquet)
+  to the repository output directory (features/resnet18). No dataset assets,
+  extracted frames, or visual_data folders are created/read inside _REPO_ROOT.
+- 0-based frame indexing for obsmat parity: decoded frame idx -> frame_id = idx
+  (covers fid 0).
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Iterator, Tuple
 
 import cv2
 import numpy as np
@@ -29,77 +33,65 @@ from data.tu_clausthal_eth_ucy_parser import TU_CLAUSTHAL_MAP
 from video_encoder.backbones import build_backbone
 
 
-def _resolve_scene_dir(frames_root: Path, scene: str) -> Path:
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_video_path(frames_root: Path, scene: str) -> Path:
+    frames_root = frames_root.resolve()
+    if _is_under(frames_root, _REPO_ROOT):
+        raise ValueError(
+            f"--frames-root must be an external TU-Clausthal path, not inside the repo: {frames_root} (repo={_REPO_ROOT})"
+        )
     if scene not in TU_CLAUSTHAL_MAP:
         raise ValueError(f"Unknown scene {scene}, valid: {sorted(set(TU_CLAUSTHAL_MAP.keys()))}")
     group, scene_dir = TU_CLAUSTHAL_MAP[scene]
-    path = frames_root / group / scene_dir
-    if not path.is_dir():
+    scene_path = frames_root / group / scene_dir
+    if not scene_path.is_dir():
         raise FileNotFoundError(
-            f"TU-Clausthal scene directory not found: {path}. "
+            f"TU-Clausthal scene directory not found (external-only): {scene_path}. "
             f"Expected nested layout under --frames-root ({frames_root}) with {group}/{scene_dir}."
         )
-    return path
+    # Never read/create visual_data inside repo; do not use repo paths.
+    if _is_under(scene_path, _REPO_ROOT):
+        raise ValueError(f"Resolved scene path is inside repo (forbidden): {scene_path}")
+    video_path = scene_path / "video.avi"
+    if not video_path.is_file():
+        raise FileNotFoundError(
+            f"Source video not found (external-only): {video_path}. "
+            "build_ethucy_features reads exclusively from external TU-Clausthal video.avi."
+        )
+    return video_path
 
 
-def _extract_frames_from_video(video_path: Path, visual_data_dir: Path) -> list[tuple[int, Path]]:
-    visual_data_dir.mkdir(parents=True, exist_ok=True)
+def _iter_video_frames(video_path: Path, stride: int) -> Iterator[Tuple[int, np.ndarray]]:
+    """Stream frames from external video.avi with 0-based obsmat-parity indexing."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise FileNotFoundError(f"Failed to open video for auto-extraction: {video_path}")
-    frames: list[tuple[int, Path]] = []
+        raise FileNotFoundError(f"Failed to open external video: {video_path}")
     idx = 0
+    yielded = 0
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
                 break
-            # Use 0-based frame numbering to match obsmat frame identifiers
-            fid = idx
-            out_path = visual_data_dir / f"frame{fid:06d}.jpg"
-            if not cv2.imwrite(str(out_path), frame):
-                raise IOError(f"Failed to write extracted frame: {out_path}")
-            frames.append((fid, out_path))
+            fid = idx  # 0-based for obsmat parity
+            if stride <= 1 or fid % stride == 0:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                yield fid, frame_rgb
+                yielded += 1
             idx += 1
     finally:
         cap.release()
-    if not frames:
-        raise RuntimeError(f"No frames extracted from video: {video_path}")
-    return frames
-
-
-def _ensure_visual_data(scene_dir: Path) -> Path:
-    visual_data_dir = scene_dir / "visual_data"
-    has_frames = visual_data_dir.is_dir() and any(visual_data_dir.glob("frame*.jpg"))
-    if has_frames:
-        return visual_data_dir
-    # Auto-extract from video.avi in the TU-Clausthal scene folder
-    video_path = scene_dir / "video.avi"
-    if not video_path.is_file():
-        raise FileNotFoundError(
-            f"visual_data missing/empty and video.avi not found for auto-extraction in: {scene_dir}. "
-            "Strict external TU-Clausthal layout requires video.avi or pre-extracted visual_data/frame*.jpg."
-        )
-    print(f"[ethucy-features] auto-extracting frames from {video_path} -> {visual_data_dir}", flush=True)
-    _extract_frames_from_video(video_path, visual_data_dir)
-    return visual_data_dir
-
-
-def _frame_files(frames_root: Path, scene: str, stride: int) -> list[tuple[int, Path]]:
-    scene_dir = _resolve_scene_dir(frames_root, scene)
-    visual_data_dir = _ensure_visual_data(scene_dir)
-    frames = []
-    for path in visual_data_dir.glob("frame*.jpg"):
-        try:
-            fid = int(path.stem.replace("frame", ""))
-        except ValueError:
-            continue
-        if stride <= 1 or fid % stride == 0:
-            frames.append((fid, path))
-    frames.sort(key=lambda item: item[0])
-    if not frames:
-        raise FileNotFoundError(f"No frame images found under {visual_data_dir} (stride={stride})")
-    return frames
+    if idx == 0:
+        raise RuntimeError(f"No frames decoded from external video: {video_path}")
+    if yielded == 0:
+        raise RuntimeError(f"No frames selected at stride={stride} from external video: {video_path}")
 
 
 @torch.inference_mode()
@@ -111,29 +103,44 @@ def build_scene(
     device: str | None,
     batch_size: int,
 ) -> tuple[int, int]:
+    out_dir = out_dir.resolve()
+    # Cache output is allowed in repo (features/resnet18); ensure we don't write dataset assets elsewhere.
+    if not _is_under(out_dir, _REPO_ROOT):
+        # allow external out if explicitly requested, but primary invariant is repo features output
+        pass
+
+    video_path = _resolve_video_path(frames_root, scene)
     model, dim, preprocess = build_backbone("resnet18")
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(dev).eval()
 
-    frames = _frame_files(frames_root, scene, stride)
+    frame_ids: list[int] = []
     feats: list[np.ndarray] = []
     buf: list[torch.Tensor] = []
-    for _, path in tqdm(frames, desc=f"encode {scene}", unit="frame"):
-        buf.append(preprocess(Image.open(path).convert("RGB")))
+    buf_fids: list[int] = []
+
+    for fid, frame_rgb in tqdm(_iter_video_frames(video_path, stride), desc=f"encode {scene}", unit="frame"):
+        buf.append(preprocess(Image.fromarray(frame_rgb)))
+        buf_fids.append(fid)
         if len(buf) >= batch_size:
             x = torch.stack(buf, dim=0).to(dev, non_blocking=True)
             feats.append(model(x).detach().cpu().numpy().astype(np.float32))
+            frame_ids.extend(buf_fids)
             buf.clear()
+            buf_fids.clear()
     if buf:
         x = torch.stack(buf, dim=0).to(dev, non_blocking=True)
         feats.append(model(x).detach().cpu().numpy().astype(np.float32))
+        frame_ids.extend(buf_fids)
 
     features = np.concatenate(feats, axis=0)
+    if features.shape[0] != len(frame_ids):
+        raise RuntimeError(f"Feature/manifest size mismatch for {scene}: {features.shape[0]} vs {len(frame_ids)}")
     manifest = pd.DataFrame(
         {
             "scene": scene,
-            "frame_id": np.asarray([fid for fid, _ in frames], dtype=np.int64),
-            "row_idx": np.arange(len(frames), dtype=np.int64),
+            "frame_id": np.asarray(frame_ids, dtype=np.int64),
+            "row_idx": np.arange(len(frame_ids), dtype=np.int64),
         }
     )
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -144,13 +151,14 @@ def build_scene(
 
 def main() -> None:
     default_frames = Path("/home/efrei_stage/Desktop/tu-clausthal/datasets")
+    default_out = _REPO_ROOT / "features" / "resnet18"
     p = argparse.ArgumentParser()
     p.add_argument(
         "--frames-root",
         default=str(default_frames),
-        help="External TU-Clausthal datasets root (contains ETH/ and UCY/).",
+        help="External TU-Clausthal datasets root (contains ETH/ and UCY/). Must not be inside repo.",
     )
-    p.add_argument("--out", default="features/resnet18")
+    p.add_argument("--out", default=str(default_out), help="Output feature cache dir (repo-root features/resnet18).")
     p.add_argument(
         "--scenes",
         nargs="*",
@@ -161,13 +169,21 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=32)
     args = p.parse_args()
 
-    out_dir = Path(args.out)
-    frames_root = Path(args.frames_root)
+    out_dir = Path(args.out).resolve()
+    frames_root = Path(args.frames_root).resolve()
     if not frames_root.is_dir():
         raise FileNotFoundError(
             f"External --frames-root not found: {frames_root}. "
             "Expected TU-Clausthal datasets root (e.g. /home/efrei_stage/Desktop/tu-clausthal/datasets)."
         )
+    if _is_under(frames_root, _REPO_ROOT):
+        raise ValueError(f"--frames-root must not be inside the repo (_REPO_ROOT={_REPO_ROOT}): {frames_root}")
+    # Guard: do not write dataset assets into repo except intended cache output
+    if _is_under(out_dir, _REPO_ROOT) and not str(out_dir).endswith("features/resnet18") and not str(out_dir).endswith("features\\resnet18"):
+        # allow subdirs under features; be permissive but explicit
+        if "features" not in out_dir.parts:
+            raise ValueError(f"--out inside repo must target a features cache path, got: {out_dir}")
+
     for scene in args.scenes:
         n, dim = build_scene(
             frames_root=frames_root,
