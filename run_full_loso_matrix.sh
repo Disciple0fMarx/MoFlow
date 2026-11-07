@@ -38,9 +38,10 @@ if [ "$SKIP_FEATURES" != "1" ]; then
   echo "FRAMES_ROOT=$FRAMES_ROOT"
   echo "FEATURES_ROOT=$FEATURES_ROOT"
   python -m video_encoder.scripts.build_ethucy_features \
-    --frames-root "$FRAMES_ROOT" \
+    --frames-root /home/efrei_stage/Desktop/tu-clausthal/datasets \
     --out "$FEATURES_ROOT" \
-    --stride 10 2>&1 | tail -40 || true
+    --scenes eth hotel univ zara1 zara2 \
+    --stride 10
 else
   echo "=== SKIP_FEATURES enabled: using cached features at $FEATURES_ROOT ==="
 fi
