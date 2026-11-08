@@ -311,49 +311,87 @@ def load_img(p, data_dir=None, scene=None, anchor_frame=None):
         traceback.print_exc()
         return None
 
+def _audit_verified_world_to_pixel(pts_xy, H, scene, orig_size, target_res=None):
+    """Audit-verified ETH/UCY mapping (Sec 1.1/4.3 of audit):
+    p = (w,1) @ inv(H)^T; inv(H) gives (row,col) => swap to (u,v)=(b,a); top-left origin.
+    UCY (univ/zara*) optical-center convention per validated pipeline: u += W/2, v = Hh/2 - v.
+    """
+    pts = np.asarray(pts_xy, dtype=np.float64)
+    if pts.size == 0:
+        return pts
+    if pts.ndim == 1:
+        pts = pts.reshape(-1, pts.shape[-1])
+    if pts.shape[-1] < 2:
+        return None
+    w = np.hstack([pts[:, :2], np.ones((len(pts), 1))])
+    p = w @ np.linalg.inv(H).T
+    a, b = p[:, 0] / p[:, 2], p[:, 1] / p[:, 2]
+    u, v = b, a  # row/col swap (winning config: inv(H), swap, top-left)
+    W, Hh = float(orig_size[0]), float(orig_size[1])
+    sc = str(scene).lower() if scene is not None else ""
+    if sc in ("univ", "zara1", "zara2", "students03", "zara01", "zara02"):
+        u = u + W / 2.0
+        v = Hh / 2.0 - v
+    out = np.column_stack([u, v])
+    if target_res is not None and tuple(map(int, target_res)) != (int(W), int(Hh)):
+        sx = float(target_res[0]) / W
+        sy = float(target_res[1]) / Hh
+        out[:, 0] *= sx
+        out[:, 1] *= sy
+    return out
+
+
 def world_to_pix_native(ds, pts, scene=None, target_res=None):
-    if pts is None or ds is None: return None
+    if pts is None or ds is None:
+        return None
     try:
         pts_arr = np.asarray(pts, dtype=float)
-        if pts_arr.size == 0: return pts_arr
-        
-        # Isolate strictly (x, y) spatial coordinates to prevent feature channels from breaking matmul
+        if pts_arr.size == 0:
+            return pts_arr
         if pts_arr.ndim >= 2 and pts_arr.shape[-1] > 2:
             pts_arr = pts_arr[..., :2]
         elif pts_arr.ndim == 1:
-            pts_arr = pts_arr.reshape(-1, 1)
-            if pts_arr.shape[1] < 2:
+            pts_arr = pts_arr.reshape(-1, pts_arr.shape[-1] if pts_arr.ndim > 1 else 1)
+            if pts_arr.shape[-1] < 2:
                 return None
-            
         original_shape = pts_arr.shape
-        if pts_arr.ndim > 2:
-            pts_arr = pts_arr.reshape(-1, 2)
-        if pts_arr.shape[-1] < 2:
-            return None
-            
-        pts_t = torch.tensor(pts_arr, dtype=torch.float32)
+        flat = pts_arr.reshape(-1, 2)
+        sc = scene or getattr(ds, 'subset', None)
+        H = None
         try:
-            if target_res is not None:
-                res = ds.world_to_pixel(pts_t, scene=scene, target_res=target_res)
-            else:
-                res = ds.world_to_pixel(pts_t, scene=scene)
-        except TypeError:
-            res = ds.world_to_pixel(pts_t, scene=scene)
-        
-        if isinstance(res, torch.Tensor): 
-            res = res.detach().cpu().numpy()
-            
-        if res is not None and hasattr(res, 'ndim') and res.ndim >= 2 and res.shape[-1] >= 2:
+            if hasattr(ds, 'scene_H') and sc in ds.scene_H:
+                H = ds.scene_H[sc]
+            elif hasattr(ds, 'H'):
+                H = ds.H
+        except Exception:
+            H = None
+        orig_size = getattr(ds, 'orig_res', (720, 576))
+        try:
+            if hasattr(ds, 'SCENE_RESOLUTIONS'):
+                orig_size = ds.SCENE_RESOLUTIONS.get(sc, orig_size)
+        except Exception:
             pass
+        if H is not None:
+            res = _audit_verified_world_to_pixel(flat, H, sc, orig_size, target_res=target_res)
         else:
+            pts_t = torch.tensor(flat, dtype=torch.float32)
+            try:
+                res = ds.world_to_pixel(pts_t, scene=sc, target_res=target_res) if target_res is not None else ds.world_to_pixel(pts_t, scene=sc)
+            except TypeError:
+                res = ds.world_to_pixel(pts_t, scene=sc)
+            if isinstance(res, torch.Tensor):
+                res = res.detach().cpu().numpy()
+        if res is None:
             return None
-            
+        res = np.asarray(res)
+        if res.ndim == 2 and res.shape[1] >= 2:
+            res = res[:, :2]
         if len(original_shape) > 2:
             res = res.reshape(original_shape[:-1] + (2,))
-            
         return res
     except Exception as e:
         print(f'[viz] world_to_pixel failed: {e}')
+        traceback.print_exc()
         return None
 
 def ensure_2d_coords(arr):
@@ -481,40 +519,8 @@ def _draw_bundle_eth(ax,bundle,background,extent,ds_ref,scene,xlim,ylim):
     ax.set_xlim(*xlim); ax.set_ylim(*ylim)
 
 def _draw_agent_crops(ax, agent_crops, scene_name=None):
-    """Render agent-centric crops in a corner inset if available."""
-    try:
-        if agent_crops is None:
-            return
-        ac = agent_crops
-        if isinstance(ac, torch.Tensor):
-            ac = ac.detach().cpu()
-        ac_np = np.asarray(ac)
-        if ac_np.size == 0:
-            return
-        # Expected shapes: [B,A,P,3,h,w] or [A,P,3,h,w]
-        if ac_np.ndim == 6:
-            crop = ac_np[0, 0, -1]  # first batch, first agent, last observed frame
-        elif ac_np.ndim == 5:
-            crop = ac_np[0, -1]
-        elif ac_np.ndim == 4:
-            crop = ac_np[-1]
-        else:
-            return
-        if crop.shape[0] == 3:
-            img = np.transpose(crop, (1, 2, 0))
-        elif crop.shape[-1] == 3:
-            img = crop
-        else:
-            return
-        img = np.clip(img, 0, 1)
-        # Draw inset in top-right corner
-        inset = ax.inset_axes([0.72, 0.72, 0.25, 0.25])
-        inset.imshow(img, interpolation='bilinear')
-        inset.set_xticks([])
-        inset.set_yticks([])
-        inset.set_title('Agent crop', fontsize=8)
-    except Exception as e:
-        traceback.print_exc()
+    """Disabled for ETH/UCY synchronized comparisons: show full uncropped scene context (no agent zoom inset)."""
+    return
 
 
 def _resolve_dataset_agents(ckpt_path, cfg_m, batch, ds_fallback):
