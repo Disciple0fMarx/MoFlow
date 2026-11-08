@@ -161,13 +161,49 @@ def load_run_config(run_dir, default_cfg='cfg/eth_ucy/cor_fm.yml'):
             if os.path.exists(p2): return p2
     return default_cfg
 
-def _decode_frame_from_video(video_path, frame_index):
+_VIDEO_FRAME_OFFSET_CACHE = {}
+
+
+def _infer_video_frame_offset(video_path, sample_fids=None):
+    """Map ETH/UCY dataset frame IDs to cv2 POS_FRAMES indices.
+    Tries identity; if sample annotation IDs exceed video length, uses relative
+    offset from min sample id (common when annotations use global frame numbers).
+    """
+    vp = str(Path(video_path).resolve())
+    if vp in _VIDEO_FRAME_OFFSET_CACHE:
+        return _VIDEO_FRAME_OFFSET_CACHE[vp]
+    off = 0
+    try:
+        cap = cv2.VideoCapture(vp)
+        if cap.isOpened():
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            s = [int(x) for x in (sample_fids or []) if x is not None]
+            if total > 0 and s:
+                mx = max(s)
+                mn = min(s)
+                # raw id in range -> identity
+                if 0 <= mn and mx < total:
+                    off = 0
+                # global frame numbers -> shift by first annotated frame
+                elif 0 <= (mn - mn) and (mx - mn) < total:
+                    off = mn
+                else:
+                    off = mn if (mx - mn) < max(total * 2, 1) else 0
+        cap.release()
+    except Exception:
+        traceback.print_exc(); off = 0
+    _VIDEO_FRAME_OFFSET_CACHE[vp] = int(off)
+    return int(off)
+
+
+def _decode_frame_from_video(video_path, frame_index, frame_offset=0):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Failed to open external video for frame streaming: {video_path}")
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        fi = max(0, int(frame_index))
+        raw = int(frame_index) - int(frame_offset)
+        fi = max(0, raw)
         if total > 0:
             fi = min(fi, total - 1)
         cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
@@ -182,34 +218,45 @@ def _decode_frame_from_video(video_path, frame_index):
                     break
                 frame = fr; cur += 1
             if frame is None:
-                raise FileNotFoundError(f"Failed to decode frame_index={frame_index} (clamped {fi}) from {video_path}")
+                raise FileNotFoundError(f"Failed to decode frame_index={frame_index} offset={frame_offset} (pos {fi}) from {video_path}")
         return frame
     finally:
         try: cap.release()
         except Exception: pass
 
 
-def _find_frame_path(vis_dir, fid, data_dir=None, scene=None):
+def _sample_fids_for_offset(ds, data_dir, scene):
+    try:
+        fids = getattr(ds, 'frame_ids', None)
+        if fids is not None and len(fids):
+            arr = np.asarray(fids).reshape(-1)
+            return [int(arr[0]), int(arr[min(len(arr)-1, 100)]), int(arr[-1])]
+    except Exception:
+        pass
+    return None
+
+
+def _find_frame_path(vis_dir, fid, data_dir=None, scene=None, frame_offset=0):
     # Negative frame IDs (historical obs windows): clamp to 0 / absolute start.
     fid_eff = int(fid) if fid is not None else 0
     if fid_eff < 0:
         fid_eff = 0
-    # Try pre-extracted frames in external visual_data if present.
+    # Try pre-extracted frames in external visual_data if present (named by dataset fid).
     if vis_dir is not None and os.path.isdir(vis_dir):
         for pat in [f'frame{fid_eff:06d}.jpg', f'frame{fid_eff:06d}.png', f'frame{fid_eff:05d}.jpg', f'frame{int(fid):06d}.jpg']:
             p = os.path.join(vis_dir, pat)
             if os.path.exists(p):
                 return p
-    # Robust fallback: on-the-fly decode from external video.avi via TU-ClaustHAL_MAP (no repo writes).
+    # Robust fallback: on-the-fly decode from external video.avi (dataset fid -> video index).
     if data_dir is not None and scene is not None:
         scene_path = _resolve_scene_path(data_dir, scene)
         vpath = Path(scene_path) / 'video.avi'
         if not vpath.is_file():
             raise FileNotFoundError(f"External video.avi not found for scene={scene}: {vpath}")
-        frame_bgr = _decode_frame_from_video(vpath, fid_eff)
-        # return ndarray marker via special tuple? simpler: cache in /tmp outside repo? forbidden to write assets in repo; /tmp is fine
+        frame_bgr = _decode_frame_from_video(vpath, fid_eff, frame_offset=frame_offset)
         import tempfile
-        tmp = Path(tempfile.gettempdir()) / f"moflow_vframe_{scene}_{fid_eff}.jpg"
+        vi = max(0, fid_eff - int(frame_offset))
+        tmp = Path(tempfile.gettempdir()) / f"moflow_vframe_{scene}_{vi}.jpg"
         if not tmp.exists():
             cv2.imwrite(str(tmp), frame_bgr)
         return str(tmp)
@@ -249,12 +296,12 @@ def _resolve_visual_data_dir(data_dir, scene, required=False):
     return None
 
 
-def _decode_scene_frame(data_dir, scene, frame_index):
+def _decode_scene_frame(data_dir, scene, frame_index, frame_offset=0):
     scene_path = _resolve_scene_path(data_dir, scene)
     vpath = Path(scene_path) / 'video.avi'
     if not vpath.is_file():
         raise FileNotFoundError(f"External video.avi not found for scene={scene}: {vpath}")
-    frame_bgr = _decode_frame_from_video(vpath, max(0, int(frame_index)))
+    frame_bgr = _decode_frame_from_video(vpath, max(0, int(frame_index)), frame_offset=frame_offset)
     return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
 
@@ -292,14 +339,14 @@ def find_ref_img(data_dir, scene, anchor_frame=None):
     # on-the-fly from external video.avi (no repo assets)
     return "video.avi#frame=0"
 
-def load_img(p, data_dir=None, scene=None, anchor_frame=None):
+def load_img(p, data_dir=None, scene=None, anchor_frame=None, frame_offset=0):
     try:
         if anchor_frame is not None and data_dir is not None and scene is not None:
-            return _decode_scene_frame(data_dir, scene, anchor_frame)
+            return _decode_scene_frame(data_dir, scene, anchor_frame, frame_offset=frame_offset)
         if isinstance(p, str) and p.startswith('video.avi#frame='):
             fi = int(p.split('=')[-1])
             if data_dir is not None and scene is not None:
-                return _decode_scene_frame(data_dir, scene, fi)
+                return _decode_scene_frame(data_dir, scene, fi, frame_offset=frame_offset)
         if not p or not os.path.exists(p):
             return None
         img = cv2.imread(p)
@@ -587,7 +634,9 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         traceback.print_exc()
     if batch is None: print(f'[ETH-UCY] {scene}: no valid batch'); return
     anchor_fid = _anchor_frame_id(ds_ref, batch, chosen_bi, cfg_ref, data_dir, scene)
-    bg = load_img(None, data_dir=data_dir, scene=scene, anchor_frame=anchor_fid)
+    vpath_off = Path(_resolve_scene_path(data_dir, scene)) / 'video.avi'
+    frame_offset = _infer_video_frame_offset(vpath_off, sample_fids=_sample_fids_for_offset(ds_ref, data_dir, scene))
+    bg = load_img(None, data_dir=data_dir, scene=scene, anchor_frame=anchor_fid, frame_offset=frame_offset)
     bundles={}
     for mode in VARIANTS:
         ckpt,run_dir=find_checkpoint(scene,mode,args.cor_fm_root,args.ckpt_dir)
@@ -638,13 +687,16 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                 traceback.print_exc()
             pm = to_numpy(pred_m)
             bi_i = int(np.asarray(bi).reshape(()))
-            btm = to_numpy(pred_m[bi_i])
+            btm = to_numpy(pred_m[bi_i]) if np.asarray(pred_m).ndim >= 1 else to_numpy(pred_m)
             gtm = to_numpy(gt_m)
-            # normalize shapes
-            if gtm.ndim==4: gtm = gtm[0,0]
-            elif gtm.ndim==3: gtm = gtm[0]
-            if pm.ndim==3: pm = pm  # [K,A,T,2] or [K,T,2]
-            bundles[mode]={'preds':pm,'best':btm.reshape(-1,2),'gt':gtm.reshape(-1,2),'ade':float(np.asarray(ade_min).reshape(())), 'batch': batch_m or batch, 'ds': ds_m}
+            # normalize shapes for plotting (keep all agents as flattened trajs)
+            if gtm.ndim == 4:  # [1,A,F,2]
+                gtm = gtm[0]
+            if gtm.ndim == 3 and gtm.shape[-1] != 2:
+                gtm = gtm.reshape(-1, 2)
+            if btm.ndim == 3 and btm.shape[-1] == 2:
+                pass  # [A,F,2]
+            bundles[mode]={'preds':pm,'best':np.asarray(btm).reshape(-1,2),'gt':np.asarray(gtm).reshape(-1,2),'ade':float(np.asarray(ade_min).reshape(())), 'batch': batch_m or batch, 'ds': ds_m}
             del model,denoiser; torch.cuda.empty_cache(); gc.collect()
         except Exception as e:
             traceback.print_exc(); print(f'  {mode} err: {e}')
@@ -750,7 +802,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             stride_f = int(getattr(cfg_ref,'frame_stride',10) or 10)
             for t in range(cfg_ref.past_frames):
                 fid = base_fid - (cfg_ref.past_frames - 1 - t) * stride_f
-                fpath = _find_frame_path(vis_dir, fid, data_dir=data_dir, scene=scene)
+                fpath = _find_frame_path(vis_dir, fid, data_dir=data_dir, scene=scene, frame_offset=frame_offset)
                 img=cv2.imread(fpath)
                 if img is None:
                     raise FileNotFoundError(f"Failed to read external frame asset: {fpath}")
