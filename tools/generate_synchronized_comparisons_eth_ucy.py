@@ -236,39 +236,80 @@ def _resolve_scene_path(data_dir, scene):
     )
 
 
-def _resolve_visual_data_dir(data_dir, scene):
+def _resolve_visual_data_dir(data_dir, scene, required=False):
     scene_path = _resolve_scene_path(data_dir, scene)
     vis = scene_path / "visual_data"
     if vis.is_dir():
         return str(vis)
-    raise FileNotFoundError(
-        f"External visual_data directory not found: {vis}. "
-        "Strict external path binding (TU-Clausthal nested layout); no repo-internal fallback. "
-        "Generate/extract visual_data or provide pre-extracted frames under the external scene directory."
-    )
+    if required:
+        raise FileNotFoundError(
+            f"External visual_data directory not found: {vis}. "
+            "Strict external path binding (TU-Clausthal nested layout); no repo-internal fallback."
+        )
+    return None
 
 
-def find_ref_img(data_dir, scene):
-    base = _resolve_visual_data_dir(data_dir, scene)
-    import glob, os
-    cands = (
-        glob.glob(os.path.join(base, 'frame*.jpg'))
-        + glob.glob(os.path.join(base, 'frame*.png'))
-        + glob.glob(os.path.join(base, '*.jpg'))
-        + glob.glob(os.path.join(base, '*.png'))
-    )
-    if cands:
-        return sorted(cands)[0]
-    # strict external-only fallback: try first frame from video.avi in the resolved scene dir via cv2? no; require frames
-    raise FileNotFoundError(f"No frame assets found under external visual_data: {base}")
+def _decode_scene_frame(data_dir, scene, frame_index):
+    scene_path = _resolve_scene_path(data_dir, scene)
+    vpath = Path(scene_path) / 'video.avi'
+    if not vpath.is_file():
+        raise FileNotFoundError(f"External video.avi not found for scene={scene}: {vpath}")
+    frame_bgr = _decode_frame_from_video(vpath, max(0, int(frame_index)))
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-def load_img(p):
-    if not p or not os.path.exists(p): return None
+
+def _anchor_frame_id(ds, batch, chosen_bi, cfg, data_dir, scene):
+    # Prefer explicit dataset frame ids (anchor/last observed frame for the window)
     try:
+        fids = getattr(ds, 'frame_ids', None)
+        if fids is not None and len(fids) > int(chosen_bi):
+            return int(fids[int(chosen_bi)])
+    except Exception:
+        pass
+    for k in ['frame_id', 'frame_ids', 'anchor_frame', 'last_frame_id']:
+        try:
+            if isinstance(batch, dict) and k in batch:
+                v = batch[k]
+                if torch.is_tensor(v):
+                    return int(v.detach().cpu().reshape(-1)[0].item())
+                return int(np.asarray(v).reshape(-1)[0])
+        except Exception:
+            pass
+    # Fallback: derive from batch index and past/future horizon
+    stride = int(getattr(cfg, 'frame_stride', 10) or 10)
+    past = int(getattr(cfg, 'past_frames', 8) or 8)
+    return int(chosen_bi) * stride + (past - 1) * stride
+
+
+def find_ref_img(data_dir, scene, anchor_frame=None):
+    if anchor_frame is not None:
+        return f"video.avi#frame={max(0,int(anchor_frame))}"
+    vis = _resolve_visual_data_dir(data_dir, scene, required=False)
+    if vis:
+        import glob, os
+        cands = glob.glob(os.path.join(vis, 'frame*.jpg')) + glob.glob(os.path.join(vis, 'frame*.png'))
+        if cands:
+            return sorted(cands)[0]
+    # on-the-fly from external video.avi (no repo assets)
+    return "video.avi#frame=0"
+
+def load_img(p, data_dir=None, scene=None, anchor_frame=None):
+    try:
+        if anchor_frame is not None and data_dir is not None and scene is not None:
+            return _decode_scene_frame(data_dir, scene, anchor_frame)
+        if isinstance(p, str) and p.startswith('video.avi#frame='):
+            fi = int(p.split('=')[-1])
+            if data_dir is not None and scene is not None:
+                return _decode_scene_frame(data_dir, scene, fi)
+        if not p or not os.path.exists(p):
+            return None
         img = cv2.imread(p)
-        if img is None: return None
+        if img is None:
+            return None
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    except: return None
+    except Exception:
+        traceback.print_exc()
+        return None
 
 def world_to_pix_native(ds, pts, scene=None, target_res=None):
     if pts is None or ds is None: return None
@@ -380,30 +421,48 @@ def best_of_k_eth(pred,gt,cfg,ds=None,init_pos=None):
     fut_max=getattr(cfg,'fut_traj_max',getattr(ds,'fut_traj_max',1.0) if ds else 1.0)
     future_frames=int(getattr(cfg,'future_frames',12))
     gt_arr=to_numpy(gt)
-    if gt_arr.ndim==4: gt_m=gt_arr[0,0,:future_frames,:2]
-    elif gt_arr.ndim==3: gt_m=gt_arr[0,:future_frames,:2]
-    else: gt_m=gt_arr.reshape(-1,2)[:future_frames]
-    gt_t=unnormalize_min_max(torch.tensor(gt_m).float().unsqueeze(0).unsqueeze(0),fut_min,fut_max,-1,1)[0,0]
+    if gt_arr.ndim==4:  # [B,A,F,D] or [B,A,F*D]? normalize below
+        if gt_arr.shape[-1]==future_frames*2:
+            gt_m=rearrange(torch.tensor(gt_arr).float(),'b a (f d)->b a f d',f=future_frames)[0,...,:2]
+        else:
+            gt_m=torch.tensor(gt_arr[0,...,:future_frames,:2]).float()
+    elif gt_arr.ndim==3:
+        if gt_arr.shape[-1]==future_frames*2:
+            gt_m=rearrange(torch.tensor(gt_arr).float(),'b (f d)->b f d',f=future_frames)[0,...,:2].unsqueeze(0)
+        else:
+            gt_m=torch.tensor(gt_arr[0,:future_frames,:2]).float().unsqueeze(0)
+    else:
+        gt_m=torch.tensor(gt_arr).float().reshape(-1,future_frames,2)
+    gt_t=unnormalize_min_max(gt_m.unsqueeze(0),fut_min,fut_max,-1,1)[0]  # [A,F,2]
     pred_arr=to_numpy(pred)
-    if pred_arr.ndim==4 and pred_arr.shape[-1]==future_frames*2:
-        pred_r=rearrange(torch.tensor(pred_arr).float(),'b k a (f d)->b k a f d',f=future_frames)[...,:2]
-    elif pred_arr.ndim==4 and pred_arr.shape[-1]==2: pred_r=torch.tensor(pred_arr).float()
-    elif pred_arr.ndim==3 and pred_arr.shape[-1]==future_frames*2:
-        pred_r=rearrange(torch.tensor(pred_arr).float(),'b k (f d)->b k f d',f=future_frames)[...,:2].unsqueeze(2)
-    else: pred_r=torch.tensor(pred_arr).float()
+    pred_t=torch.tensor(pred_arr).float()
+    if pred_t.ndim==4 and pred_t.shape[-1]==future_frames*2:
+        pred_r=rearrange(pred_t,'b k a (f d)->b k a f d',f=future_frames)[...,:2]
+    elif pred_t.ndim==4 and pred_t.shape[-1]==2:
+        pred_r=pred_t  # [B,K,F,2] -> add agent dim
+        if pred_r.shape[2] == future_frames:
+            pred_r=pred_r.unsqueeze(2)
+    elif pred_t.ndim==5 and pred_t.shape[-1]==2:
+        pred_r=pred_t
+    elif pred_t.ndim==3 and pred_t.shape[-1]==future_frames*2:
+        pred_r=rearrange(pred_t,'b k (f d)->b k f d',f=future_frames)[...,:2].unsqueeze(2)
+    else:
+        pred_r=pred_t.reshape(pred_t.shape[0], pred_t.shape[1], -1, future_frames, 2)
     pred_r=unnormalize_min_max(pred_r,fut_min,fut_max,-1,1)
     # Convert relative to absolute if init_pos provided
     if init_pos is not None:
-        init_t = torch.tensor(np.asarray(init_pos), dtype=torch.float32)
-        if init_t.ndim == 1:
-            init_t = init_t.reshape(1,1,2)
-        elif init_t.ndim == 2:
-            init_t = init_t.reshape(1,1,1,2)
-        gt_t = gt_t + init_t
+        init_a = np.asarray(init_pos)
+        if init_a.ndim==1: init_a = init_a.reshape(1,2)
+        init_t = torch.tensor(init_a, dtype=torch.float32).reshape(1,1,-1,1,2)
+        gt_t = gt_t.unsqueeze(0) + init_t[0,0]
         pred_r = pred_r + init_t
-    diff=pred_r[0]-gt_t.unsqueeze(0).unsqueeze(0); ade=torch.norm(diff,-1).mean(-1)
-    if ade.dim()==2: ade=ade.mean(1)
-    ade_min,bi=ade.min(0); return ade_min,int(bi.item()),pred_r[0],gt_t.unsqueeze(0).unsqueeze(0)
+    else:
+        gt_t = gt_t
+    diff=pred_r[0]-gt_t.unsqueeze(0)  # [K,A,F,2]
+    ade_k = torch.norm(diff,-1).mean(-1)  # [K,A]
+    ade_k = ade_k.mean(-1) if ade_k.ndim>1 else ade_k
+    ade_min,bi=ade_k.min(0)
+    return float(ade_min.detach().cpu().reshape(()).item()), int(bi.detach().cpu().reshape(()).item()), pred_r[0].detach().cpu(), gt_t.unsqueeze(0).detach().cpu()
 
 def _draw_bundle_eth(ax,bundle,background,extent,ds_ref,scene,xlim,ylim):
     if background is not None and ds_ref is not None:
@@ -507,7 +566,8 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
     except Exception:
         traceback.print_exc()
     if batch is None: print(f'[ETH-UCY] {scene}: no valid batch'); return
-    bg=load_img(find_ref_img(data_dir,scene))
+    anchor_fid = _anchor_frame_id(ds_ref, batch, chosen_bi, cfg_ref, data_dir, scene)
+    bg = load_img(None, data_dir=data_dir, scene=scene, anchor_frame=anchor_fid)
     bundles={}
     for mode in VARIANTS:
         ckpt,run_dir=find_checkpoint(scene,mode,args.cor_fm_root,args.ckpt_dir)
@@ -518,24 +578,31 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         except: pass
         ac=_resolve_dataset_agents(ckpt,cfg_m,batch,ds_ref)
         force_set_agents(cfg_m,ac)
-        try: ds_m=ETHDataset(cfg=cfg_m,training=False,data_dir=data_dir,subset=scene,rotate_time_frame=0,type='original',video_mode=mode); copy_norm_stats(ds_m,cfg_m)
-        except: ds_m=ds_ref; copy_norm_stats(ds_m,cfg_m)
+        # Variant conditioning isolation: load per-mode dataset/batch
+        try:
+            ds_m=ETHDataset(cfg=cfg_m,training=False,data_dir=data_dir,subset=scene,rotate_time_frame=0,type='original',video_mode=mode)
+            copy_norm_stats(ds_m,cfg_m)
+            loader_m=DataLoader(ds_m,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
+            it_m=iter(loader_m); batch_m=None
+            for _ in range(chosen_bi+1): batch_m=next(it_m)
+        except Exception:
+            traceback.print_exc(); ds_m=ds_ref; batch_m=batch; copy_norm_stats(ds_m,cfg_m)
         try:
             model=ETHMotionTransformer(model_config=cfg_m.MODEL,logger=NullLogger(),config=cfg_m)
             denoiser=FlowMatcher(cfg_m,model,logger=NullLogger())
             denoiser=load_ckpt_flexible(ckpt,denoiser).to(device).eval()
             for p in denoiser.parameters(): p.requires_grad_(False)
-            x_data={k:v.to(device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
-            gt=batch['fut_traj_original_scale'].to(device).float()
+            x_data={k:v.to(device) for k,v in (batch_m or batch).items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
+            gt=(batch_m or batch)['fut_traj_original_scale'].to(device).float()
             pred=euler_sample(denoiser,cfg_m,x_data,getattr(cfg_m,'future_frames',12),device,args.seed)
             try:
                 print(f'[DIAG] {scene}/{mode} raw_pred min/max: {pred.min().item():.6f}/{pred.max().item():.6f}')
             except Exception:
                 traceback.print_exc()
-            # get init pos
+            # get init pos (use mode batch)
             init_pos=None
             try:
-                po_b = batch.get('past_traj_original_scale')
+                po_b = (batch_m or batch).get('past_traj_original_scale')
                 if po_b is not None:
                     po_n = to_numpy(po_b)
                     if po_n.ndim==4: init_pos = po_n[0,0,-1,:2]
@@ -544,19 +611,21 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                 traceback.print_exc()
             ade_min,bi,pred_m,gt_m=best_of_k_eth(pred,gt,cfg_m,ds_m,init_pos=init_pos)
             try:
-                print(f'[DIAG] {scene}/{mode} unnorm_pred_m min/max: {np.asarray(pred_m).min():.6f}/{np.asarray(pred_m).max():.6f}, ade_min={float(ade_min):.6f}')
+                print(f'[DIAG] {scene}/{mode} unnorm_pred_m min/max: {np.asarray(pred_m).min():.6f}/{np.asarray(pred_m).max():.6f}, ade_min={float(np.asarray(ade_min).reshape(())):.6f}')
             except Exception:
                 traceback.print_exc()
             pm = to_numpy(pred_m)
-            btm = to_numpy(pred_m[bi])
+            bi_i = int(np.asarray(bi).reshape(()))
+            btm = to_numpy(pred_m[bi_i])
             gtm = to_numpy(gt_m)
             # normalize shapes
             if gtm.ndim==4: gtm = gtm[0,0]
             elif gtm.ndim==3: gtm = gtm[0]
             if pm.ndim==3: pm = pm  # [K,A,T,2] or [K,T,2]
-            bundles[mode]={'preds':pm,'best':btm.reshape(-1,2),'gt':gtm.reshape(-1,2),'ade':float(ade_min)}
+            bundles[mode]={'preds':pm,'best':btm.reshape(-1,2),'gt':gtm.reshape(-1,2),'ade':float(np.asarray(ade_min).reshape(())), 'batch': batch_m or batch, 'ds': ds_m}
             del model,denoiser; torch.cuda.empty_cache(); gc.collect()
-        except Exception as e: print(f'  {mode} err: {e}')
+        except Exception as e:
+            traceback.print_exc(); print(f'  {mode} err: {e}')
     if not bundles: return
     obs_raw=batch['past_traj_original_scale']
     obs_xy=to_numpy(obs_raw)
@@ -628,7 +697,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         ax.set_title(f"{PANEL_TITLES[variant]}\nADE$_{{min}}$ = {b['ade']:.2f}",fontsize=11)
         ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
         try:
-            _draw_agent_crops(ax, batch.get('agent_crops'))
+            _draw_agent_crops(ax, ((bundles_list.get('full') or {}).get('batch') or batch).get('agent_crops'))
         except Exception:
             traceback.print_exc()
     # panel 4: Grad-CAM
@@ -644,19 +713,21 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
             backbone, dim, preprocess = _make_backbone('resnet18', pretrained=True, device=device)
             backbone.eval()
             # load frames
-            vis_dir = _resolve_visual_data_dir(data_dir, scene)
+            vis_dir = _resolve_visual_data_dir(data_dir, scene, required=False)
             frame_ids = getattr(ds_ref, 'frame_ids', None)
             bidx = locals().get('chosen_bi', args.batch_idx)
             try:
-                if 'batch' in locals() and isinstance(batch,dict) and 'index' in batch:
-                    bidx_cand = int(batch['index'].detach().cpu().numpy().reshape(-1)[0]) if hasattr(batch['index'],'detach') else int(batch['index'])
-                    if bidx_cand < len(ds_ref): bidx = bidx_cand
+                gcam_batch = (bundles_list.get('full') or {}).get('batch') or batch
+                if isinstance(gcam_batch,dict) and 'index' in gcam_batch:
+                    bidx_cand = int(gcam_batch['index'].detach().cpu().numpy().reshape(-1)[0]) if hasattr(gcam_batch['index'],'detach') else int(gcam_batch['index'])
+                    if bidx_cand < len(ds_full if 'ds_full' in locals() else ds_ref): bidx = bidx_cand
             except Exception:
                 traceback.print_exc()
-            base_fid = int(frame_ids[bidx]) if frame_ids is not None and len(frame_ids)>bidx else 0
+            ds_full = (bundles_list.get('full') or {}).get('ds') or ds_ref; frame_ids_f = getattr(ds_full,'frame_ids',None); base_fid = int(frame_ids_f[bidx]) if frame_ids_f is not None and len(frame_ids_f)>bidx else anchor_fid
             frames_t_list=[]; frames_rgb_list=[]
+            stride_f = int(getattr(cfg_ref,'frame_stride',10) or 10)
             for t in range(cfg_ref.past_frames):
-                fid = base_fid - (cfg_ref.past_frames - 1 - t) * 10
+                fid = base_fid - (cfg_ref.past_frames - 1 - t) * stride_f
                 fpath = _find_frame_path(vis_dir, fid, data_dir=data_dir, scene=scene)
                 img=cv2.imread(fpath)
                 if img is None:
@@ -673,22 +744,22 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                     cfg_f.device=device
                     try: cfg_f.MODEL.CONTEXT_ENCODER.VIDEO_MODE='full'; cfg_f.MODEL.CONTEXT_ENCODER.USE_VIDEO=True
                     except: pass
-                    ac_f=_resolve_dataset_agents(ckpt_f,cfg_f,batch,ds_ref)
+                    gcam_batch = (bundles_list.get('full') or {}).get('batch') or batch; ds_full = (bundles_list.get('full') or {}).get('ds') or ds_ref; ac_f=_resolve_dataset_agents(ckpt_f,cfg_f,gcam_batch,ds_full)
                     force_set_agents(cfg_f,ac_f)
-                    copy_norm_stats(ds_ref,cfg_f)
+                    copy_norm_stats(ds_full,cfg_f)
                     model_f=ETHMotionTransformer(model_config=cfg_f.MODEL,logger=NullLogger(),config=cfg_f)
                     den_f=FlowMatcher(cfg_f,model_f,logger=NullLogger())
                     den_f=load_ckpt_flexible(ckpt_f,den_f).to(device).eval()
                 for p in den_f.parameters(): p.requires_grad_(False)
-                x_gc={k:v.to(device) for k,v in batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
+                gcam_batch = (bundles_list.get('full') or {}).get('batch') or batch; x_gc={k:v.to(device) for k,v in gcam_batch.items() if k in ['past_traj_original_scale','fut_traj','agent_mask','z_video_global']}
                 # ensure z_video_global present for gradcam if expected
-                if 'z_video_global' not in x_gc and ds_ref.z_video_global is not None:
+                if 'z_video_global' not in x_gc and getattr(ds_full,'z_video_global',None) is not None:
                     try:
                         bidx_cand = locals().get('chosen_bi', args.batch_idx)
-                        x_gc['z_video_global'] = ds_ref.z_video_global[bidx_cand:bidx_cand+1].to(device)
+                        x_gc['z_video_global'] = ds_full.z_video_global[bidx_cand:bidx_cand+1].to(device)
                     except Exception:
                         traceback.print_exc()
-                gt_gc=batch['fut_traj_original_scale'].to(device).float()
+                gcam_batch = (bundles_list.get('full') or {}).get('batch') or batch; gt_gc=gcam_batch['fut_traj_original_scale'].to(device).float()
                 res_gc=gradcam_pass(backbone,den_f,cfg_f,x_gc,frames_t,gt_gc,cfg_f.future_frames,device,args.seed)
                 cam=res_gc['cam']
                 if cam is not None and len(cam)>0 and len(frames_rgb_list)>0:
@@ -699,7 +770,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                     base=frames_rgb_list[-1].astype(np.float32)/255.0
                     overlay=(1-0.4)*base+0.4*heat_rgb
                     overlay=np.clip(overlay*255,0,255).astype(np.uint8)
-                    h,wbg=bg.shape[:2]
+                    hbg,wbg=overlay.shape[:2]
                     extent=(0,wbg,hbg,0)
                     ax.imshow(overlay,extent=extent,origin='upper',zorder=0,aspect='equal',interpolation='bilinear')
                     cam_overlay_done=True
@@ -715,7 +786,7 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                     ax.set_title(f"Grad-CAM (full)\nanchor frame",fontsize=11)
                     ax.set_xlabel('x [px]'); ax.set_ylabel('y [px]'); ax.tick_params(labelsize=8)
                     try:
-                        _draw_agent_crops(ax, batch.get('agent_crops'))
+                        _draw_agent_crops(ax, ((bundles_list.get('full') or {}).get('batch') or batch).get('agent_crops'))
                     except Exception:
                         traceback.print_exc()
         except Exception as e:

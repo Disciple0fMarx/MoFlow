@@ -157,43 +157,47 @@ def gradcam_pass(
         feats.append(out)
 
     def b_hook(m, gin, gout):
-        grads.append(gout[0])
+        g = gout[0] if isinstance(gout, (tuple, list)) else gout
+        if g is not None:
+            grads.append(g)
 
     h1 = backbone.layer4.register_forward_hook(f_hook)
     h2 = backbone.layer4.register_full_backward_hook(b_hook)
     try:
-        z_list = []
-        for i in range(frames_t.shape[0]):
-            with torch.enable_grad():
-                ft = frames_t[i : i + 1]
-                ft.requires_grad_(True)
-                rep = backbone(ft)  # [1,512]
-                z_list.append(rep)
-        z_cat = torch.cat(z_list, dim=0)  # [T,512]
-        z_mean = z_cat.mean(dim=0, keepdim=True).unsqueeze(0)  # [1,1,512]
+        # Batch over observed frames so activations/gradients align per frame [T,512,H,W]
+        with torch.enable_grad():
+            ft = frames_t.detach().to(device).requires_grad_(True)
+            rep = backbone(ft)  # [T,512]
+        z_mean = rep.mean(dim=0, keepdim=True).unsqueeze(0)  # [1,1,512]
         x_data_gc = dict(x_data)
         x_data_gc["z_video_global"] = z_mean
         pred = euler_sample_predictions(denoiser, cfg, x_data_gc, num_frames, device, seed)
         score, best_idx, per_hyp_ade = best_of_k_target_score(pred, gt, cfg)
         score = score.mean()
-        denoiser.model.zero_grad()
-        if z_mean.grad is not None:
-            z_mean.grad.zero_()
+        denoiser.model.zero_grad(set_to_none=True)
         score.backward()
-        A = feats[-1]  # [T,512,7,7]
-        G = grads[-1]  # [T,512,7,7]
+        if not feats or not grads:
+            raise RuntimeError("Grad-CAM hooks did not capture activations/gradients from backbone.layer4")
+        A = feats[0]  # [T,512,H,W]
+        G = grads[0]  # [T,512,H,W]
+        if A.shape[0] != G.shape[0]:
+            Tm = min(A.shape[0], G.shape[0])
+            A, G = A[:Tm], G[:Tm]
         alpha = G.mean(dim=(-2, -1), keepdim=True)
         cam = torch.relu((alpha * A).sum(dim=1))
-        cam = cam - cam.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]
-        cam = cam / (cam.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] + 1e-12)
+        cam_min = cam.amin(dim=(-2, -1), keepdim=True)
+        cam = cam - cam_min
+        cam_max = cam.amax(dim=(-2, -1), keepdim=True)
+        cam = cam / (cam_max + 1e-12)
+        bidx = int(best_idx.detach().reshape(-1)[0].item()) if hasattr(best_idx, 'detach') else int(best_idx)
         return {
             "cam": cam.detach().cpu().numpy(),
             "alphas": alpha.detach().cpu().numpy(),
             "activations": A.detach().cpu().numpy(),
             "z_video_global": z_mean.detach().cpu().numpy(),
             "per_hyp_ade": per_hyp_ade.detach().cpu().numpy(),
-            "score": float(score.detach().cpu().numpy()),
-            "best_idx": int(best_idx.detach().cpu().numpy()[0]),
+            "score": float(score.detach().reshape(()).cpu().item()),
+            "best_idx": bidx,
         }
     finally:
         h1.remove()
