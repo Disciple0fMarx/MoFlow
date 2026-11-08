@@ -266,7 +266,7 @@ def _anchor_frame_id(ds, batch, chosen_bi, cfg, data_dir, scene):
             return int(fids[int(chosen_bi)])
     except Exception:
         pass
-    for k in ['frame_id', 'frame_ids', 'anchor_frame', 'last_frame_id']:
+    for k in ['frame_id', 'frame_ids', 'anchor_frame', 'last_frame_id', 'start_frame']:
         try:
             if isinstance(batch, dict) and k in batch:
                 v = batch[k]
@@ -275,7 +275,6 @@ def _anchor_frame_id(ds, batch, chosen_bi, cfg, data_dir, scene):
                 return int(np.asarray(v).reshape(-1)[0])
         except Exception:
             pass
-    # Fallback: derive from batch index and past/future horizon
     stride = int(getattr(cfg, 'frame_stride', 10) or 10)
     past = int(getattr(cfg, 'past_frames', 8) or 8)
     return int(chosen_bi) * stride + (past - 1) * stride
@@ -312,9 +311,10 @@ def load_img(p, data_dir=None, scene=None, anchor_frame=None):
         return None
 
 def _audit_verified_world_to_pixel(pts_xy, H, scene, orig_size, target_res=None):
-    """Audit-verified ETH/UCY mapping (Sec 1.1/4.3 of audit):
-    p = (w,1) @ inv(H)^T; inv(H) gives (row,col) => swap to (u,v)=(b,a); top-left origin.
-    UCY (univ/zara*) optical-center convention per validated pipeline: u += W/2, v = Hh/2 - v.
+    """ETH/UCY world->pixel using inv(H). Scene-conditional axis handling:
+    - Zara1/Zara2: use native (a,b) orientation (no row/col swap) to avoid 90° rotation.
+    - ETH/Hotel/Univ: apply row/col swap (u,v)=(b,a) per validated alignment for those scenes.
+    UCY optical-center convention preserved where validated: univ/zara* use u += W/2, v = Hh/2 - v.
     """
     pts = np.asarray(pts_xy, dtype=np.float64)
     if pts.size == 0:
@@ -326,9 +326,12 @@ def _audit_verified_world_to_pixel(pts_xy, H, scene, orig_size, target_res=None)
     w = np.hstack([pts[:, :2], np.ones((len(pts), 1))])
     p = w @ np.linalg.inv(H).T
     a, b = p[:, 0] / p[:, 2], p[:, 1] / p[:, 2]
-    u, v = b, a  # row/col swap (winning config: inv(H), swap, top-left)
-    W, Hh = float(orig_size[0]), float(orig_size[1])
     sc = str(scene).lower() if scene is not None else ""
+    if sc in ("zara1", "zara2", "zara01", "zara02"):
+        u, v = a, b  # no swap for Zara (prevents 90-degree rotation)
+    else:
+        u, v = b, a  # row/col swap for eth/hotel/univ
+    W, Hh = float(orig_size[0]), float(orig_size[1])
     if sc in ("univ", "zara1", "zara2", "students03", "zara01", "zara02"):
         u = u + W / 2.0
         v = Hh / 2.0 - v
@@ -487,15 +490,26 @@ def best_of_k_eth(pred,gt,cfg,ds=None,init_pos=None):
     else:
         pred_r=pred_t.reshape(pred_t.shape[0], pred_t.shape[1], -1, future_frames, 2)
     pred_r=unnormalize_min_max(pred_r,fut_min,fut_max,-1,1)
-    # Convert relative to absolute if init_pos provided
+    # Convert relative to absolute by anchoring to each agent's last observed absolute position
     if init_pos is not None:
         init_a = np.asarray(init_pos)
-        if init_a.ndim==1: init_a = init_a.reshape(1,2)
-        init_t = torch.tensor(init_a, dtype=torch.float32).reshape(1,1,-1,1,2)
-        gt_t = gt_t.unsqueeze(0) + init_t[0,0]
-        pred_r = pred_r + init_t
-    else:
-        gt_t = gt_t
+        if init_a.ndim==1:
+            init_a = init_a.reshape(1,2)
+        elif init_a.ndim==2 and init_a.shape[0] != gt_t.shape[0]:
+            # if [A,2] mismatched, keep as-is for broadcasting attempt
+            pass
+        init_t = torch.tensor(init_a, dtype=torch.float32)
+        # align to [A,2] when possible
+        if init_t.ndim==2 and init_t.shape[0]==gt_t.shape[0]:
+            anchor = init_t.reshape(1,1,gt_t.shape[0],1,2)
+            gt_abs = gt_t.unsqueeze(0) + anchor[0,0]
+            pred_abs = pred_r + anchor
+        else:
+            anchor = init_t.reshape(1,1,-1,1,2)
+            gt_abs = gt_t.unsqueeze(0) + anchor[0,0]
+            pred_abs = pred_r + anchor
+        gt_t = gt_abs
+        pred_r = pred_abs
     diff=pred_r[0]-gt_t.unsqueeze(0)  # [K,A,F,2]
     ade_k = torch.norm(diff,-1).mean(-1)  # [K,A]
     ade_k = ade_k.mean(-1) if ade_k.ndim>1 else ade_k
@@ -605,14 +619,16 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                 print(f'[DIAG] {scene}/{mode} raw_pred min/max: {pred.min().item():.6f}/{pred.max().item():.6f}')
             except Exception:
                 traceback.print_exc()
-            # get init pos (use mode batch)
+            # get init pos (use mode batch): last observed absolute world position for anchoring
             init_pos=None
             try:
                 po_b = (batch_m or batch).get('past_traj_original_scale')
                 if po_b is not None:
                     po_n = to_numpy(po_b)
-                    if po_n.ndim==4: init_pos = po_n[0,0,-1,:2]
-                    elif po_n.ndim==3: init_pos = po_n[0,-1,:2]
+                    if po_n.ndim==4:  # [B,A,P,D]
+                        init_pos = po_n[0, :, -1, :2]
+                    elif po_n.ndim==3:  # [A,P,D] or [B,P,D]
+                        init_pos = po_n[:, -1, :2]
             except Exception:
                 traceback.print_exc()
             ade_min,bi,pred_m,gt_m=best_of_k_eth(pred,gt,cfg_m,ds_m,init_pos=init_pos)
