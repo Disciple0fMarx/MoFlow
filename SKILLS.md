@@ -187,7 +187,7 @@ Good verification questions for this project:
 ### /run for MoFlow
 Useful run commands:
 - "Train Flow Matching model with agent-centric video: python fm_eth.py --cfg cfg/eth_ucy/cor_fm.yml --subset eth"
-- "Build frame index for video features: python -m video_encoder.scripts.build_frame_index --data-root /path/to/raw --pkl-dir /path/to/processed --scene eth --split train"
+- "Build per-scene video features from video.avi: python -m video_encoder.scripts.build_ethucy_features --frames-root /path/to/tu_clausthal/datasets --out features/resnet18"
 - "Run integrated encoder tests: python test_integrated_encoder.py"
 - "Visualize sample agent crops from a batch"
 

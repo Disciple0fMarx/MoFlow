@@ -28,8 +28,20 @@ from torch.utils.data import DataLoader
 from data.dataloader_eth_ucy import ETHDataset, seq_collate_eth
 from models.backbone_eth_ucy import ETHMotionTransformer
 from models.flow_matching import FlowMatcher
+from utils.eth_ucy_geometry import (
+    observed_frame_ids,
+    scene_video_path,
+    video_index_for_frame,
+)
 from utils.normalization import unnormalize_min_max
+from utils.norm_bounds import (
+    apply_bounds_to_cfg,
+    bounds_from_cfg,
+    load_norm_bounds_from_run,
+    resolve_run_dir_from_checkpoint,
+)
 from utils.config import Config
+from utils.video_reader import get_video_reader
 
 
 class _NullLogger:
@@ -101,16 +113,9 @@ def euler_sample_predictions(
 
 
 def _cfg_norm_bounds(cfg):
-    def _get(*names, default):
-        for n in names:
-            if hasattr(cfg, n):
-                v = getattr(cfg, n)
-                if v is not None:
-                    return v
-        return default
-    fmin = _get('fut_traj_min', 'FUT_TRAJ_MIN', 'data_min', 'DATA_MIN', default=-1.0)
-    fmax = _get('fut_traj_max', 'FUT_TRAJ_MAX', 'data_max', 'DATA_MAX', default=1.0)
-    return fmin, fmax
+    # Strict: never default to [-1, 1]; bounds must come from the training run.
+    bounds = bounds_from_cfg(cfg, source="gradcam_eth")
+    return bounds.fut_min, bounds.fut_max
 
 
 def best_of_k_target_score(pred: torch.Tensor, gt: torch.Tensor, cfg):
@@ -131,7 +136,7 @@ def best_of_k_target_score(pred: torch.Tensor, gt: torch.Tensor, cfg):
         gt_metric = gt[..., :2]
     else:
         raise ValueError(f"Unexpected gt shape in best_of_k_target_score: {tuple(gt.shape)}")
-    gt_metric = unnormalize_min_max(gt_metric, fmin, fmax, -1, 1)
+    # Ground truth is already raw metres; unnormalize predictions only.
     diff = pred_metric - gt_metric.unsqueeze(1)
     ade = torch.norm(diff, dim=-1).mean(dim=-1).mean(dim=-1)
     ade_min, best_idx = ade.min(dim=1)
@@ -218,8 +223,8 @@ def _save_single(out_dir: Path, fid: int, frame_rgb: np.ndarray, cam2d: np.ndarr
     base = frame_rgb.astype(np.float32) / 255.0
     overlay = (1 - a) * base + a * heat_rgb
     overlay = np.clip(overlay * 255.0, 0, 255).astype(np.uint8)
-    cv2.imwrite(str(out_dir / f"frame_f{fid:06d}_overlay.jpg"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(out_dir / f"frame_f{fid:06d}_cam.jpg"), np.uint8(255 * cam_up))
+    cv2.imwrite(str(out_dir / f"frame_f{fid:06d}_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(out_dir / f"frame_f{fid:06d}_cam.png"), np.uint8(255 * cam_up))
 
 
 def load_ckpt(ckpt_path: str, model):
@@ -252,6 +257,7 @@ def main(argv: list[str] | None = None):
     p.add_argument("--ckpt", required=True)
     p.add_argument("--data_dir", default="data/eth_ucy")
     p.add_argument("--video-features-root", default="features/resnet18")
+    p.add_argument("--norm-bounds-dir", default=None)
     p.add_argument("--window-index", type=int, default=0)
     p.add_argument("--batch-index", type=int, default=0)
     p.add_argument("--backbone", default="resnet18")
@@ -275,6 +281,9 @@ def main(argv: list[str] | None = None):
     out_dir = Path(args.out_dir) if args.out_dir else (_REPO_ROOT / "results_eth" / "gradcam_visualizations" / args.subset / f"w{args.window_index:05d}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    bounds_dir = args.norm_bounds_dir or resolve_run_dir_from_checkpoint(args.ckpt)
+    apply_bounds_to_cfg(cfg, load_norm_bounds_from_run(bounds_dir))
+
     ds = ETHDataset(cfg=cfg, training=False, data_dir=args.data_dir, subset=args.subset, rotate_time_frame=0, type="original", video_mode="full")
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=seq_collate_eth)
     it = iter(loader)
@@ -293,31 +302,22 @@ def main(argv: list[str] | None = None):
     backbone, dim, preprocess = _make_backbone(args.backbone, pretrained=args.pretrained, device=args.device)
     backbone.eval()
 
-    # load frames for observed window
+    # load observed frames directly from video.avi at the scene annotation step
     frames_t_list = []
     frames_rgb_list = []
-    vis_dir = os.path.join(args.data_dir, args.subset, "visual_data")
-    # try to get frame ids if available
     frame_ids = getattr(ds, "frame_ids", None)
-    base_fid = int(frame_ids[args.batch_index]) if frame_ids is not None else 0
-    for t in range(cfg.past_frames):
-        fid = base_fid - (cfg.past_frames - 1 - t) * 10  # approximate
-        # find nearest
-        fpath = os.path.join(vis_dir, f"frame{fid:06d}.jpg")
-        if not os.path.exists(fpath):
-            # search
-            import glob
-            cand = sorted(glob.glob(os.path.join(vis_dir, "frame*.jpg")))
-            if not cand:
-                raise FileNotFoundError(f"No frames in {vis_dir}")
-            # pick nearest by index
-            fpath = cand[min(max(0, len(cand)//2), len(cand)-1)]
-        img = cv2.imread(fpath)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if frame_ids is None or len(frame_ids) <= args.batch_index:
+        raise ValueError("Dataset did not expose start frame ids for this window")
+    start_fid = int(np.asarray(frame_ids).reshape(-1)[args.batch_index])
+    observed_fids = observed_frame_ids(start_fid, args.subset, int(cfg.past_frames))
+    video_path = scene_video_path(args.data_dir, args.subset)
+    reader = get_video_reader(video_path)
+    from PIL import Image
+    for fid in observed_fids:
+        idx = video_index_for_frame(args.subset, fid)
+        img_rgb = reader.read(idx, color="rgb")
         frames_rgb_list.append(img_rgb)
-        from PIL import Image
-        pil = Image.fromarray(img_rgb)
-        frames_t_list.append(preprocess(pil))
+        frames_t_list.append(preprocess(Image.fromarray(img_rgb)))
     frames_t = torch.stack(frames_t_list, dim=0).to(args.device)
 
     x_data = {
@@ -331,7 +331,7 @@ def main(argv: list[str] | None = None):
     res = gradcam_pass(backbone, denoiser, cfg, x_data, frames_t, gt, cfg.future_frames, args.device, args.seed)
     cam = np.asarray(res["cam"])
     for i in range(min(cam.shape[0], len(frames_rgb_list))):
-        _save_single(out_dir, base_fid - (cfg.past_frames - 1 - i) * 10, frames_rgb_list[i], cam[i], args.alpha)
+        _save_single(out_dir, observed_fids[i], frames_rgb_list[i], cam[i], args.alpha)
     np.savez(out_dir / "_gradcam.npz", cam=cam, **{k: res[k] for k in ["alphas", "activations", "z_video_global", "per_hyp_ade", "score", "best_idx"]})
     print(f"[gradcam_eth:{args.subset}] saved to {out_dir}")
 

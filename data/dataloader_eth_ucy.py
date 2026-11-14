@@ -7,7 +7,23 @@ import numpy as np
 import torch
 from einops import rearrange
 
+from utils.eth_ucy_geometry import (
+    SCENE_RESOLUTIONS,
+    annotation_step,
+    assert_temporal_alignment,
+    observed_frame_ids,
+    scene_video_path,
+    temporal_anchor_frame,
+    video_index_for_frame,
+    world_to_pixel as project_world_to_pixel,
+)
 from utils.normalization import normalize_min_max
+from utils.norm_bounds import (
+    NormBoundsError,
+    bounds_from_cfg,
+    maybe_persist_bounds_from_cfg,
+)
+from utils.video_reader import get_video_reader
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from video_encoder.moflow_adapter import FrameFeatureLookup
@@ -66,9 +82,16 @@ def seq_collate_eth(batch):
     else:
         z_video_stack = None
 
-    # agent_crops may be a degenerate `torch.zeros(1)` when USE_AGENT_VIDEO=False — detect.
-    if agent_crops[0].numel() > 1 and agent_crops[0].dim() == 4:
-        agent_crops_stack = torch.stack(agent_crops, dim=0)  # [B, A, P, 3, h, w]
+    # agent_crops may be a degenerate `torch.zeros(1)` when USE_AGENT_VIDEO=False.
+    if agent_crops[0].numel() > 1 and agent_crops[0].dim() >= 4:
+        agent_crops_stack = torch.stack(agent_crops, dim=0)
+        if agent_crops_stack.dim() == 5:  # [B, P, 3, h, w]
+            agent_crops_stack = agent_crops_stack.unsqueeze(1)  # [B, A=1, P, ...]
+        if agent_crops_stack.dim() != 6:
+            raise ValueError(
+                "agent_crops must be [A, P, 3, h, w] or [P, 3, h, w] per sample; "
+                f"got stacked shape {tuple(agent_crops_stack.shape)}"
+            )
     else:
         agent_crops_stack = None
 
@@ -109,9 +132,16 @@ def seq_collate_imle_train(batch):
     y_t = torch.stack(y_t, dim=0)
     y_pred_data = torch.stack(y_pred_data, dim=0)
 
-    # agent_crops may be a degenerate `torch.zeros(1)` when USE_AGENT_VIDEO=False — detect.
-    if agent_crops[0].dim() == 4:  # [A, P, 3, h, w] -> 4 dimensions
-        agent_crops_stack = torch.stack(agent_crops, dim=0)  # [B, A, P, 3, h, w]
+    # agent_crops may be a degenerate `torch.zeros(1)` when USE_AGENT_VIDEO=False.
+    if agent_crops[0].numel() > 1 and agent_crops[0].dim() >= 4:
+        agent_crops_stack = torch.stack(agent_crops, dim=0)
+        if agent_crops_stack.dim() == 5:  # [B, P, 3, h, w]
+            agent_crops_stack = agent_crops_stack.unsqueeze(1)  # [B, A=1, P, ...]
+        if agent_crops_stack.dim() != 6:
+            raise ValueError(
+                "agent_crops must be [A, P, 3, h, w] or [P, 3, h, w] per sample; "
+                f"got stacked shape {tuple(agent_crops_stack.shape)}"
+            )
     else:
         agent_crops_stack = None
 
@@ -211,14 +241,6 @@ class ETHDataset(object):
             cfg.future_frames = 12
         if not hasattr(cfg, "agents"):
             cfg.agents = 1
-        if not hasattr(cfg, "past_traj_min"):
-            cfg.past_traj_min = -1.0
-        if not hasattr(cfg, "past_traj_max"):
-            cfg.past_traj_max = 1.0
-        if not hasattr(cfg, "fut_traj_min"):
-            cfg.fut_traj_min = -1.0
-        if not hasattr(cfg, "fut_traj_max"):
-            cfg.fut_traj_max = 1.0
         if not hasattr(cfg, "MODEL"):
 
             class _Dummy:
@@ -330,6 +352,13 @@ class ETHDataset(object):
             cfg.fut_traj_min = fut_traj.min()
             cfg.past_traj_max = past_traj.max()
             cfg.past_traj_min = past_traj.min()
+            # Persist the exact training bounds so evaluation/visualization
+            # processes never have to guess (no [-1, 1] fallback).
+            maybe_persist_bounds_from_cfg(cfg)
+        elif getattr(cfg, "data_norm", "min_max") == "min_max":
+            # Strict: evaluation/viz configs must carry bounds loaded from the
+            # training artifact.  Missing bounds raise instead of defaulting.
+            bounds_from_cfg(cfg, source="evaluation config")
 
         ### record the original to avoid numerical errors
         self.past_traj_original_scale = past_traj
@@ -387,7 +416,6 @@ class ETHDataset(object):
                     ) from e
 
             T_obs = int(cfg.past_frames)
-            stride = 10
             D = next(iter(lookups.values())).features.shape[1]
             z = np.zeros((self.all_data.shape[0], T_obs, D), dtype=np.float32)
             if self.video_mode == "static":
@@ -397,18 +425,9 @@ class ETHDataset(object):
                     ids = lookup.sorted_frame_ids
                     if ids.size:
                         sample = ids[:: max(1, ids.size // 8)][:8]
-                        try:
-                            z_sample = lookup.window(
-                                int(sample[0]),
-                                n_frames=len(sample),
-                                stride=(
-                                    int(np.diff(sample)[0]) if len(sample) > 1 else 1
-                                ),
-                                policy="nearest",
-                            )
-                            static = z_sample.mean(axis=0).astype(np.float32)
-                        except Exception:
-                            pass
+                        static = np.stack(
+                            [lookup(int(f)) for f in sample], axis=0
+                        ).mean(axis=0).astype(np.float32)
                     static_by_scene[scene_name] = static
                 for i, scene_name in enumerate(scenes):
                     z[i] = np.tile(
@@ -416,13 +435,16 @@ class ETHDataset(object):
                     )
             else:
                 coverage = {}
+                steps: dict[str, int] = {}
                 for scene_name, lookup in lookups.items():
+                    step = annotation_step(scene_name)
+                    steps[scene_name] = step
                     available = set(int(x) for x in lookup.sorted_frame_ids)
                     scene_mask = scenes == scene_name
                     required = np.unique(
                         (
                             start_fids[scene_mask, None]
-                            + np.arange(T_obs)[None, :] * stride
+                            + np.arange(T_obs)[None, :] * step
                         ).ravel()
                     )
                     missing = np.asarray(
@@ -440,12 +462,13 @@ class ETHDataset(object):
                         "Video feature cache does not cover every raw frame "
                         f"needed by this split under '{features_root}'. "
                         f"Missing per scene (count,min,max): {coverage}. "
-                        "Rebuild features for the full raw frame range; the "
-                        "current cache may only contain the validation segment."
+                        "Rebuild features at each scene's annotation step "
+                        "(see video_encoder/scripts/build_ethucy_features.py)."
                     )
                 for i, (fid, scene_name) in enumerate(zip(start_fids, scenes)):
+                    step = steps[str(scene_name)]
                     z[i] = lookups[str(scene_name)].window(
-                        int(fid), n_frames=T_obs, stride=stride, policy="nearest"
+                        int(fid), n_frames=T_obs, stride=step, policy="nearest"
                     )
             self.z_video_global = torch.from_numpy(z)
 
@@ -470,13 +493,8 @@ class ETHDataset(object):
 
         self.subset = subset
 
-        self.SCENE_RESOLUTIONS = {
-            "eth": (640, 480),
-            "hotel": (720, 576),
-            "univ": (720, 576),
-            "zara1": (720, 576),
-            "zara2": (720, 576),
-        }
+        # Authoritative scene geometry lives in utils/eth_ucy_geometry.py.
+        self.SCENE_RESOLUTIONS = dict(SCENE_RESOLUTIONS)
 
         self.SCENE_WORLD_BOUNDS = {
             "eth": (-7.69, 13.89, -1.81, 12.67),
@@ -485,17 +503,6 @@ class ETHDataset(object):
             "zara1": (-0.14, 15.48, -0.37, 12.39),
             "zara2": (-0.36, 15.56, -0.19, 13.48),
         }
-
-        self.SCENE_FLIP = {
-            "eth": (False, False),
-            "hotel": (False, False),
-            "univ": (True, False),
-            "zara1": (False, False),
-            "zara2": (False, False),
-        }
-
-        self.SCENE_SWAP_XY = {"hotel": True}
-        self.SCENE_FLIP_X = {"hotel": True}
 
         # Load raw H.txt directly from every scene present in this dataset.
         if load_scene_data is None:
@@ -596,9 +603,17 @@ class ETHDataset(object):
             # Extract agent-centric video crops if enabled
             agent_crops = None
             if self.use_agent_video:
-                if hasattr(self, "scene_by_sample"):
-                    self.current_scene = str(self.scene_by_sample[item])
-                agent_crops = self._extract_agent_crops(past_traj_original_scale)
+                scene = (
+                    str(self.scene_by_sample[item])
+                    if getattr(self, "scene_by_sample", None) is not None
+                    else str(self.subset)
+                )
+                self.current_scene = scene
+                agent_crops = self._extract_agent_crops(
+                    past_traj_original_scale,
+                    start_frame=int(self.frame_ids[item]),
+                    scene=scene,
+                )
 
             z_video = (
                 self.z_video_global[item]
@@ -619,152 +634,105 @@ class ETHDataset(object):
         return out
 
     def world_to_pixel(self, traj_pts, target_res=(224, 224), scene=None):
-        traj_w = np.array(traj_pts, dtype=np.float64)
+        """Project world metres to pixels via the single authoritative mapping."""
         scene = scene or self.subset
-        orig_w, orig_h = self.SCENE_RESOLUTIONS.get(scene, self.orig_res)
-        H_inv = (
-            np.linalg.inv(self.scene_H[scene])
-            if hasattr(self, "scene_H")
-            else self.H_inv
+        H = self.scene_H[scene] if hasattr(self, "scene_H") else self.H
+        return project_world_to_pixel(
+            np.asarray(traj_pts, dtype=np.float64),
+            H,
+            scene=scene,
+            target_res=target_res,
         )
-
-        # Use validated homography: inv(H) maps world (meters) -> pixel coordinates
-        h = np.hstack((traj_w, np.ones((len(traj_w), 1)))).T
-        c = H_inv @ h
-        img_pts = (c / c[2]).T[:, :2].copy()
-
-        # Apply scene-specific coordinate conventions per notebook alignment
-        if scene in ("univ", "zara1", "zara2"):
-            img_pts = np.column_stack(
-                [img_pts[:, 0] + orig_w / 2.0, orig_h / 2.0 - img_pts[:, 1]]
-            )
-        elif scene == "hotel":
-            img_pts = img_pts.copy()
-        else:  # eth
-            img_pts = img_pts.copy()
-
-        # Scale from original image resolution to target_res if different
-        if (orig_w, orig_h) != target_res:
-            img_pts = img_pts.copy()
-            img_pts[:, 0] = img_pts[:, 0] / orig_w * target_res[0]
-            img_pts[:, 1] = img_pts[:, 1] / orig_h * target_res[1]
-        return img_pts
 
     world_to_pixel_backup = world_to_pixel  # kept for compatibility
 
-    def _extract_agent_crops(self, past_traj_original_scale):
-        """
-        Extract agent-centric video crops for each agent in each observed frame.
+    def _extract_agent_crops(
+        self,
+        past_traj_original_scale,
+        start_frame: int | None = None,
+        scene: str | None = None,
+    ):
+        """Extract agent-centric crops directly from the native ``video.avi``.
 
-        Scientific justification (ETH/UCY vs SDD):
-        - Agent crop size 64x64: matches SDD agent-centric convention for local context
-          (sufficient receptive field for ResNet-18 layer4 at 224x224 after resize) while
-          controlling compute; justified by ablation precedent in agent-centric prediction.
-        - Homography via inv(H): world->pixel using validated homography (see notebook
-          validation) ensures spatial alignment with observed frames.
-        - Time-shared ResNet-18 backbone with block freezing (RESNET_FREEZE_BLOCKS=2)
-          matches SDD pattern to preserve ImageNet features and reduce overfitting on
-          small ETH/UCY splits.
+        ``video.avi`` is the sole visual source: no pre-extracted frame dumps,
+        no frame-directory fallbacks, and no nearest-frame substitution.  Frames
+        are read at the exact scene annotation stride for the observed window.
 
         Args:
-            past_traj_original_scale: [A, P, 6] tensor containing [abs_xy, rel_xy, vel_xy]
-                                    where abs_xy are world coordinates
+            past_traj_original_scale: ``[A, P, 6]`` with absolute world ``xy`` first.
+            start_frame: first observed annotation frame id for this sample.
+            scene: canonical scene name (defaults to the current sample's scene).
 
         Returns:
-            Tensor of shape [A, P, 3, h, w] containing RGB crops for each agent/frame
+            ``[A, P, 3, h, w]`` RGB crops, or ``None`` when agent video is off.
         """
         if not self.use_agent_video:
             return None
 
-        A, P, _ = past_traj_original_scale.shape
-        h, w = self.agent_crop_size
-        crops = torch.zeros(A, P, 3, h, w, dtype=torch.float32)
-
-        scene = getattr(self, "current_scene", self.subset)
-        orig_w, orig_h = self.SCENE_RESOLUTIONS.get(scene, self.orig_res)
-        import os
-
-        import cv2
-
-        vis_dir = os.path.join(getattr(self, "data_dir"), scene, "visual_data")
+        if start_frame is None:
+            raise ValueError(
+                "start_frame is required for agent-centric video cropping; "
+                "refusing to guess (previous behaviour used frame 0)."
+            )
         if not getattr(self, "data_dir", None):
-            raise FileNotFoundError("ETHUCYDataset.data_dir must be set for strict external visual asset loading.")
-        if not os.path.isdir(vis_dir):
             raise FileNotFoundError(
-                f"External visual_data directory not found: {vis_dir}. "
-                "Provide data_dir pointing at the TU-Clausthal datasets root with <scene>/visual_data/."
+                "ETHDataset.data_dir must point at the TU-Clausthal root to "
+                "extract agent crops from video.avi."
             )
 
-        base_fid = None
-        try:
-            if hasattr(self, "frame_ids") and len(self.frame_ids) > 0:
-                # Per-item frame binding is not available in this helper; require explicit frame mapping upstream.
-                pass
-        except Exception:
-            pass
+        scene = scene or getattr(self, "current_scene", self.subset)
+        A, P, _ = past_traj_original_scale.shape
+        h, w = self.agent_crop_size
+        frame_ids = observed_frame_ids(int(start_frame), scene, P)
+        anchor = assert_temporal_alignment(
+            int(start_frame), scene, P, frame_ids=frame_ids
+        )
+        if frame_ids[-1] != anchor:
+            raise AssertionError(
+                f"Temporal anchor mismatch for scene={scene}: {frame_ids[-1]} != {anchor}"
+            )
 
-        for a in range(A):
-            for p in range(P):
-                world_xy = past_traj_original_scale[a, p, :2].detach().cpu().numpy()
-                try:
-                    pixel_xy = self.world_to_pixel(world_xy.reshape(1, 2), scene=scene)[
-                        0
+        video_path = scene_video_path(self.data_dir, scene)
+        reader = get_video_reader(video_path)
+        native_w, native_h = reader.size if reader.size is not None else (None, None)
+        if native_w is None or native_h is None:
+            raise ValueError(f"Could not determine native video size for {video_path}")
+
+        H = self.scene_H[str(scene)] if hasattr(self, "scene_H") else self.H
+        world_xy = (
+            past_traj_original_scale[:, :, :2].detach().cpu().numpy().reshape(-1, 2)
+        )
+        pixels = project_world_to_pixel(
+            world_xy, H, scene=scene, target_res=(native_w, native_h)
+        ).reshape(A, P, 2)
+
+        crops = torch.zeros(A, P, 3, h, w, dtype=torch.float32)
+        for p in range(P):
+            frame_id = int(frame_ids[p])
+            video_index = video_index_for_frame(scene, frame_id)
+            frame = reader.read(video_index, color="rgb")
+            if frame.shape[0] != native_h or frame.shape[1] != native_w:
+                raise ValueError(
+                    f"Decoded frame {video_index} has shape {frame.shape[:2]}, "
+                    f"expected {(native_h, native_w)} for {video_path}"
+                )
+            for a in range(A):
+                px = int(round(float(pixels[a, p, 0])))
+                py = int(round(float(pixels[a, p, 1])))
+                x1, y1 = px - w // 2, py - h // 2
+                x2, y2 = x1 + w, y1 + h
+
+                canvas = np.zeros((h, w, 3), dtype=frame.dtype)
+                sx1, sy1 = max(0, x1), max(0, y1)
+                sx2, sy2 = min(native_w, x2), min(native_h, y2)
+                if sx2 > sx1 and sy2 > sy1:
+                    dx1, dy1 = sx1 - x1, sy1 - y1
+                    canvas[dy1 : dy1 + (sy2 - sy1), dx1 : dx1 + (sx2 - sx1)] = frame[
+                        sy1:sy2, sx1:sx2
                     ]
-                    pixel_x, pixel_y = int(round(float(pixel_xy[0]))), int(
-                        round(float(pixel_xy[1]))
-                    )
-                except Exception:
-                    continue
-
-                x1 = pixel_x - w // 2
-                y1 = pixel_y - h // 2
-                x2 = x1 + w
-                y2 = y1 + h
-
-                x1_clip = max(0, x1)
-                y1_clip = max(0, y1)
-                x2_clip = min(orig_w, x2)
-                y2_clip = min(orig_h, y2)
-
-                if (
-                    vis_dir is not None
-                    and cv2 is not None
-                    and x2_clip > x1_clip
-                    and y2_clip > y1_clip
-                ):
-                    # Strict external path binding: no repo-internal fallback, no nearest-frame fallback.
-                    fid = base_fid if base_fid is not None else 0
-                    fpath = os.path.join(vis_dir, f"frame{int(fid):06d}.jpg")
-                    if not os.path.exists(fpath):
-                        # try png/alt naming only within the same external dir (no fallback to other dirs/frames)
-                        alt = os.path.join(vis_dir, f"frame{int(fid):06d}.png")
-                        if os.path.exists(alt):
-                            fpath = alt
-                        else:
-                            raise FileNotFoundError(
-                                f"Required external frame not found: {fpath} (strict; no fallback). "
-                                f"vis_dir={vis_dir}, fid={fid}"
-                            )
-                    img = cv2.imread(fpath)
-                    if img is None:
-                        raise FileNotFoundError(f"Failed to read external frame asset: {fpath}")
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    crop = img[y1_clip:y2_clip, x1_clip:x2_clip]
-                    if crop.shape[0] > 0 and crop.shape[1] > 0:
-                        if crop.shape[0] != h or crop.shape[1] != w:
-                            crop = cv2.resize(crop, (w, h))
-                        if x1 < 0 or y1 < 0 or x2 > orig_w or y2 > orig_h:
-                            pad_img = np.zeros((h, w, 3), dtype=crop.dtype)
-                            py1 = max(0, -y1)
-                            px1 = max(0, -x1)
-                            py2 = py1 + crop.shape[0]
-                            px2 = px1 + crop.shape[1]
-                            pad_img[py1:py2, px1:px2] = crop
-                            crop = pad_img
-                        crop_t = torch.from_numpy(crop).permute(2, 0, 1).float() / 255.0
-                        crops[a, p] = crop_t
-                        continue
-                crops[a, p] = torch.zeros(3, h, w, dtype=torch.float32)
+                crops[a, p] = (
+                    torch.from_numpy(canvas).permute(2, 0, 1).float() / 255.0
+                )
 
         return crops
 

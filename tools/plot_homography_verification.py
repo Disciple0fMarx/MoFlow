@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader
 
 from data.dataloader_eth_ucy import ETHDataset, seq_collate_eth
 from utils.config import Config
+from utils.eth_ucy_geometry import scene_video_path, world_to_pixel as geo_world_to_pixel
+from utils.video_reader import get_video_reader
 
 
 class NullLogger:
@@ -40,36 +42,27 @@ def load_homography(data_dir, subset):
 
 
 def find_ref(data_dir, subset):
-    for base in [os.path.join(data_dir, subset, 'visual_data'), os.path.join(REPO_ROOT, 'data', 'eth_ucy', subset, 'visual_data')]:
-        if os.path.exists(base):
-            for f in sorted(os.listdir(base)):
-                if f.lower().endswith(('.jpg','.png','.jpeg')):
-                    return os.path.join(base, f)
-    return None
+    # Native video.avi is the only reference visual source.
+    return scene_video_path(data_dir, subset)
 
 
-def load_img(p):
-    if not p or not os.path.exists(p): return None
-    try:
-        from PIL import Image
-        return np.array(Image.open(p).convert('RGB'))
-    except Exception:
-        try:
-            import cv2
-            img=cv2.imread(p); return cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
-        except: return None
+def load_img(p, scene=None, frame_id=0):
+    if p is None:
+        return None
+    reader = get_video_reader(p)
+    if scene is not None:
+        from utils.eth_ucy_geometry import video_index_for_frame
+
+        frame_id = video_index_for_frame(scene, frame_id)
+    return reader.read(int(frame_id), color="rgb")
 
 
-def world_to_pixel_apply_h(H, pts):
+def world_to_pixel_apply_h(H, pts, scene=None):
     if H is None or pts is None: return None
     pts = np.asarray(pts)
     if pts.size == 0: return pts
     orig = pts.shape
-    p = pts.reshape(-1,2)
-    ph = np.c_[p, np.ones((len(p),1))] @ H.T
-    w = ph[:,2:3]
-    w[np.abs(w)<1e-12]=np.nan
-    out = ph[:,:2]/w
+    out = geo_world_to_pixel(pts.reshape(-1, 2), H, scene=scene)
     return out.reshape(orig)
 
 
@@ -106,13 +99,14 @@ def generate_diagnostics(subset, data_dir, out_dir):
     print(f"\n{'='*60}\nGenerating homography diagnostics for {subset}\n{'='*60}")
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     cfg = Config('cfg/eth_ucy/cor_fm.yml', f'hdiag_{subset}'); cfg.device='cpu'
+    cfg.data_norm='original'  # only raw metres are needed for diagnostics
     try:
         ds = ETHDataset(cfg=cfg, training=False, data_dir=data_dir, subset=subset, rotate_time_frame=0, type='original', video_mode='off')
         loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=seq_collate_eth)
     except Exception as e:
         print(f"[{subset}] {e}"); return False
     H = load_homography(data_dir, subset)
-    bg = load_img(find_ref(data_dir, subset))
+    bg = load_img(find_ref(data_dir, subset), scene=subset, frame_id=0)
     
     all_pw, all_fw = [], []
     best = None; best_n=-1
@@ -122,8 +116,11 @@ def generate_diagnostics(subset, data_dir, out_dir):
             f = extract_xy_agents(b.get('fut_traj_original_scale'), cfg.future_frames)
             if p is None or f is None: continue
             A=min(p.shape[0],f.shape[0])
-            if A>best_n: best_n=A; best=(p[:A].copy(),f[:A].copy())
-            all_pw.append(p[:A]); all_fw.append(f[:A])
+            # Future targets are stored relative to the last observed pose; make
+            # them absolute so past/future share one world frame before projection.
+            f_abs = f[:A] + p[:A, -1:, :]
+            if A>best_n: best_n=A; best=(p[:A].copy(),f_abs.copy())
+            all_pw.append(p[:A]); all_fw.append(f_abs)
         except: continue
     print(f"[{subset}] Max agents: {best_n}")
     
@@ -138,7 +135,7 @@ def generate_diagnostics(subset, data_dir, out_dir):
     if H is not None and all_pw:
         try:
             ap=np.concatenate(all_pw,0); af=np.concatenate(all_fw,0)
-            pp=world_to_pixel_apply_h(H,ap); fp=world_to_pixel_apply_h(H,af)
+            pp=world_to_pixel_apply_h(H,ap,scene=subset); fp=world_to_pixel_apply_h(H,af,scene=subset)
             if pp is not None:
                 msk=np.isfinite(pp).all(1)
                 if bg is not None: msk &= (pp[:,0]>=0)&(pp[:,0]<bg.shape[1])&(pp[:,1]>=0)&(pp[:,1]<bg.shape[0])
@@ -157,7 +154,7 @@ def generate_diagnostics(subset, data_dir, out_dir):
         ax2p.imshow(bg); ax2p.set_xlim(0,bg.shape[1]); ax2p.set_ylim(bg.shape[0],0)
     if best and H is not None:
         pb,fb=best
-        pp=world_to_pixel_apply_h(H,pb); fp=world_to_pixel_apply_h(H,fb)
+        pp=world_to_pixel_apply_h(H,pb,scene=subset); fp=world_to_pixel_apply_h(H,fb,scene=subset)
         if pp is not None:
             for a in range(pp.shape[0]):
                 ax2p.plot(pp[a,:,0],pp[a,:,1],'--',c='cyan',lw=1.5,alpha=0.9)

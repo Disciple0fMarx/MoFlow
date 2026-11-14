@@ -80,19 +80,12 @@ python imle_eth.py --cfg cfg/eth_ucy/imle.yml --subset eth
 
 ### Video Processing Utilities
 ```bash
-# Build frame index (required for video features)
-python -m video_encoder.scripts.build_frame_index \
-    --data-root <path_to_raw_data> \
-    --pkl-dir <path_to_processed_data> \
-    --scene eth \
-    --split train
-
-# Encode video features (global scene)
-python -m video_encoder \
-    --backbone resnet18 \
-    --data-root <path_to_raw_frames> \
-    --out-dir <output_features_dir> \
-    --split-parquet <path_to_split_parquet>
+# Build per-scene video feature caches directly from native video.avi files.
+# --stride defaults to the benchmark 10-frame grid (all scenes).
+python -m video_encoder.scripts.build_ethucy_features \
+    --frames-root <path_to_tu_clausthal_datasets> \
+    --out features/resnet18 \
+    --scenes eth hotel univ zara1 zara2
 ```
 
 ### Testing
@@ -189,10 +182,12 @@ MoFlow/
 │       ├── mtr_encoder.py     # MotionTransformer encoder
 │       └── fusion_module.py   # Cross-modal fusion (original)
 ├── video_encoder/          # Video processing modules
-│   ├── agent_encoder.py     # NEW: Agent-centric video encoder
-│   ├── encoder.py           # Global video encoder
+│   ├── agent_encoder.py     # Agent-centric video encoder
+│   ├── agent_encoder_sdd.py # SDD agent encoder (JPEG-native, exempt)
+│   ├── global_video_encoder_sdd.py # SDD global encoder (JPEG-native, exempt)
+│   ├── scenes.py            # Scene lookup helpers
 │   ├── __init__.py          # Module exports
-│   └── scripts/             # Utilities (build_frame_index, etc.)
+│   └── scripts/             # build_ethucy_features, etc.
 ├── fm_eth.py               # Flow matching training script
 ├── imle_eth.py             # IMLE training script
 └── tests/                  # Test modules
@@ -208,10 +203,12 @@ MoFlow/
    # Assuming .venv exists
    source .venv/bin/activate
    ```
-3. **Prepare data**: Ensure ETH/UCY data is in the expected format
-4. **Build frame indices** for video features (if using video):
+3. **Prepare data**: Ensure the strict TU-Clausthal layout exists
+   (`ETH/seq_eth`, `ETH/seq_hotel`, `UCY/students03`, `UCY/zara01`, `UCY/zara02`,
+   each with `obsmat.txt`, `H.txt`, and `video.avi`)
+4. **Build video feature caches** (if using global video):
    ```bash
-   python -m video_encoder.scripts.build_frame_index --data-root /path/to/raw --pkl-dir /path/to/processed --scene eth --split train
+   python -m video_encoder.scripts.build_ethucy_features --frames-root /path/to/tu_clausthal/datasets --out features/resnet18
    ```
 5. **Run experiments**:
    ```bash

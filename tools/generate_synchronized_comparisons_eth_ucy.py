@@ -5,20 +5,22 @@ Direct ETH/UCY equivalent of tools/generate_synchronized_comparisons.py.
 """
 from __future__ import annotations
 
-from einops import rearrange
 import argparse
 import gc
-import traceback
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
+
+from einops import rearrange
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import matplotlib
+
 matplotlib.use("Agg")
 matplotlib.rcParams.update({
     "font.family": "serif",
@@ -40,10 +42,10 @@ matplotlib.rcParams.update({
     "ps.fonttype": 42,
 })
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import cv2
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from torch.utils.data import DataLoader
@@ -52,13 +54,24 @@ from data.dataloader_eth_ucy import ETHDataset, seq_collate_eth
 from data.tu_clausthal_eth_ucy_parser import TU_CLAUSTHAL_MAP
 from models.backbone_eth_ucy import ETHMotionTransformer
 from models.flow_matching import FlowMatcher
-from utils.normalization import unnormalize_min_max
 from utils.config import Config
+from utils.eth_ucy_geometry import (annotation_step,
+                                    assert_pixel_frame_alignment,
+                                    observed_frame_ids, scene_video_path,
+                                    temporal_anchor_frame,
+                                    video_index_for_frame)
+from utils.eth_ucy_geometry import world_to_pixel as geo_world_to_pixel
+from utils.norm_bounds import (NormBoundsError, apply_bounds_to_cfg,
+                               bounds_from_cfg, load_norm_bounds_from_run,
+                               resolve_run_dir_from_checkpoint)
+from utils.normalization import unnormalize_min_max
+from utils.video_reader import get_video_reader
+from video_encoder.moflow_adapter import FrameFeatureLookup
 
 # Optional Grad-CAM support
 try:
     from tools import gradcam_eth as gcam_eth
-    from tools.gradcam_eth import _make_backbone, gradcam_pass, _apply_jet
+    from tools.gradcam_eth import _apply_jet, _make_backbone, gradcam_pass
     _HAS_GCAM = True
 except Exception:
     gcam_eth = None
@@ -105,11 +118,17 @@ def force_set_agents(cfg_m, agents):
         try: fn(cfg_m,agents)
         except: pass
 
-def copy_norm_stats(src,dst):
-    for k in ['fut_traj_min','fut_traj_max','past_traj_min','past_traj_max']:
-        if hasattr(src,k):
-            try: setattr(dst,k,getattr(src,k))
-            except: pass
+def _apply_run_bounds(cfg, run_dir=None, ckpt=None):
+    """Load exact training bounds from a run artifact onto ``cfg`` (strict)."""
+    target = run_dir or (resolve_run_dir_from_checkpoint(ckpt) if ckpt else None)
+    if target is None:
+        raise NormBoundsError(
+            "Cannot locate a training run directory for normalization bounds. "
+            "Pass a checkpoint inside a run dir or provide --norm-bounds-dir."
+        )
+    bounds = load_norm_bounds_from_run(target)
+    apply_bounds_to_cfg(cfg, bounds)
+    return bounds
 
 def load_ckpt_flexible(ckpt_path, model):
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -161,106 +180,16 @@ def load_run_config(run_dir, default_cfg='cfg/eth_ucy/cor_fm.yml'):
             if os.path.exists(p2): return p2
     return default_cfg
 
-_VIDEO_FRAME_OFFSET_CACHE = {}
-
-
-def _infer_video_frame_offset(video_path, sample_fids=None):
-    """Map ETH/UCY dataset frame IDs to cv2 POS_FRAMES indices.
-    Tries identity; if sample annotation IDs exceed video length, uses relative
-    offset from min sample id (common when annotations use global frame numbers).
-    """
-    vp = str(Path(video_path).resolve())
-    if vp in _VIDEO_FRAME_OFFSET_CACHE:
-        return _VIDEO_FRAME_OFFSET_CACHE[vp]
-    off = 0
-    try:
-        cap = cv2.VideoCapture(vp)
-        if cap.isOpened():
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            s = [int(x) for x in (sample_fids or []) if x is not None]
-            if total > 0 and s:
-                mx = max(s)
-                mn = min(s)
-                # raw id in range -> identity
-                if 0 <= mn and mx < total:
-                    off = 0
-                # global frame numbers -> shift by first annotated frame
-                elif 0 <= (mn - mn) and (mx - mn) < total:
-                    off = mn
-                else:
-                    off = mn if (mx - mn) < max(total * 2, 1) else 0
-        cap.release()
-    except Exception:
-        traceback.print_exc(); off = 0
-    _VIDEO_FRAME_OFFSET_CACHE[vp] = int(off)
-    return int(off)
-
-
-def _decode_frame_from_video(video_path, frame_index, frame_offset=0):
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Failed to open external video for frame streaming: {video_path}")
-    try:
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        raw = int(frame_index) - int(frame_offset)
-        fi = max(0, raw)
-        if total > 0:
-            fi = min(fi, total - 1)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            # fallback: sequential read
-            cap.release(); cap = cv2.VideoCapture(str(video_path))
-            cur = 0; frame = None
-            while cur <= fi:
-                ok, fr = cap.read()
-                if not ok or fr is None:
-                    break
-                frame = fr; cur += 1
-            if frame is None:
-                raise FileNotFoundError(f"Failed to decode frame_index={frame_index} offset={frame_offset} (pos {fi}) from {video_path}")
-        return frame
-    finally:
-        try: cap.release()
-        except Exception: pass
-
-
-def _sample_fids_for_offset(ds, data_dir, scene):
-    try:
-        fids = getattr(ds, 'frame_ids', None)
-        if fids is not None and len(fids):
-            arr = np.asarray(fids).reshape(-1)
-            return [int(arr[0]), int(arr[min(len(arr)-1, 100)]), int(arr[-1])]
-    except Exception:
-        pass
-    return None
-
-
-def _find_frame_path(vis_dir, fid, data_dir=None, scene=None, frame_offset=0):
-    # Negative frame IDs (historical obs windows): clamp to 0 / absolute start.
-    fid_eff = int(fid) if fid is not None else 0
-    if fid_eff < 0:
-        fid_eff = 0
-    # Try pre-extracted frames in external visual_data if present (named by dataset fid).
-    if vis_dir is not None and os.path.isdir(vis_dir):
-        for pat in [f'frame{fid_eff:06d}.jpg', f'frame{fid_eff:06d}.png', f'frame{fid_eff:05d}.jpg', f'frame{int(fid):06d}.jpg']:
-            p = os.path.join(vis_dir, pat)
-            if os.path.exists(p):
-                return p
-    # Robust fallback: on-the-fly decode from external video.avi (dataset fid -> video index).
-    if data_dir is not None and scene is not None:
-        scene_path = _resolve_scene_path(data_dir, scene)
-        vpath = Path(scene_path) / 'video.avi'
-        if not vpath.is_file():
-            raise FileNotFoundError(f"External video.avi not found for scene={scene}: {vpath}")
-        frame_bgr = _decode_frame_from_video(vpath, fid_eff, frame_offset=frame_offset)
-        import tempfile
-        vi = max(0, fid_eff - int(frame_offset))
-        tmp = Path(tempfile.gettempdir()) / f"moflow_vframe_{scene}_{vi}.jpg"
-        if not tmp.exists():
-            cv2.imwrite(str(tmp), frame_bgr)
-        return str(tmp)
-    raise FileNotFoundError(f"Cannot resolve frame for fid={fid} (vis_dir={vis_dir}, data_dir={data_dir}, scene={scene})")
+def _decode_frame_from_video(video_path, frame_index, scene=None):
+    """Decode an exact frame from ``video.avi`` (BGR, no offset, no clamping)."""
+    reader = get_video_reader(video_path)
+    if scene is None:
+        for name, (_group, scene_dir) in TU_CLAUSTHAL_MAP.items():
+            if Path(video_path).parent.name == scene_dir:
+                scene = name
+                break
+    index = video_index_for_frame(scene, frame_index) if scene else int(frame_index)
+    return reader.read(index, color="bgr")
 
 
 def _resolve_scene_path(data_dir, scene):
@@ -283,112 +212,74 @@ def _resolve_scene_path(data_dir, scene):
     )
 
 
-def _resolve_visual_data_dir(data_dir, scene, required=False):
-    scene_path = _resolve_scene_path(data_dir, scene)
-    vis = scene_path / "visual_data"
-    if vis.is_dir():
-        return str(vis)
-    if required:
-        raise FileNotFoundError(
-            f"External visual_data directory not found: {vis}. "
-            "Strict external path binding (TU-Clausthal nested layout); no repo-internal fallback."
-        )
-    return None
-
-
-def _decode_scene_frame(data_dir, scene, frame_index, frame_offset=0):
-    scene_path = _resolve_scene_path(data_dir, scene)
-    vpath = Path(scene_path) / 'video.avi'
-    if not vpath.is_file():
-        raise FileNotFoundError(f"External video.avi not found for scene={scene}: {vpath}")
-    frame_bgr = _decode_frame_from_video(vpath, max(0, int(frame_index)), frame_offset=frame_offset)
+def _decode_scene_frame(data_dir, scene, frame_index):
+    vpath = scene_video_path(data_dir, scene)
+    frame_bgr = _decode_frame_from_video(vpath, int(frame_index), scene=scene)
     return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
 
-def _anchor_frame_id(ds, batch, chosen_bi, cfg, data_dir, scene):
-    # Prefer explicit dataset frame ids (anchor/last observed frame for the window)
+def _sample_start_frame_ids(ds, batch, chosen_bi):
+    """Resolve the first observed frame id for a dataset sample."""
     try:
         fids = getattr(ds, 'frame_ids', None)
         if fids is not None and len(fids) > int(chosen_bi):
-            return int(fids[int(chosen_bi)])
+            return int(np.asarray(fids).reshape(-1)[int(chosen_bi)])
     except Exception:
         pass
-    for k in ['frame_id', 'frame_ids', 'anchor_frame', 'last_frame_id', 'start_frame']:
-        try:
-            if isinstance(batch, dict) and k in batch:
-                v = batch[k]
-                if torch.is_tensor(v):
-                    return int(v.detach().cpu().reshape(-1)[0].item())
-                return int(np.asarray(v).reshape(-1)[0])
-        except Exception:
-            pass
-    stride = int(getattr(cfg, 'frame_stride', 10) or 10)
+    try:
+        if isinstance(batch, dict) and 'index' in batch:
+            idx = batch['index']
+            if torch.is_tensor(idx):
+                idx = int(idx.detach().cpu().reshape(-1)[0].item())
+            else:
+                idx = int(np.asarray(idx).reshape(-1)[0])
+            fids = getattr(ds, 'frame_ids', None)
+            if fids is not None and 0 <= idx < len(fids):
+                return int(np.asarray(fids).reshape(-1)[idx])
+    except Exception:
+        pass
+    raise ValueError(
+        "Cannot resolve the start frame for this sample; refusing to guess a temporal anchor."
+    )
+
+
+def _anchor_frame_id(ds, batch, chosen_bi, cfg, data_dir, scene):
+    """Final observed frame: start + (past_frames - 1) * scene annotation step."""
+    start = _sample_start_frame_ids(ds, batch, chosen_bi)
     past = int(getattr(cfg, 'past_frames', 8) or 8)
-    return int(chosen_bi) * stride + (past - 1) * stride
+    return temporal_anchor_frame(start, scene, past)
 
 
 def find_ref_img(data_dir, scene, anchor_frame=None):
-    if anchor_frame is not None:
-        return f"video.avi#frame={max(0,int(anchor_frame))}"
-    vis = _resolve_visual_data_dir(data_dir, scene, required=False)
-    if vis:
-        import glob, os
-        cands = glob.glob(os.path.join(vis, 'frame*.jpg')) + glob.glob(os.path.join(vis, 'frame*.png'))
-        if cands:
-            return sorted(cands)[0]
-    # on-the-fly from external video.avi (no repo assets)
-    return "video.avi#frame=0"
+    frame = 0 if anchor_frame is None else int(anchor_frame)
+    return f"video.avi#frame={max(0, frame)}"
 
-def load_img(p, data_dir=None, scene=None, anchor_frame=None, frame_offset=0):
-    try:
-        if anchor_frame is not None and data_dir is not None and scene is not None:
-            return _decode_scene_frame(data_dir, scene, anchor_frame, frame_offset=frame_offset)
-        if isinstance(p, str) and p.startswith('video.avi#frame='):
-            fi = int(p.split('=')[-1])
-            if data_dir is not None and scene is not None:
-                return _decode_scene_frame(data_dir, scene, fi, frame_offset=frame_offset)
-        if not p or not os.path.exists(p):
-            return None
-        img = cv2.imread(p)
-        if img is None:
-            return None
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    except Exception:
-        traceback.print_exc()
-        return None
+
+def load_img(p, data_dir=None, scene=None, anchor_frame=None):
+    if anchor_frame is not None and data_dir is not None and scene is not None:
+        return _decode_scene_frame(data_dir, scene, anchor_frame)
+    if isinstance(p, str) and p.startswith('video.avi#frame='):
+        fi = int(p.split('=')[-1])
+        if data_dir is not None and scene is not None:
+            return _decode_scene_frame(data_dir, scene, fi)
+    raise FileNotFoundError(
+        f"Cannot resolve frame (path={p!r}, data_dir={data_dir}, scene={scene}); "
+        "only native video.avi decoding is supported."
+    )
 
 def _audit_verified_world_to_pixel(pts_xy, H, scene, orig_size, target_res=None):
-    """ETH/UCY world->pixel using inv(H). Scene-conditional axis handling:
-    - Zara1/Zara2: use native (a,b) orientation (no row/col swap) to avoid 90° rotation.
-    - ETH/Hotel/Univ: apply row/col swap (u,v)=(b,a) per validated alignment for those scenes.
-    UCY optical-center convention preserved where validated: univ/zara* use u += W/2, v = Hh/2 - v.
+    """Delegate to the single authoritative world->pixel mapping.
+
+    eth/hotel use ``(u, v) = (b, a)``; univ/zara1/zara2 use no swap plus the
+    UCY optical-centre convention ``(a + W/2, H/2 - b)``.  Empirically verified
+    against moving-pixel distance on all five scenes.
     """
     pts = np.asarray(pts_xy, dtype=np.float64)
     if pts.size == 0:
         return pts
-    if pts.ndim == 1:
-        pts = pts.reshape(-1, pts.shape[-1])
-    if pts.shape[-1] < 2:
-        return None
-    w = np.hstack([pts[:, :2], np.ones((len(pts), 1))])
-    p = w @ np.linalg.inv(H).T
-    a, b = p[:, 0] / p[:, 2], p[:, 1] / p[:, 2]
-    sc = str(scene).lower() if scene is not None else ""
-    if sc in ("zara1", "zara2", "zara01", "zara02"):
-        u, v = a, b  # no swap for Zara (prevents 90-degree rotation)
-    else:
-        u, v = b, a  # row/col swap for eth/hotel/univ
-    W, Hh = float(orig_size[0]), float(orig_size[1])
-    if sc in ("univ", "zara1", "zara2", "students03", "zara01", "zara02"):
-        u = u + W / 2.0
-        v = Hh / 2.0 - v
-    out = np.column_stack([u, v])
-    if target_res is not None and tuple(map(int, target_res)) != (int(W), int(Hh)):
-        sx = float(target_res[0]) / W
-        sy = float(target_res[1]) / Hh
-        out[:, 0] *= sx
-        out[:, 1] *= sy
-    return out
+    return geo_world_to_pixel(
+        pts, H, scene=scene, orig_size=orig_size, target_res=target_res
+    )
 
 
 def world_to_pix_native(ds, pts, scene=None, target_res=None):
@@ -505,8 +396,8 @@ def euler_sample(denoiser,cfg,x_data,num_frames,device,seed):
     return y_t
 
 def best_of_k_eth(pred,gt,cfg,ds=None,init_pos=None):
-    fut_min=getattr(cfg,'fut_traj_min',getattr(ds,'fut_traj_min',-1.0) if ds else -1.0)
-    fut_max=getattr(cfg,'fut_traj_max',getattr(ds,'fut_traj_max',1.0) if ds else 1.0)
+    bounds = bounds_from_cfg(cfg, source="best_of_k_eth")
+    fut_min, fut_max = bounds.fut_min, bounds.fut_max
     future_frames=int(getattr(cfg,'future_frames',12))
     gt_arr=to_numpy(gt)
     if gt_arr.ndim==4:  # [B,A,F,D] or [B,A,F*D]? normalize below
@@ -521,7 +412,9 @@ def best_of_k_eth(pred,gt,cfg,ds=None,init_pos=None):
             gt_m=torch.tensor(gt_arr[0,:future_frames,:2]).float().unsqueeze(0)
     else:
         gt_m=torch.tensor(gt_arr).float().reshape(-1,future_frames,2)
-    gt_t=unnormalize_min_max(gt_m.unsqueeze(0),fut_min,fut_max,-1,1)[0]  # [A,F,2]
+    # Ground truth is already raw metres (relative to the last observed pose).
+    # Unnormalize predictions only.
+    gt_t=gt_m  # [A,F,2]
     pred_arr=to_numpy(pred)
     pred_t=torch.tensor(pred_arr).float()
     if pred_t.ndim==4 and pred_t.shape[-1]==future_frames*2:
@@ -603,10 +496,272 @@ def _resolve_dataset_agents(ckpt_path, cfg_m, batch, ds_fallback):
         return int(getattr(cfg_m.MODEL.CONTEXT_ENCODER, 'AGENTS', 2))
 
 
+def _dry_run_mode_dataset(scene, mode, data_dir, base_cfg_path, device):
+    cfg = Config(base_cfg_path, f"dry_{scene}_{mode}")
+    cfg.device = device
+    cfg.data_norm = "original"
+    try:
+        cfg.MODEL.CONTEXT_ENCODER.VIDEO_MODE = mode
+        cfg.MODEL.CONTEXT_ENCODER.USE_VIDEO = mode != "off"
+    except Exception:
+        traceback.print_exc()
+    ds = ETHDataset(
+        cfg=cfg,
+        training=False,
+        data_dir=data_dir,
+        subset=scene,
+        rotate_time_frame=0,
+        type="original",
+        video_mode=mode,
+    )
+    return cfg, ds
+
+
+def _batch_at(ds, chosen_bi):
+    loader = DataLoader(
+        ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=seq_collate_eth
+    )
+    batch = None
+    for _ in range(int(chosen_bi) + 1):
+        batch = next(iter(loader))
+    if batch is None:
+        raise RuntimeError(f"Cannot load batch {chosen_bi} for dry run")
+    return batch
+
+
+def _anchor_overlay_metric(data_dir, scene, anchor_fid, world_xy, ds_ref, bg_shape):
+    prev_fid = max(0, int(anchor_fid) - annotation_step(scene))
+    curr = _decode_scene_frame(data_dir, scene, int(anchor_fid))
+    prev = _decode_scene_frame(data_dir, scene, prev_fid)
+    diff = cv2.absdiff(
+        cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY),
+        cv2.cvtColor(curr, cv2.COLOR_RGB2GRAY),
+    )
+    mask = cv2.dilate((diff > 25).astype(np.uint8), np.ones((5, 5), np.uint8))
+    ys, xs = np.nonzero(mask)
+    px = world_to_pix_native(
+        ds_ref, world_xy, scene, target_res=(bg_shape[1], bg_shape[0])
+    )
+    px = ensure_2d_coords(px)
+    finite = px is not None and np.isfinite(px).all()
+    if not finite or len(xs) == 0:
+        return {
+            "finite": bool(finite),
+            "moving_pixels": int(len(xs)),
+            "median_px": None,
+            "frac_within_10px": None,
+        }
+    d = np.sqrt(
+        (px[:, 0, None] - xs[None, :]) ** 2 + (px[:, 1, None] - ys[None, :]) ** 2
+    ).min(axis=1)
+    width, height = bg_shape[1], bg_shape[0]
+    in_bounds = (
+        (px[:, 0] >= 0) & (px[:, 0] < width) & (px[:, 1] >= 0) & (px[:, 1] < height)
+    )
+    return {
+        "finite": True,
+        "moving_pixels": int(len(xs)),
+        "median_px": float(np.median(d)),
+        "frac_within_10px": float((d < 10.0).mean()),
+        "in_bounds_fraction": float(in_bounds.mean()),
+        "anchor_frame": int(anchor_fid),
+        "previous_frame": int(prev_fid),
+        "background_shape": [int(bg_shape[0]), int(bg_shape[1])],
+    }
+
+
+def _render_dry_run_alignment(
+    scene, args, out_dir, data_dir, ds_ref, batch, chosen_bi, anchor_fid, bg, cfg_ref
+):
+    """Validate caches/overlays without model checkpoints and save a figure."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    start_fid = _sample_start_frame_ids(ds_ref, batch, chosen_bi)
+    past = int(getattr(cfg_ref, "past_frames", 8) or 8)
+    obs_raw = to_numpy(batch["past_traj_original_scale"])
+    gt_raw = to_numpy(batch["fut_traj_original_scale"])
+    obs_xy = obs_raw[0, ..., :2] if obs_raw.ndim >= 4 else obs_raw[..., :2]
+    gt_xy = gt_raw[0, ..., :2] if gt_raw.ndim >= 4 else gt_raw[..., :2]
+    obs_flat = np.asarray(obs_xy).reshape(-1, 2)
+    gt_flat = np.asarray(gt_xy).reshape(-1, 2)
+
+    mode_reports = {}
+    for mode in VARIANTS:
+        cfg_m, ds_m = _dry_run_mode_dataset(
+            scene, mode, data_dir, args.cfg, args.device
+        )
+        batch_m = _batch_at(ds_m, chosen_bi)
+        mode_start = _sample_start_frame_ids(ds_m, batch_m, chosen_bi)
+        report = {
+            "mode": mode,
+            "start_frame": int(mode_start),
+            "past_frames": int(getattr(cfg_m, "past_frames", 8)),
+            "use_video": bool(getattr(ds_m, "use_video", False)),
+        }
+        if mode != "off":
+            feats_root = getattr(
+                cfg_m.MODEL.CONTEXT_ENCODER,
+                "VIDEO_FEATURES_ROOT",
+                "features/resnet18",
+            )
+            lookup = FrameFeatureLookup.from_root(feats_root, scene=scene)
+            step = annotation_step(scene)
+            frame_ids = observed_frame_ids(mode_start, scene, report["past_frames"])
+            missing = [int(f) for f in frame_ids if int(f) not in lookup.frame_to_row]
+            window = lookup.window(
+                mode_start, report["past_frames"], stride=step, policy="nearest"
+            )
+            exact = all(int(f) in lookup.frame_to_row for f in frame_ids)
+            z = to_numpy(batch_m.get("z_video_global"))
+            if z is None:
+                raise RuntimeError(f"{scene}/{mode}: dataset did not emit z_video_global")
+            z = z[0]
+            if z.shape != window.shape:
+                raise RuntimeError(
+                    f"{scene}/{mode}: z_video_global shape {z.shape} != lookup {window.shape}"
+                )
+            if not np.isfinite(z).all():
+                raise RuntimeError(f"{scene}/{mode}: non-finite z_video_global")
+            if mode == "full":
+                if not np.allclose(z, window, atol=1e-6):
+                    raise RuntimeError(
+                        f"{scene}/{mode}: z_video_global does not match exact frame lookup"
+                    )
+            else:
+                ids = lookup.sorted_frame_ids
+                sample = ids[:: max(1, ids.size // 8)][:8]
+                static = np.stack(
+                    [lookup(int(f)) for f in sample], axis=0
+                ).mean(axis=0)
+                expected = np.repeat(static[None, :], z.shape[0], axis=0)
+                if not np.allclose(z, expected, atol=1e-6):
+                    raise RuntimeError(
+                        f"{scene}/{mode}: z_video_global does not match cached static mean"
+                    )
+            report.update(
+                {
+                    "cache_root": str(feats_root),
+                    "observed_frame_ids": [int(f) for f in frame_ids],
+                    "frame_ids_exact": bool(exact),
+                    "missing_frame_ids": missing,
+                    "features_shape": list(z.shape),
+                    "features_finite": bool(np.isfinite(z).all()),
+                    "features_nonzero": bool(np.abs(z).sum() > 0),
+                    "timesteps_identical": bool(
+                        np.allclose(z, np.repeat(z[:1], z.shape[0], axis=0), atol=1e-6)
+                    ),
+                }
+            )
+        mode_reports[mode] = report
+
+    anchor_world = np.asarray(obs_xy).reshape(-1, np.asarray(obs_xy).shape[-1])[
+        -1, :2
+    ].reshape(1, 2)
+    alignment = _anchor_overlay_metric(
+        data_dir, scene, anchor_fid, anchor_world, ds_ref, bg.shape
+    )
+
+    width, height = bg.shape[1], bg.shape[0]
+    obs_p = ensure_2d_coords(
+        world_to_pix_native(ds_ref, obs_flat, scene, target_res=(width, height))
+    )
+    gt_p = ensure_2d_coords(
+        world_to_pix_native(ds_ref, gt_flat, scene, target_res=(width, height))
+    )
+    if obs_p is None or gt_p is None or not np.isfinite(obs_p).all():
+        raise RuntimeError(f"{scene}: projection produced non-finite overlay points")
+
+    fig, axes = plt.subplots(1, 4, figsize=(22.0, 5.6))
+    extent = (0, width, height, 0)
+    for ax, mode in zip(axes[:3], VARIANTS):
+        ax.imshow(bg, extent=extent, origin="upper", zorder=0, aspect="equal")
+        ax.plot(
+            obs_p[:, 0],
+            obs_p[:, 1],
+            "--",
+            color="black",
+            linewidth=1.6,
+            marker="o",
+            markersize=3,
+            zorder=4,
+        )
+        ax.plot(
+            gt_p[:, 0],
+            gt_p[:, 1],
+            color="green",
+            linewidth=1.8,
+            marker="o",
+            markersize=3,
+            zorder=4,
+        )
+        ap = ensure_2d_coords(
+            world_to_pix_native(
+                ds_ref, anchor_world, scene, target_res=(width, height)
+            )
+        )
+        if ap is not None:
+            ax.plot(
+                ap[:, 0],
+                ap[:, 1],
+                "x",
+                color="blue",
+                markersize=10,
+                mew=2.2,
+                zorder=6,
+            )
+        rep = mode_reports[mode]
+        cache_txt = (
+            "no cache"
+            if mode == "off"
+            else f"frames={rep['features_shape'][0]} exact={rep['frame_ids_exact']}"
+        )
+        ax.set_title(f"{mode} | {cache_txt}")
+        ax.set_xlim(0, width)
+        ax.set_ylim(height, 0)
+        ax.set_xlabel("x [px]")
+        ax.set_ylabel("y [px]")
+        assert_pixel_frame_alignment(obs_p, gt_p, obs_p)
+    axes[3].axis("off")
+    report = {
+        "scene": scene,
+        "dry_run": True,
+        "start_frame": int(start_fid),
+        "anchor_frame": int(anchor_fid),
+        "background_frame": int(anchor_fid),
+        "background_video": str(scene_video_path(data_dir, scene)),
+        "modes": mode_reports,
+        "alignment": alignment,
+        "overlay_points": {
+            "observed": int(len(obs_p)),
+            "future": int(len(gt_p)),
+            "obs_finite": bool(np.isfinite(obs_p).all()),
+            "gt_finite": bool(np.isfinite(gt_p).all()),
+        },
+    }
+    axes[3].text(
+        0.0,
+        0.98,
+        json.dumps(report, indent=2, sort_keys=True)[:4000],
+        family="monospace",
+        fontsize=7,
+        va="top",
+    )
+    fig.tight_layout()
+    png_path = out_dir / f"{scene}_synchronized_comparison_dry_run.png"
+    json_path = out_dir / f"{scene}_synchronized_comparison_dry_run.json"
+    fig.savefig(png_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+    print(f"[dry-run] {scene}: saved {png_path} and {json_path}", flush=True)
+    print(f"[dry-run] {scene}: alignment={alignment}", flush=True)
+
+
 def render_scene_eth(scene,args,out_dir,data_dir,device):
     cfg_ref=Config(args.cfg,f'sync_{scene}'); cfg_ref.device=device
+    # Reference dataset is used for geometry/frame ids only; keep raw metres.
+    cfg_ref.data_norm='original'
     ds_ref=ETHDataset(cfg=cfg_ref,training=False,data_dir=data_dir,subset=scene,rotate_time_frame=0,type='original',video_mode='full')
-    copy_norm_stats(ds_ref,cfg_ref)
     loader=DataLoader(ds_ref,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
     batch=None
     chosen_bi = args.batch_idx
@@ -634,28 +789,37 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         traceback.print_exc()
     if batch is None: print(f'[ETH-UCY] {scene}: no valid batch'); return
     anchor_fid = _anchor_frame_id(ds_ref, batch, chosen_bi, cfg_ref, data_dir, scene)
-    vpath_off = Path(_resolve_scene_path(data_dir, scene)) / 'video.avi'
-    frame_offset = _infer_video_frame_offset(vpath_off, sample_fids=_sample_fids_for_offset(ds_ref, data_dir, scene))
-    bg = load_img(None, data_dir=data_dir, scene=scene, anchor_frame=anchor_fid, frame_offset=frame_offset)
+    bg = load_img(None, data_dir=data_dir, scene=scene, anchor_frame=anchor_fid)
+    if getattr(args, "dry_run", False):
+        _render_dry_run_alignment(
+            scene,
+            args,
+            out_dir,
+            data_dir,
+            ds_ref,
+            batch,
+            chosen_bi,
+            anchor_fid,
+            bg,
+            cfg_ref,
+        )
+        return
     bundles={}
     for mode in VARIANTS:
         ckpt,run_dir=find_checkpoint(scene,mode,args.cor_fm_root,args.ckpt_dir)
         if not ckpt: print(f'  SKIP {scene}/{mode} missing'); continue
         # Build config from the run that produced this checkpoint so embedding shapes match natively.
         cfg_path=load_run_config(run_dir,args.cfg); cfg_m=Config(cfg_path,f'sync_{scene}_{mode}'); cfg_m.device=device
+        _apply_run_bounds(cfg_m, run_dir=run_dir, ckpt=ckpt)
         try: cfg_m.MODEL.CONTEXT_ENCODER.VIDEO_MODE=mode; cfg_m.MODEL.CONTEXT_ENCODER.USE_VIDEO=(mode!='off')
         except: pass
         ac=_resolve_dataset_agents(ckpt,cfg_m,batch,ds_ref)
         force_set_agents(cfg_m,ac)
         # Variant conditioning isolation: load per-mode dataset/batch
-        try:
-            ds_m=ETHDataset(cfg=cfg_m,training=False,data_dir=data_dir,subset=scene,rotate_time_frame=0,type='original',video_mode=mode)
-            copy_norm_stats(ds_m,cfg_m)
-            loader_m=DataLoader(ds_m,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
-            it_m=iter(loader_m); batch_m=None
-            for _ in range(chosen_bi+1): batch_m=next(it_m)
-        except Exception:
-            traceback.print_exc(); ds_m=ds_ref; batch_m=batch; copy_norm_stats(ds_m,cfg_m)
+        ds_m=ETHDataset(cfg=cfg_m,training=False,data_dir=data_dir,subset=scene,rotate_time_frame=0,type='original',video_mode=mode)
+        loader_m=DataLoader(ds_m,batch_size=1,shuffle=False,num_workers=0,collate_fn=seq_collate_eth)
+        it_m=iter(loader_m); batch_m=None
+        for _ in range(chosen_bi+1): batch_m=next(it_m)
         try:
             model=ETHMotionTransformer(model_config=cfg_m.MODEL,logger=NullLogger(),config=cfg_m)
             denoiser=FlowMatcher(cfg_m,model,logger=NullLogger())
@@ -705,13 +869,8 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
     obs_xy=to_numpy(obs_raw)
     if obs_xy.ndim==4: obs_xy=obs_xy[0,0]
     elif obs_xy.ndim==3: obs_xy=obs_xy[0]
-    past_min=getattr(cfg_ref,'past_traj_min',getattr(ds_ref,'past_traj_min',-1.0)); past_max=getattr(cfg_ref,'past_traj_max',getattr(ds_ref,'past_traj_max',1.0))
-    obs_xy=unnormalize_min_max(torch.tensor(obs_xy).float().unsqueeze(0).unsqueeze(0),past_min,past_max,-1,1)[0,0].numpy()
-    # obs is absolute; ensure we use absolute coords consistently
-    try:
-        # if somehow relative, add last? but original_scale is absolute in ETH loader
-        pass
-    except: pass
+    # past_traj_original_scale already stores absolute world metres: never
+    # unnormalize it (that was the source of the ~1/11 ground-truth collapse).
     bundles_list=bundles
     # attach obs to all
     for k in bundles_list: bundles_list[k]['obs']=obs_xy
@@ -763,6 +922,8 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
         if best_p is not None and np.isfinite(best_p).all() and best_p.shape[0]>1: ax.plot(best_p[:,0],best_p[:,1],color=PRED_COLOR,linewidth=2.6,alpha=0.9,marker='o',markersize=3,zorder=5)
         gt_p=world_to_pix_native(ds_ref,gt_arr,scene,target_res=(w,h) if bg is not None else None)
         gt_p=ensure_2d_coords(gt_p)
+        if obs_p is not None and gt_p is not None and best_p is not None:
+            assert_pixel_frame_alignment(obs_p, gt_p, best_p)
         if gt_p is not None and np.isfinite(gt_p).all() and gt_p.shape[0]>1: ax.plot(gt_p[:,0],gt_p[:,1],color='green',linewidth=1.8,marker='o',markersize=3,zorder=4)
         if bg is not None:
             ax.set_xlim(0, w); ax.set_ylim(h, 0)
@@ -781,32 +942,33 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
     if bg is not None and _HAS_GCAM and ds_ref is not None:
         try:
             import torchvision
-            from torchvision import transforms
             from PIL import Image
+            from torchvision import transforms
+
             # load backbone
             backbone, dim, preprocess = _make_backbone('resnet18', pretrained=True, device=device)
             backbone.eval()
-            # load frames
-            vis_dir = _resolve_visual_data_dir(data_dir, scene, required=False)
-            frame_ids = getattr(ds_ref, 'frame_ids', None)
+            # load observed frames directly from video.avi at scene annotation step
+            gcam_ds = (bundles_list.get('full') or {}).get('ds') or ds_ref
+            gcam_batch = (bundles_list.get('full') or {}).get('batch') or batch
             bidx = locals().get('chosen_bi', args.batch_idx)
             try:
-                gcam_batch = (bundles_list.get('full') or {}).get('batch') or batch
-                if isinstance(gcam_batch,dict) and 'index' in gcam_batch:
-                    bidx_cand = int(gcam_batch['index'].detach().cpu().numpy().reshape(-1)[0]) if hasattr(gcam_batch['index'],'detach') else int(gcam_batch['index'])
-                    if bidx_cand < len(ds_full if 'ds_full' in locals() else ds_ref): bidx = bidx_cand
+                if isinstance(gcam_batch, dict) and 'index' in gcam_batch:
+                    idx_v = gcam_batch['index']
+                    bidx_cand = int(idx_v.detach().cpu().numpy().reshape(-1)[0]) if hasattr(idx_v, 'detach') else int(idx_v)
+                    if 0 <= bidx_cand < len(gcam_ds):
+                        bidx = bidx_cand
             except Exception:
                 traceback.print_exc()
-            ds_full = (bundles_list.get('full') or {}).get('ds') or ds_ref; frame_ids_f = getattr(ds_full,'frame_ids',None); base_fid = int(frame_ids_f[bidx]) if frame_ids_f is not None and len(frame_ids_f)>bidx else anchor_fid
+            start_fid = _sample_start_frame_ids(gcam_ds, gcam_batch, bidx)
+            frame_ids_obs = observed_frame_ids(start_fid, scene, int(cfg_ref.past_frames))
+            if frame_ids_obs[-1] != int(anchor_fid):
+                raise AssertionError(
+                    f"Grad-CAM anchor {anchor_fid} != final observed frame {frame_ids_obs[-1]}"
+                )
             frames_t_list=[]; frames_rgb_list=[]
-            stride_f = int(getattr(cfg_ref,'frame_stride',10) or 10)
-            for t in range(cfg_ref.past_frames):
-                fid = base_fid - (cfg_ref.past_frames - 1 - t) * stride_f
-                fpath = _find_frame_path(vis_dir, fid, data_dir=data_dir, scene=scene, frame_offset=frame_offset)
-                img=cv2.imread(fpath)
-                if img is None:
-                    raise FileNotFoundError(f"Failed to read external frame asset: {fpath}")
-                img_rgb=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+            for fid in frame_ids_obs:
+                img_rgb = _decode_scene_frame(data_dir, scene, fid)
                 frames_rgb_list.append(img_rgb)
                 pil=Image.fromarray(img_rgb); frames_t_list.append(preprocess(pil))
             if frames_t_list:
@@ -816,11 +978,11 @@ def render_scene_eth(scene,args,out_dir,data_dir,device):
                 if ckpt_f:
                     cfg_f=Config(load_run_config(run_f,args.cfg),f'gcam_{scene}')
                     cfg_f.device=device
+                    _apply_run_bounds(cfg_f, run_dir=run_f, ckpt=ckpt_f)
                     try: cfg_f.MODEL.CONTEXT_ENCODER.VIDEO_MODE='full'; cfg_f.MODEL.CONTEXT_ENCODER.USE_VIDEO=True
                     except: pass
-                    gcam_batch = (bundles_list.get('full') or {}).get('batch') or batch; ds_full = (bundles_list.get('full') or {}).get('ds') or ds_ref; ac_f=_resolve_dataset_agents(ckpt_f,cfg_f,gcam_batch,ds_full)
+                    ds_full = gcam_ds; ac_f=_resolve_dataset_agents(ckpt_f,cfg_f,gcam_batch,ds_full)
                     force_set_agents(cfg_f,ac_f)
-                    copy_norm_stats(ds_full,cfg_f)
                     model_f=ETHMotionTransformer(model_config=cfg_f.MODEL,logger=NullLogger(),config=cfg_f)
                     den_f=FlowMatcher(cfg_f,model_f,logger=NullLogger())
                     den_f=load_ckpt_flexible(ckpt_f,den_f).to(device).eval()
@@ -896,6 +1058,11 @@ def main():
     p.add_argument('--batch-idx',type=int,default=0)
     p.add_argument('--device',default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--seed',type=int,default=1234)
+    p.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Validate feature caches and projected overlays without checkpoints; saves *_dry_run.{png,json}.',
+    )
     args=p.parse_args()
     data_dir=args.data_dir
     if not os.path.isdir(data_dir):
